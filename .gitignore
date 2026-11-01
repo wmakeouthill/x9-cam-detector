@@ -1,0 +1,55 @@
+# Ambientes e Variáveis de Configuração
+.env
+.env.*
+!.env.example
+
+# Credenciais e Segredos do Google Cloud / OAuth / Chaves
+*client_secret*.json
+*service_account*.json
+*token*.json
+*credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Dados sensíveis de persistência local (ancorados para não ignorar código-fonte)
+/data/
+/backend/data/
+/snapshots/
+/backend/snapshots/
+/recordings/
+/backend/recordings/
+*.db
+*.sqlite
+*.sqlite3
+
+# Arquivos de mídia gerados localmente por testes
+snapshot_*.jpg
+video_*.mp4
+
+# Modelos binários PyTorch / YOLO (baixados automaticamente pelo Ultralytics)
+*.pt
+
+# Python Caches & Ambientes
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Node & Frontend
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Scripts pontuais de debug de credenciais
+backend/app/debug_creds.py
+backend/app/debug_events.py
+
+# IDEs & Sistema Operacional
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

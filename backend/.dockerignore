@@ -1,0 +1,28 @@
+.git
+.vscode
+.idea
+
+# Segredos e Ambientes
+.env*
+!.env.example
+*client_secret*.json
+*service_account*.json
+*token*.json
+*credentials*.json
+*.pem
+*.key
+
+# Dados, fotos e gravações
+data/
+snapshots/
+recordings/
+*.db
+*.sqlite*
+
+# Caches e dependências
+__pycache__
+*.pyc
+.pytest_cache
+.venv
+venv
+*.pt

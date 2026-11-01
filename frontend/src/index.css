@@ -1,0 +1,75 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-heading: 'Chakra Petch', sans-serif;
+    --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #040608;
+  color: #E2E8F0;
+  overflow: hidden;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Scrollbar refinada, discreta e estilizada para painel NOC */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 4px;
+  transition: background 0.2s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #10b981;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #27272a transparent;
+}
+
+/* Efeito de Scanline sutil para visual CCTV de segurança */
+.cctv-scanline {
+  background: linear-gradient(
+    rgba(18, 16, 16, 0) 50%, 
+    rgba(0, 0, 0, 0.35) 50%
+  ), linear-gradient(
+    90deg,
+    rgba(0, 255, 100, 0.02),
+    rgba(0, 0, 0, 0.02),
+    rgba(0, 255, 100, 0.02)
+  );
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+}
+
+/* Grid sutil estilo terminal de monitoramento NOC */
+.terminal-grid {
+  background-image: radial-gradient(rgba(16, 185, 129, 0.05) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Animação de pulso do indicador LIVE */
+@keyframes live-pulse {
+  0% { transform: scale(0.95); opacity: 0.8; }
+  50% { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(0.95); opacity: 0.8; }
+}
+
+.animate-live {
+  animation: live-pulse 1.8s infinite ease-in-out;
+}

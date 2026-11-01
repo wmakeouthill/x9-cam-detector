@@ -1,0 +1,30 @@
+**/.git
+**/.github
+**/.vscode
+**/.idea
+
+# Segredos e Ambientes
+**/.env*
+!**/.env.example
+**/*client_secret*.json
+**/*service_account*.json
+**/*token*.json
+**/*credentials*.json
+**/*.pem
+**/*.key
+
+# Dados, fotos e gravações
+**/data
+**/snapshots
+**/recordings
+**/*.db
+**/*.sqlite*
+
+# Caches e dependências
+**/node_modules
+**/dist
+**/__pycache__
+**/.pytest_cache
+**/.venv
+**/*.tsbuildinfo
+**/*.pt
