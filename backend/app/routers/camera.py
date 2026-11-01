@@ -191,9 +191,16 @@ def delete_events_batch(req: DeleteBatchRequest, user: str = Depends(get_current
     return {"status": "ok", "deleted_count": deleted}
 
 @router.get("/scan")
-def scan_network_cameras(subnet: str | None = None, user: str = Depends(get_current_user)):
-    devices = camera_service.scan_network_cameras(subnet)
-    return {"cameras": devices}
+def scan_network_cameras(
+    subnets: str | None = Query(None, description="Sub-redes separadas por vírgula (ex: 192.168.1, 192.168.2)"),
+    subnet: str | None = Query(None, description="Sub-rede única (legado)"),
+    user: str = Depends(get_current_user)
+):
+    target = subnets if subnets is not None else subnet
+    result = camera_service.scan_network_cameras(target)
+    if isinstance(result, dict):
+        return result
+    return {"cameras": result, "scanned_subnets": []}
 
 @router.get("/gdrive/status")
 def get_gdrive_status(user: str = Depends(get_current_user)):

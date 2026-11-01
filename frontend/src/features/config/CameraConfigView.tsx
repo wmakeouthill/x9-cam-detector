@@ -1,5 +1,20 @@
-import React, { useState, useEffect } from 'react';
-import { Settings, Save, Server, Shield, CheckCircle, AlertCircle, RefreshCw, Terminal, Sliders, Radio } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Settings,
+  Save,
+  Server,
+  Shield,
+  CheckCircle,
+  AlertCircle,
+  RefreshCw,
+  Terminal,
+  Sliders,
+  Radar,
+  Camera,
+  Network,
+  ArrowUpRight,
+  HelpCircle,
+} from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
 interface CameraConfigViewProps {
@@ -9,6 +24,14 @@ interface CameraConfigViewProps {
   currentUser: string;
   currentSubtype: number;
   onConfigSaved: () => void;
+}
+
+interface FoundDevice {
+  ip: string;
+  ports: number[];
+  name: string;
+  subnet?: string;
+  is_camera?: boolean;
 }
 
 export function CameraConfigView({
@@ -29,6 +52,10 @@ export function CameraConfigView({
 
   const [hasLoaded, setHasLoaded] = useState(false);
 
+  // Refs para scroll suave
+  const formRef = useRef<HTMLDivElement>(null);
+  const detectorRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     if (!hasLoaded && currentIp) {
       setIp(currentIp);
@@ -42,36 +69,103 @@ export function CameraConfigView({
 
   const [saving, setSaving] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [foundCameras, setFoundCameras] = useState<Array<{ ip: string; ports: number[]; name: string }>>([]);
+  const [scanPerformed, setScanPerformed] = useState(false);
+  const [subnetsInput, setSubnetsInput] = useState('192.168.1, 192.168.2');
+  const [scannedSubnets, setScannedSubnets] = useState<string[]>([]);
+  const [foundCameras, setFoundCameras] = useState<FoundDevice[]>([]);
   const [message, setMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [detectorMessage, setDetectorMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
 
-  const handleScan = async () => {
+  const presetSubnets = [
+    { label: '192.168.1.0/24 (Principal)', value: '192.168.1' },
+    { label: '192.168.2.0/24 (2º Modem / Roteador)', value: '192.168.2' },
+    { label: '192.168.0.0/24 (Comum TP-Link/D-Link)', value: '192.168.0' },
+    { label: '192.168.15.0/24 (Vivo Fibra)', value: '192.168.15' },
+    { label: '10.0.0.0/24 (Rede / AP)', value: '10.0.0' },
+  ];
+
+  const togglePresetSubnet = (val: string) => {
+    const parts = subnetsInput
+      .split(/[,;\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (parts.includes(val)) {
+      // Remove
+      const remaining = parts.filter((s) => s !== val);
+      setSubnetsInput(remaining.join(', '));
+    } else {
+      // Adiciona
+      parts.push(val);
+      setSubnetsInput(parts.join(', '));
+    }
+  };
+
+  const isPresetActive = (val: string) => {
+    const parts = subnetsInput
+      .split(/[,;\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return parts.includes(val);
+  };
+
+  const handleScan = async (overrideSubnets?: string) => {
+    const target = overrideSubnets !== undefined ? overrideSubnets : subnetsInput;
     setScanning(true);
-    setMessage(null);
+    setScanPerformed(true);
+    setDetectorMessage(null);
+
     try {
-      const res = await fetch('/api/camera/scan', {
+      const params = new URLSearchParams();
+      if (target.trim()) {
+        params.set('subnets', target.trim());
+      }
+      const res = await fetch(`/api/camera/scan?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
+
       if (res.ok) {
         const data = await res.json();
-        const cams = data.cameras || [];
+        const cams: FoundDevice[] = data.cameras || [];
+        const subs: string[] = data.scanned_subnets || [];
         setFoundCameras(cams);
+        setScannedSubnets(subs);
+
         if (cams.length === 0) {
-          setMessage({ text: 'Nenhuma câmera com portas RTSP/HTTP detectada na sub-rede.', type: 'error' });
+          setDetectorMessage({
+            type: 'info',
+            text: `Nenhuma câmera respondendo nas portas RTSP/HTTP nas sub-redes: ${subs.join(', ')}.`,
+          });
         } else {
-          setMessage({
-            text: `${cams.length} dispositivo(s) encontrado(s) na rede! Selecione abaixo para aplicar o IP.`,
+          setDetectorMessage({
             type: 'success',
+            text: `${cams.length} dispositivo(s) encontrado(s) nas sub-redes varridas! Clique em "Usar esta Câmera" para aplicar.`,
           });
         }
       } else {
         throw new Error('Falha na resposta do scanner.');
       }
     } catch {
-      setMessage({ text: 'Erro ao executar varredura de rede.', type: 'error' });
+      setDetectorMessage({
+        type: 'error',
+        text: 'Erro ao executar varredura de sub-redes. Verifique a conexão com o backend.',
+      });
     } finally {
       setScanning(false);
     }
+  };
+
+  const handleSelectCamera = (cam: FoundDevice) => {
+    setIp(cam.ip);
+    if (cam.ports.includes(554)) setPort(554);
+    if (cam.ports.includes(80)) setHttpPort(80);
+
+    setMessage({
+      text: `Câmera ${cam.ip} selecionada com sucesso! Verifique a senha da câmera acima e clique em "Salvar e Conectar".`,
+      type: 'success',
+    });
+
+    formRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -113,9 +207,9 @@ export function CameraConfigView({
   };
 
   return (
-    <div className="w-full h-full p-3.5 sm:p-6 lg:p-8 overflow-y-auto space-y-4 sm:space-y-6">
+    <div className="w-full h-full p-3.5 sm:p-6 lg:p-8 overflow-y-auto space-y-6 sm:space-y-8">
       {/* Cabeçalho expandido */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4 border-b border-zinc-800/80 pb-4 sm:pb-5">
+      <div ref={formRef} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4 border-b border-zinc-800/80 pb-4 sm:pb-5">
         <div className="flex items-center gap-2.5 sm:gap-3">
           <div className="w-9 h-9 sm:w-11 sm:h-11 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shadow-[0_0_20px_rgba(16,185,129,0.15)] shrink-0">
             <Settings className="w-5 h-5 sm:w-6 sm:h-6" />
@@ -151,7 +245,7 @@ export function CameraConfigView({
         </div>
       )}
 
-      {/* Grid Principal aproveitando a largura 1920x1080 */}
+      {/* Formulário Principal de Configuração */}
       <form onSubmit={handleSubmit} className="space-y-4 sm:space-y-6">
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
           {/* Card 1: Endereçamento de Rede e Portas */}
@@ -167,20 +261,20 @@ export function CameraConfigView({
               <div>
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 sm:gap-2 mb-1.5">
                   <label className="text-xs font-semibold text-zinc-300 font-mono">
-                    Endereço IP da Câmera (Fixo ou Auto)
+                    Endereço IP da Câmera (Fixo ou Detectado)
                   </label>
                   <button
                     type="button"
-                    onClick={handleScan}
-                    disabled={scanning}
-                    className="self-start sm:self-auto flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-[11px] font-mono transition-all cursor-pointer disabled:opacity-50"
+                    onClick={() => {
+                      detectorRef.current?.scrollIntoView({ behavior: 'smooth' });
+                      if (!scanPerformed && !scanning) {
+                        handleScan();
+                      }
+                    }}
+                    className="self-start sm:self-auto flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-[11px] font-mono transition-all cursor-pointer"
                   >
-                    {scanning ? (
-                      <RefreshCw className="w-3 h-3 animate-spin" />
-                    ) : (
-                      <Radio className="w-3 h-3" />
-                    )}
-                    <span>{scanning ? 'Varrendo Rede...' : 'Auto-Detectar Câmera'}</span>
+                    <Radar className="w-3 h-3 text-emerald-400 animate-pulse" />
+                    <span>Abrir Detector de Redes</span>
                   </button>
                 </div>
                 <input
@@ -192,40 +286,6 @@ export function CameraConfigView({
                   className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 sm:p-3 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none min-h-[42px]"
                 />
                 <p className="text-[10px] text-zinc-500 font-mono mt-1">IP Padrão de fábrica Intelbras: 192.168.1.108</p>
-
-                {foundCameras.length > 0 && (
-                  <div className="mt-3 p-3 rounded-lg bg-[#0C1017] border border-emerald-500/30 space-y-2">
-                    <p className="text-[11px] font-mono font-bold text-emerald-400 flex items-center gap-1.5">
-                      <Radio className="w-3.5 h-3.5" /> Dispositivos Detectados na Rede:
-                    </p>
-                    <div className="space-y-2">
-                      {foundCameras.map((cam) => (
-                        <div
-                          key={cam.ip}
-                          className="flex flex-col sm:flex-row sm:items-center justify-between p-2.5 rounded bg-zinc-900/80 border border-zinc-800 text-xs font-mono gap-2"
-                        >
-                          <div>
-                            <span className="text-zinc-200 font-bold">{cam.ip}</span>
-                            <span className="text-[10px] text-zinc-400 ml-2 block sm:inline">
-                              {cam.name} (Portas: {cam.ports.join(', ')})
-                            </span>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setIp(cam.ip);
-                              if (cam.ports.includes(554)) setPort(554);
-                              if (cam.ports.includes(80)) setHttpPort(80);
-                            }}
-                            className="w-full sm:w-auto px-2.5 py-1 sm:py-0.5 rounded bg-emerald-500 hover:bg-emerald-400 text-black text-[10px] font-bold uppercase transition-all cursor-pointer text-center"
-                          >
-                            Usar IP
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
@@ -361,10 +421,10 @@ export function CameraConfigView({
           </div>
         </div>
 
-        {/* Barra de Ação Inferior */}
-        <div className="pt-4 border-t border-zinc-800 flex flex-col sm:flex-row items-center justify-between gap-3">
+        {/* Barra de Ação do Formulário */}
+        <div className="pt-2 border-t border-zinc-800/80 flex flex-col sm:flex-row items-center justify-between gap-3">
           <div className="text-xs font-mono text-zinc-500 hidden sm:block">
-            Alterações são aplicadas imediatamente no pipeline de captura
+            Alterações são salvas de forma segura no SQLite com criptografia AES-256
           </div>
 
           <button
@@ -381,6 +441,270 @@ export function CameraConfigView({
           </button>
         </div>
       </form>
+
+      {/* SEÇÃO DEDICADA: DETECTOR AUTOMÁTICO DE CÂMERAS & SCANNER DE SUB-REDES */}
+      <div
+        ref={detectorRef}
+        className="bg-[#080B10] border border-zinc-800/90 rounded-xl p-4 sm:p-6 lg:p-7 space-y-5 sm:space-y-6 relative overflow-hidden"
+      >
+        {/* Glow sutil de fundo do radar */}
+        <div className="absolute top-0 right-0 w-96 h-96 bg-emerald-500/5 rounded-full blur-3xl pointer-events-none -mr-20 -mt-20" />
+
+        {/* Cabeçalho da Seção */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-zinc-800/80 pb-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)] shrink-0">
+              <Radar className={`w-5 h-5 ${scanning ? 'animate-spin text-emerald-300' : ''}`} />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-base sm:text-lg font-bold font-['Chakra_Petch'] text-zinc-100 uppercase tracking-wide">
+                  Detector Automático de Câmeras na Rede
+                </h3>
+                <span className="text-[9px] sm:text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 uppercase">
+                  Scanner Multi-Sub-rede
+                </span>
+              </div>
+              <p className="text-xs text-zinc-400 font-mono">
+                Varredura paralela no modem principal (192.168.1.x), 2º modem/roteador (192.168.2.x) ou sub-redes personalizadas
+              </p>
+            </div>
+          </div>
+
+          <div className="text-[10px] font-mono text-zinc-500 hidden md:block text-right">
+            <span>PORTAS: 554 (RTSP) · 80 (HTTP) · 37777 (DAHUA) · 8000 (HIK)</span>
+          </div>
+        </div>
+
+        {/* Configuração de Sub-redes para Varredura */}
+        <div className="space-y-3 sm:space-y-4">
+          <div>
+            <label className="block text-xs font-semibold text-zinc-300 font-mono mb-2 flex items-center gap-2">
+              <Network className="w-3.5 h-3.5 text-emerald-400" />
+              Sub-redes para Varredura (Selecione os atalhos ou digite os IPs dos modens)
+            </label>
+
+            {/* Presets Rápidos */}
+            <div className="flex flex-wrap gap-2 mb-3">
+              {presetSubnets.map((p) => {
+                const active = isPresetActive(p.value);
+                return (
+                  <button
+                    key={p.value}
+                    type="button"
+                    onClick={() => togglePresetSubnet(p.value)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-mono transition-all border flex items-center gap-1.5 cursor-pointer ${
+                      active
+                        ? 'bg-emerald-500/20 border-emerald-500/60 text-emerald-300 shadow-[0_0_10px_rgba(16,185,129,0.15)] font-semibold'
+                        : 'bg-[#0E131C] border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                    }`}
+                  >
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        active ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-600'
+                      }`}
+                    />
+                    <span>{p.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Campo de Entrada de Sub-redes Customizadas + Botão de Ação */}
+            <div className="flex flex-col sm:flex-row gap-2.5">
+              <div className="relative flex-1">
+                <input
+                  type="text"
+                  value={subnetsInput}
+                  onChange={(e) => setSubnetsInput(e.target.value)}
+                  placeholder="Ex: 192.168.1.1, 192.168.2.1 ou 192.168.1, 192.168.2"
+                  className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg px-3 py-2.5 text-xs text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none min-h-[42px]"
+                />
+                <span className="absolute right-3 top-3 text-[10px] font-mono text-zinc-500 hidden sm:block">
+                  separado por vírgula
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => handleScan()}
+                disabled={scanning || !subnetsInput.trim()}
+                className="flex items-center justify-center gap-2 px-6 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black font-bold font-mono text-xs uppercase tracking-wider transition-all disabled:opacity-50 cursor-pointer shadow-lg shadow-emerald-500/20 shrink-0 min-h-[42px]"
+              >
+                {scanning ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Varrendo Redes...</span>
+                  </>
+                ) : (
+                  <>
+                    <Radar className="w-3.5 h-3.5" />
+                    <span>Escanear Sub-redes</span>
+                  </>
+                )}
+              </button>
+            </div>
+            <p className="text-[10px] text-zinc-500 font-mono mt-1.5 flex items-center gap-1.5">
+              <span>💡 Dica: Você pode digitar o IP de cada modem (ex: 192.168.1.1, 192.168.2.1) que o detector varrerá todos os 254 endereços de cada um em paralelo (~2 a 3 segundos).</span>
+            </p>
+          </div>
+        </div>
+
+        {/* Mensagem de Feedback do Detector */}
+        {detectorMessage && (
+          <div
+            className={`p-3.5 rounded-xl border text-xs flex items-center gap-3 font-mono ${
+              detectorMessage.type === 'success'
+                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                : detectorMessage.type === 'error'
+                ? 'bg-red-500/10 border-red-500/30 text-red-300'
+                : 'bg-zinc-800/40 border-zinc-700/50 text-zinc-300'
+            }`}
+          >
+            {detectorMessage.type === 'success' ? (
+              <CheckCircle className="w-4 h-4 shrink-0 text-emerald-400" />
+            ) : detectorMessage.type === 'error' ? (
+              <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+            ) : (
+              <HelpCircle className="w-4 h-4 shrink-0 text-amber-400" />
+            )}
+            <span>{detectorMessage.text}</span>
+          </div>
+        )}
+
+        {/* Animação de Varredura em Andamento */}
+        {scanning && (
+          <div className="p-6 rounded-xl bg-[#0C1017] border border-emerald-500/30 flex flex-col items-center justify-center space-y-3 text-center">
+            <div className="relative">
+              <Radar className="w-10 h-10 text-emerald-400 animate-spin" />
+              <div className="absolute inset-0 rounded-full bg-emerald-500/20 animate-ping pointer-events-none" />
+            </div>
+            <div>
+              <p className="text-sm font-bold font-mono text-emerald-400 uppercase tracking-wide">
+                Varrendo Sub-redes em Paralelo...
+              </p>
+              <p className="text-xs text-zinc-400 font-mono mt-1">
+                Testando portas RTSP (554), HTTP (80) e Dahua/Intelbras (37777) em {subnetsInput}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Lista de Resultados de Câmeras e Dispositivos Encontrados */}
+        {!scanning && scanPerformed && (
+          <div className="space-y-3">
+            <div className="flex items-center justify-between border-b border-zinc-800/80 pb-2">
+              <span className="text-xs font-bold uppercase tracking-wider text-zinc-300 font-mono flex items-center gap-2">
+                <Camera className="w-4 h-4 text-emerald-400" /> Dispositivos Detectados ({foundCameras.length})
+              </span>
+              {scannedSubnets.length > 0 && (
+                <span className="text-[10px] font-mono text-zinc-500">
+                  Sub-redes: {scannedSubnets.join(', ')}
+                </span>
+              )}
+            </div>
+
+            {foundCameras.length === 0 ? (
+              <div className="p-5 rounded-xl bg-[#0C1017] border border-zinc-800/80 space-y-3 text-xs font-mono text-zinc-400">
+                <div className="flex items-start gap-2.5 text-zinc-300">
+                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-bold text-zinc-200">Nenhuma câmera detectada nas sub-redes varridas.</p>
+                    <p className="text-zinc-400 mt-1">
+                      Possíveis causas e como resolver:
+                    </p>
+                  </div>
+                </div>
+                <ul className="list-disc list-inside space-y-1.5 pl-2 text-[11px] text-zinc-400">
+                  <li>
+                    <span className="text-zinc-200 font-semibold">2º Modem em rede isolada:</span> Se o segundo modem estiver com roteamento próprio (NAT duplo), certifique-se de que a opção <span className="text-emerald-400">"Isolamento de AP"</span> (AP Isolation) está desativada nele.
+                  </li>
+                  <li>
+                    <span className="text-zinc-200 font-semibold">Faixa de IP diferente:</span> Verifique se o IP do segundo modem não é por exemplo <span className="text-emerald-400">192.168.15.1</span> (Vivo Fibra) ou <span className="text-emerald-400">192.168.0.1</span> e adicione-o na lista acima.
+                  </li>
+                  <li>
+                    <span className="text-zinc-200 font-semibold">Câmera recém-ligada:</span> A Intelbras leva cerca de 45 segundos para inicializar os serviços RTSP após ser ligada na energia.
+                  </li>
+                </ul>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {foundCameras.map((cam) => {
+                  const isCamera = cam.is_camera !== false;
+                  return (
+                    <div
+                      key={cam.ip}
+                      className={`p-3.5 rounded-xl border flex flex-col justify-between gap-3 transition-all ${
+                        isCamera
+                          ? 'bg-[#0C111A] border-emerald-500/40 hover:border-emerald-500/70 shadow-[0_0_15px_rgba(16,185,129,0.05)]'
+                          : 'bg-[#0E131C] border-zinc-800/90 hover:border-zinc-700'
+                      }`}
+                    >
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <span
+                            className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase tracking-wider flex items-center gap-1.5 ${
+                              isCamera
+                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                : 'bg-zinc-800 text-zinc-400 border border-zinc-700'
+                            }`}
+                          >
+                            <Camera className="w-3 h-3" />
+                            {cam.name}
+                          </span>
+                          {cam.subnet && (
+                            <span className="text-[10px] font-mono text-zinc-500">
+                              {cam.subnet}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-base font-bold font-mono text-zinc-100 tracking-wide">
+                            {cam.ip}
+                          </span>
+                        </div>
+
+                        <div className="flex flex-wrap gap-1.5 pt-1">
+                          {cam.ports.map((p) => {
+                            let label = `Porta ${p}`;
+                            if (p === 554) label = '554 (RTSP)';
+                            if (p === 80) label = '80 (HTTP)';
+                            if (p === 37777) label = '37777 (Intelbras/Dahua)';
+                            if (p === 8000) label = '8000 (Hikvision)';
+                            if (p === 8899) label = '8899 (ONVIF)';
+                            return (
+                              <span
+                                key={p}
+                                className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-300"
+                              >
+                                {label}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => handleSelectCamera(cam)}
+                        className={`w-full py-2 px-3 rounded-lg text-xs font-mono font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                          isCamera
+                            ? 'bg-emerald-500 hover:bg-emerald-400 text-black shadow-md shadow-emerald-500/20'
+                            : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-200'
+                        }`}
+                      >
+                        <ArrowUpRight className="w-3.5 h-3.5" />
+                        <span>Usar esta Câmera</span>
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -421,9 +421,31 @@ class CameraService:
         return filename
 
     @staticmethod
-    def scan_network_cameras(base_subnet: str = None) -> list:
-        """Varre a sub-rede local nas portas RTSP (554), HTTP (80) e Dahua/Intelbras (37777)."""
-        if not base_subnet:
+    def _parse_subnets(subnets_input: str | list[str] | None) -> list[str]:
+        """
+        Normaliza entradas de sub-redes como '192.168.1, 192.168.2.1, 192.168.0.0/24'
+        para ['192.168.1', '192.168.2', '192.168.0'].
+        """
+        raw_items: list[str] = []
+        if isinstance(subnets_input, list):
+            raw_items = subnets_input
+        elif isinstance(subnets_input, str):
+            import re
+            raw_items = [part.strip() for part in re.split(r"[,;\s]+", subnets_input) if part.strip()]
+
+        normalized = set()
+        for item in raw_items:
+            clean = item.split("/")[0].strip()
+            parts = clean.split(".")
+            if len(parts) >= 3:
+                try:
+                    octets = [int(p) for p in parts[:3]]
+                    if all(0 <= o <= 255 for o in octets):
+                        normalized.add(f"{octets[0]}.{octets[1]}.{octets[2]}")
+                except ValueError:
+                    continue
+
+        if not normalized:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.settimeout(0.5)
@@ -431,16 +453,39 @@ class CameraService:
                 local_ip = s.getsockname()[0]
                 s.close()
                 parts = local_ip.split(".")
-                base_subnet = f"{parts[0]}.{parts[1]}.{parts[2]}"
+                normalized.add(f"{parts[0]}.{parts[1]}.{parts[2]}")
             except Exception:
-                base_subnet = "192.168.1"
+                normalized.add("192.168.1")
+
+            # Se a sub-rede principal for 192.168.1, inclui também 192.168.2 (segundo modem/roteador comum)
+            if "192.168.1" in normalized:
+                normalized.add("192.168.2")
+
+        return sorted(list(normalized))
+
+    @classmethod
+    def scan_network_cameras(cls, subnets: str | list[str] | None = None) -> dict:
+        """
+        Varre uma ou mais sub-redes em paralelo procurando câmeras IP e dispositivos.
+        Portas avaliadas:
+          - 554: RTSP (streaming de vídeo universal)
+          - 80: HTTP (web da câmera / snapshot CGI)
+          - 37777: Dahua / Intelbras RPC e vídeo nativo
+          - 8000: Hikvision
+          - 8899: ONVIF Device Service
+        """
+        target_subnets = cls._parse_subnets(subnets)
+        all_ips = []
+        for subnet in target_subnets:
+            all_ips.extend([f"{subnet}.{i}" for i in range(1, 255)])
+
+        ports = [37777, 554, 80, 8000, 8899]
 
         def _check_ip(ip):
-            ports = [37777, 80, 554]
             found = []
             for port in ports:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.3)
+                s.settimeout(0.25)
                 try:
                     if s.connect_ex((ip, port)) == 0:
                         found.append(port)
@@ -448,19 +493,53 @@ class CameraService:
                     pass
                 finally:
                     s.close()
+
             if found:
-                name = "Intelbras / Dahua" if (37777 in found or 554 in found) else "Dispositivo IP"
-                return {"ip": ip, "ports": found, "name": name}
+                if 37777 in found:
+                    name = "Intelbras / Dahua"
+                    is_camera = True
+                elif 8000 in found:
+                    name = "Hikvision"
+                    is_camera = True
+                elif 554 in found:
+                    name = "Câmera IP (RTSP)"
+                    is_camera = True
+                elif 8899 in found:
+                    name = "Câmera ONVIF"
+                    is_camera = True
+                else:
+                    name = "Dispositivo Web (HTTP)"
+                    is_camera = False
+
+                parts = ip.split(".")
+                return {
+                    "ip": ip,
+                    "subnet": f"{parts[0]}.{parts[1]}.{parts[2]}.0/24",
+                    "ports": found,
+                    "name": name,
+                    "is_camera": is_camera,
+                }
             return None
 
-        ips = [f"{base_subnet}.{i}" for i in range(1, 255)]
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-            futures = [executor.submit(_check_ip, ip) for ip in ips]
+        workers = min(120, max(25, len(all_ips) // 4))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_check_ip, ip) for ip in all_ips]
             for f in concurrent.futures.as_completed(futures):
                 res = f.result()
                 if res:
                     results.append(res)
-        return sorted(results, key=lambda x: [int(p) for p in x["ip"].split(".")])
+
+        sorted_results = sorted(
+            results,
+            key=lambda x: (
+                0 if x["is_camera"] else 1,
+                [int(p) for p in x["ip"].split(".")]
+            )
+        )
+        return {
+            "cameras": sorted_results,
+            "scanned_subnets": [f"{s}.0/24" for s in target_subnets]
+        }
 
 camera_service = CameraService()
