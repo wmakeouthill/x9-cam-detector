@@ -15,4 +15,6 @@ from app.db.db import (
     increment_sync_retry,
     get_pending_sync_files,
     is_file_synced_or_untracked,
+    get_whatsapp_config,
+    save_whatsapp_config,
 )

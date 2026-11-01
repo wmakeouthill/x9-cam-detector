@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     GOOGLE_DRIVE_FOLDER_ID: str = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
     GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE: str = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE", "service_account.json")
 
+    # Notificações WhatsApp (Evolution API v2)
+    EVOLUTION_API_URL: str = os.getenv("EVOLUTION_API_URL", "")
+    EVOLUTION_API_KEY: str = os.getenv("EVOLUTION_API_KEY", "")
+    EVOLUTION_INSTANCE_NAME: str = os.getenv("EVOLUTION_INSTANCE_NAME", "")
+    EVOLUTION_TARGET_NUMBERS: str = os.getenv("EVOLUTION_TARGET_NUMBERS", "")
+
     @property
     def RTSP_URL(self) -> str:
         return f"rtsp://{self.CAMERA_USER}:{self.CAMERA_PASSWORD}@{self.CAMERA_IP}:{self.CAMERA_PORT}/cam/realmonitor?channel=1&subtype={self.CAMERA_SUBTYPE}"

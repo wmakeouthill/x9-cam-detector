@@ -9,6 +9,7 @@ from app.core.time import get_now
 from app.db import get_night_watch_config, log_detection_event, cleanup_retention
 from app.services.camera_service import camera_service
 from app.services.gdrive_service import gdrive_service
+from app.services.evolution_service import evolution_service
 
 logger = logging.getLogger("x9.detector")
 
@@ -37,9 +38,10 @@ class SimpleTracker:
     Garante ID consistente para cada pessoa e evita que a caixa pisque quando a
     confiança oscila por alguns quadros.
     """
-    def __init__(self, max_age_seconds: float = 0.8, iou_threshold: float = 0.25):
+    def __init__(self, max_age_seconds: float = 2.0, iou_threshold: float = 0.20, min_hits: int = 1):
         self.max_age_seconds = max_age_seconds
         self.iou_threshold = iou_threshold
+        self.min_hits = min_hits
         self.next_id = 1
         self.tracks = {}  # tid: {"box": [x1, y1, x2, y2], "conf": float, "last_seen": float, "hits": int}
 
@@ -51,6 +53,10 @@ class SimpleTracker:
             tid: trk for tid, trk in self.tracks.items()
             if (now - trk["last_seen"]) < self.max_age_seconds
         }
+
+        # Quando não há ninguém na cena, reseta contador para #1 (evita IDs infinitos)
+        if not self.tracks:
+            self.next_id = 1
 
         matched_tracks = set()
         matched_detections = set()
@@ -93,14 +99,17 @@ class SimpleTracker:
                     "hits": 1,
                 }
 
+        # Retorna tracks ativos com proteção contra ruído transitório (hits >= min_hits)
         return [
             {
                 "box": tuple(trk["box"]),
                 "track_id": tid,
                 "conf": trk["conf"],
                 "last_seen": trk["last_seen"],
+                "hits": trk["hits"],
             }
             for tid, trk in self.tracks.items()
+            if trk["hits"] >= self.min_hits
         ]
 
 class DetectorService:
@@ -114,12 +123,13 @@ class DetectorService:
         self.last_detection_time = 0.0
         self.last_cleanup_time = 0.0
         self.cooldown_seconds = 20.0 # Intervalo mínimo entre disparos de flash para não ofuscar em excesso
-        self.tracker = SimpleTracker(max_age_seconds=0.8, iou_threshold=0.25)
+        self.tracker = SimpleTracker(max_age_seconds=2.0, iou_threshold=0.20, min_hits=2)
         
         # Telemetria em tempo real
         self.is_active = False
         self.last_person_detected = False
         self.last_confidence = 0.0
+        self.people_count = 0
         self.detections_count = 0
         self.test_mode = False # Por padrão desligado; segue rigorosamente a janela cadastrada
 
@@ -222,6 +232,7 @@ class DetectorService:
 
                 self.last_person_detected = person_detected
                 self.last_confidence = max_conf
+                self.people_count = len(active_tracks)
 
                 # 3. Gating do MODO VIGIA (Flash, Alarme Noturno e Snapshot de Invasão)
                 vigia_enabled = bool(cfg.get("enabled", 1))
@@ -265,9 +276,11 @@ class DetectorService:
                     
                     # 4. Foto 2: Foto com Flash (Full Color 1080p nítida com o ambiente 100% iluminado)
                     snapshot_flash = camera_service.take_snapshot(prefix="snapshot_flash")
+                    # Envio imediato da foto de flagrante no WhatsApp (assíncrono)
+                    evolution_service.send_alert_photo_async(snapshot_flash, max_conf)
 
                     # 5. Grava clipe de vídeo MP4 em alta definição com áudio sincronizado (10 segundos)
-                    # O upload para o Google Drive é agendado para quando o ffmpeg terminar de renderizar o arquivo completo
+                    # O upload para o Google Drive e WhatsApp é agendado para quando o ffmpeg terminar de renderizar o arquivo completo
                     def _upload_video_when_ready(fpath, fname):
                         logger.info(f"[+] Gravação finalizada, enviando vídeo ao Google Drive: {fname}")
                         gdrive_service.upload_file_async(
@@ -275,6 +288,8 @@ class DetectorService:
                             description=f"Gravação Noturna X9: Vídeo de Invasão ({max_conf:.1%})",
                             file_type="recording"
                         )
+                        # Envio do vídeo de 10s no WhatsApp (assíncrono)
+                        evolution_service.send_alert_video_async(fpath, max_conf)
 
                     video_filename = camera_service.record_clip(seconds=video_duration, on_complete=_upload_video_when_ready)
 

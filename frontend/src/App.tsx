@@ -19,6 +19,7 @@ interface CameraStatus {
   user: string;
   detector_active?: boolean;
   person_detected?: boolean;
+  people_count?: number;
   last_confidence?: number;
   detections_count?: number;
   test_mode?: boolean;
@@ -93,6 +94,7 @@ export function App() {
               cameraIp={camStatus.ip}
               detectorActive={camStatus.detector_active}
               personDetected={camStatus.person_detected}
+              peopleCount={camStatus.people_count}
               lastConfidence={camStatus.last_confidence}
               detectionsCount={camStatus.detections_count}
               testMode={camStatus.test_mode}

@@ -78,6 +78,21 @@ def init_db():
         )
     """)
 
+    # Tabela 5: Configurações do WhatsApp (Evolution API v2 com chave criptografada)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS whatsapp_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 0,
+            api_url TEXT NOT NULL DEFAULT '',
+            api_key_encrypted TEXT NOT NULL DEFAULT '',
+            instance_name TEXT NOT NULL DEFAULT '',
+            target_number TEXT NOT NULL DEFAULT '',
+            send_photo INTEGER NOT NULL DEFAULT 1,
+            send_video INTEGER NOT NULL DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Popula dados padrão se tabela estiver vazia
     cursor.execute("SELECT COUNT(*) as count FROM camera_config WHERE id = 1")
     if cursor.fetchone()["count"] == 0:
@@ -99,6 +114,19 @@ def init_db():
             INSERT INTO night_watch_config (id, enabled, start_time, end_time, flash_duration, confidence_threshold, model_type, retention_days)
             VALUES (1, 1, '00:00', '06:00', 2.5, 0.45, 'yolov8s', 15)
         """)
+
+    cursor.execute("SELECT COUNT(*) as count FROM whatsapp_config WHERE id = 1")
+    if cursor.fetchone()["count"] == 0:
+        cursor.execute("""
+            INSERT INTO whatsapp_config (id, enabled, api_url, api_key_encrypted, instance_name, target_number, send_photo, send_video)
+            VALUES (1, ?, ?, ?, ?, ?, 1, 1)
+        """, (
+            1 if (settings.EVOLUTION_API_URL and settings.EVOLUTION_INSTANCE_NAME) else 0,
+            settings.EVOLUTION_API_URL,
+            encrypt_credential(settings.EVOLUTION_API_KEY) if settings.EVOLUTION_API_KEY else "",
+            settings.EVOLUTION_INSTANCE_NAME,
+            settings.EVOLUTION_TARGET_NUMBERS,
+        ))
 
     conn.commit()
     conn.close()
@@ -371,3 +399,81 @@ def cleanup_retention(retention_days: int = 15):
     conn.close()
     if deleted > 0:
         logger.info(f"Limpeza de retenção local ({retention_days} dias): {deleted} registros antigos removidos com proteção de nuvem.")
+
+def get_whatsapp_config(decrypt_key: bool = False) -> dict:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM whatsapp_config WHERE id = 1")
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return {
+            "enabled": False,
+            "api_url": "",
+            "instance_name": "",
+            "target_number": "",
+            "send_photo": True,
+            "send_video": True,
+            "has_key": False,
+            "api_key": "",
+        }
+    encrypted_key = row["api_key_encrypted"] or ""
+    has_key = bool(encrypted_key)
+    api_key_val = ""
+    if has_key:
+        api_key_val = decrypt_credential(encrypted_key) if decrypt_key else "••••••••"
+    return {
+        "enabled": bool(row["enabled"]),
+        "api_url": row["api_url"] or "",
+        "instance_name": row["instance_name"] or "",
+        "target_number": row["target_number"] or "",
+        "send_photo": bool(row["send_photo"]),
+        "send_video": bool(row["send_video"]),
+        "has_key": has_key,
+        "api_key": api_key_val,
+    }
+
+def save_whatsapp_config(
+    enabled: bool,
+    api_url: str,
+    instance_name: str,
+    target_number: str,
+    send_photo: bool = True,
+    send_video: bool = True,
+    api_key: str = None,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT api_key_encrypted FROM whatsapp_config WHERE id = 1")
+    existing = cursor.fetchone()
+    existing_encrypted = existing["api_key_encrypted"] if existing else ""
+
+    if api_key and api_key.strip() and api_key != "••••••••":
+        new_encrypted = encrypt_credential(api_key.strip())
+    else:
+        new_encrypted = existing_encrypted
+
+    cursor.execute("""
+        INSERT INTO whatsapp_config (id, enabled, api_url, api_key_encrypted, instance_name, target_number, send_photo, send_video, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(id) DO UPDATE SET
+            enabled = excluded.enabled,
+            api_url = excluded.api_url,
+            api_key_encrypted = excluded.api_key_encrypted,
+            instance_name = excluded.instance_name,
+            target_number = excluded.target_number,
+            send_photo = excluded.send_photo,
+            send_video = excluded.send_video,
+            updated_at = CURRENT_TIMESTAMP
+    """, (
+        1 if enabled else 0,
+        api_url.strip(),
+        new_encrypted,
+        instance_name.strip(),
+        target_number.strip(),
+        1 if send_photo else 0,
+        1 if send_video else 0,
+    ))
+    conn.commit()
+    conn.close()
+    logger.info("Configurações do WhatsApp (Evolution API) atualizadas com sucesso.")

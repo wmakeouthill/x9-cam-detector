@@ -61,3 +61,30 @@ def test_tracker_multiple_people():
     assert len(tracks) == 2
     track_ids = {t["track_id"] for t in tracks}
     assert len(track_ids) == 2
+
+def test_tracker_min_hits_confirmation_and_id_reset():
+    # min_hits=2: requer pelo menos 2 frames para confirmar a pessoa (filtra ruído transitório)
+    tracker = SimpleTracker(max_age_seconds=0.4, iou_threshold=0.25, min_hits=2)
+
+    # Frame 1: detecção inicial isolada (ainda não atinge min_hits=2)
+    det1 = [{"box": [50, 50, 100, 150], "conf": 0.80}]
+    tracks1 = tracker.update(det1)
+    assert len(tracks1) == 0  # Protegido contra contar à toa no primeiro milissegundo
+
+    # Frame 2: mesma pessoa confirmada no frame seguinte
+    det2 = [{"box": [52, 51, 102, 151], "conf": 0.85}]
+    tracks2 = tracker.update(det2)
+    assert len(tracks2) == 1
+    assert tracks2[0]["track_id"] == 1
+    assert tracks2[0]["hits"] == 2
+
+    # Cena esvaziada e expiração
+    time.sleep(0.45)
+    tracks_empty = tracker.update([])
+    assert len(tracks_empty) == 0
+
+    # Próxima pessoa que entrar depois de limpo deve receber ID 1 novamente
+    tracker.update([{"box": [50, 50, 100, 150], "conf": 0.80}])
+    tracks_new = tracker.update([{"box": [50, 50, 100, 150], "conf": 0.85}])
+    assert len(tracks_new) == 1
+    assert tracks_new[0]["track_id"] == 1

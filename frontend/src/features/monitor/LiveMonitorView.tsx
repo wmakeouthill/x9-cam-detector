@@ -8,7 +8,7 @@ import {
   AlertCircle,
   CheckCircle,
   ShieldAlert,
-  UserCheck,
+  Users,
   Volume2,
   VolumeX,
   Volume1,
@@ -23,6 +23,7 @@ interface LiveMonitorViewProps {
   cameraIp: string;
   detectorActive?: boolean;
   personDetected?: boolean;
+  peopleCount?: number;
   lastConfidence?: number;
   detectionsCount?: number;
   testMode?: boolean;
@@ -36,6 +37,7 @@ export function LiveMonitorView({
   cameraIp,
   detectorActive,
   personDetected,
+  peopleCount,
   lastConfidence,
   detectionsCount,
   testMode,
@@ -414,17 +416,25 @@ export function LiveMonitorView({
             INTELBRAS VIP 1230 FC+ • {cameraIp}
           </div>
 
-          {detectorActive && (
-            <div className="flex items-center gap-1 sm:gap-1.5 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-cyan-950/80 backdrop-blur-md border border-cyan-500/50 text-cyan-300 text-[10px] sm:text-xs font-mono font-semibold shadow-[0_0_10px_rgba(6,182,212,0.2)]">
-              <ShieldAlert className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
-              <span>YOLO VIGIA ({detectionsCount || 0})</span>
+          {/* Contador de Pessoas na Cena em Tempo Real */}
+          {personDetected && (peopleCount || 0) > 0 ? (
+            <div className="flex items-center gap-1 sm:gap-1.5 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-amber-500/95 backdrop-blur-md border border-amber-300 text-black text-[10px] sm:text-xs font-mono font-bold shadow-[0_0_15px_rgba(245,158,11,0.6)] animate-pulse">
+              <Users className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-black" />
+              <span>
+                {peopleCount} {peopleCount === 1 ? 'PESSOA' : 'PESSOAS'} NA CENA ({lastConfidence}%)
+              </span>
+            </div>
+          ) : (
+            <div className="hidden sm:flex items-center gap-1 sm:gap-1.5 px-2 py-0.5 sm:px-2 sm:py-1 rounded bg-black/60 backdrop-blur-md border border-emerald-500/30 text-emerald-400 text-[10px] sm:text-xs font-mono">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+              <span>CENA LIVRE</span>
             </div>
           )}
 
-          {personDetected && (
-            <div className="flex items-center gap-1 sm:gap-1.5 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-red-600/90 backdrop-blur-md border border-red-400 text-white text-[10px] sm:text-xs font-mono font-bold shadow-[0_0_15px_#ef4444] animate-bounce">
-              <UserCheck className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
-              <span>PESSOA ({lastConfidence}%)</span>
+          {detectorActive && (
+            <div className="flex items-center gap-1 sm:gap-1.5 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-cyan-950/80 backdrop-blur-md border border-cyan-500/50 text-cyan-300 text-[10px] sm:text-xs font-mono font-semibold shadow-[0_0_10px_rgba(6,182,212,0.2)]">
+              <ShieldAlert className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
+              <span>VIGIA: {detectionsCount || 0} ALARMES</span>
             </div>
           )}
         </div>

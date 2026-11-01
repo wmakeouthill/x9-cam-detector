@@ -1,0 +1,261 @@
+import os
+import base64
+import logging
+import threading
+import requests
+from typing import Optional, Dict, Any
+from app.core.time import get_now_str
+from app.db import get_whatsapp_config
+
+logger = logging.getLogger("x9.evolution")
+
+class EvolutionService:
+    @staticmethod
+    def normalize_number(number: str) -> str:
+        """Normaliza o número para formato padrão internacional do WhatsApp (ex: 5511999999999)."""
+        if not number:
+            return ""
+        digits = "".join(c for c in number if c.isdigit())
+        # Se usuário colocou 10 ou 11 dígitos (DDD + celular do Brasil sem DDI 55)
+        if len(digits) in (10, 11):
+            digits = f"55{digits}"
+        return digits
+
+    @classmethod
+    def parse_numbers(cls, raw: str) -> list[str]:
+        """Extrai e normaliza múltiplos números separados por vírgula, ponto-e-vírgula ou quebra de linha."""
+        if not raw:
+            return []
+        parts = [raw]
+        for delimiter in [",", ";", "\n", "/"]:
+            new_parts = []
+            for p in parts:
+                new_parts.extend(p.split(delimiter))
+            parts = new_parts
+
+        normalized_list = []
+        for p in parts:
+            clean = cls.normalize_number(p.strip())
+            if clean and clean not in normalized_list:
+                normalized_list.append(clean)
+        return normalized_list
+
+    def _resolve_full_path(self, filepath: str) -> str:
+        if not filepath:
+            return ""
+        if os.path.isabs(filepath) and os.path.exists(filepath):
+            return filepath
+        filename = os.path.basename(filepath)
+        for base in ["snapshots", "backend/snapshots", "recordings", "backend/recordings", ""]:
+            cand = os.path.join(base, filename) if base else filepath
+            if os.path.exists(cand):
+                return cand
+        return ""
+
+    def test_connection(self, api_url: str, api_key: str, instance_name: str) -> Dict[str, Any]:
+        """Testa o status de conexão da instância na Evolution API v2."""
+        if not api_url or not instance_name:
+            return {"connected": False, "state": "error", "message": "URL e Nome da Instância são obrigatórios."}
+        
+        url = f"{api_url.rstrip('/')}/instance/connectionState/{instance_name.strip()}"
+        headers = {"apikey": api_key.strip()}
+        try:
+            r = requests.get(url, headers=headers, timeout=8.0)
+            if r.status_code == 200:
+                data = r.json()
+                # Na Evolution v2: {"instance": {"state": "open"}}
+                inst_data = data.get("instance", {})
+                state = inst_data.get("state") or data.get("state", "open")
+                is_open = (state == "open")
+                msg = "WhatsApp conectado e pronto!" if is_open else f"Instância encontrada, mas estado é '{state}' (aguardando QR Code ou reconexão)."
+                return {"connected": is_open, "state": state, "message": msg}
+            elif r.status_code == 404:
+                return {"connected": False, "state": "not_found", "message": f"Instância '{instance_name}' não encontrada na Evolution API."}
+            elif r.status_code in (401, 403):
+                return {"connected": False, "state": "unauthorized", "message": "API Key inválida ou sem permissão de acesso."}
+            else:
+                return {"connected": False, "state": f"http_{r.status_code}", "message": f"Erro HTTP {r.status_code} da Evolution API: {r.text[:120]}"}
+        except requests.exceptions.Timeout:
+            return {"connected": False, "state": "timeout", "message": "Tempo limite esgotado ao contatar a Evolution API (verifique URL e firewall)."}
+        except Exception as e:
+            return {"connected": False, "state": "error", "message": f"Falha de rede ao conectar na Evolution API: {str(e)}"}
+
+    def send_test_message(self, api_url: str, api_key: str, instance_name: str, target_number: str) -> Dict[str, Any]:
+        """Envia mensagem de texto de teste para validar entrega no WhatsApp (para todos os números informados)."""
+        numbers = self.parse_numbers(target_number)
+        if not numbers:
+            return {"success": False, "message": "Nenhum número de telefone válido encontrado."}
+
+        url = f"{api_url.rstrip('/')}/message/sendText/{instance_name.strip()}"
+        headers = {
+            "apikey": api_key.strip(),
+            "Content-Type": "application/json",
+        }
+        text = (
+            "🟢 *X9 CAM DETECTOR - TESTE DE ALERTA*\n\n"
+            f"📅 Teste realizado em {get_now_str('%d/%m/%Y às %H:%M:%S')}\n"
+            "✅ Sua Evolution API está conectada e configurada com sucesso!\n"
+            "Quando o Modo Vigia detectar uma pessoa, você receberá aqui a foto com flash e o vídeo de flagrante."
+        )
+
+        success_count = 0
+        last_error = ""
+        for norm_num in numbers:
+            payload = {
+                "number": norm_num,
+                "text": text,
+                "delay": 500,
+            }
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=12.0)
+                if r.status_code in (200, 201):
+                    success_count += 1
+                else:
+                    last_error = f"HTTP {r.status_code}: {r.text[:120]}"
+            except Exception as e:
+                last_error = str(e)
+
+        if success_count > 0:
+            recipients = ", ".join(f"+{n}" for n in numbers)
+            return {"success": True, "message": f"Mensagem de teste enviada com sucesso para {success_count} número(s): {recipients}!"}
+        return {"success": False, "message": f"Falha ao enviar mensagem de teste: {last_error}"}
+
+    def send_alert_photo_async(self, snapshot_path: str, confidence: float):
+        """Envia a foto de flagrante com flash de forma 100% assíncrona em background."""
+        threading.Thread(
+            target=self._send_photo_worker,
+            args=(snapshot_path, confidence),
+            daemon=True
+        ).start()
+
+    def _send_photo_worker(self, snapshot_path: str, confidence: float):
+        try:
+            cfg = get_whatsapp_config(decrypt_key=True)
+            if not cfg.get("enabled") or not cfg.get("send_photo"):
+                return
+            
+            api_url = cfg.get("api_url")
+            api_key = cfg.get("api_key")
+            instance = cfg.get("instance_name")
+            target_number = cfg.get("target_number")
+
+            if not api_url or not api_key or not instance or not target_number:
+                logger.warning("[WhatsApp] Configuração incompleta para envio de foto de alerta.")
+                return
+
+            numbers = self.parse_numbers(target_number)
+            if not numbers:
+                return
+
+            full_path = self._resolve_full_path(snapshot_path)
+            if not full_path or not os.path.exists(full_path):
+                logger.warning(f"[WhatsApp] Arquivo de snapshot não encontrado: {snapshot_path}")
+                return
+
+            with open(full_path, "rb") as f:
+                b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+            hora_formatada = get_now_str("%d/%m/%Y às %H:%M:%S")
+            caption = (
+                "🚨 *X9 CAM DETECTOR - ALERTA DE VIGIA*\n\n"
+                f"📅 *Horário:* {hora_formatada}\n"
+                f"👤 *Detecção:* Pessoa ({confidence:.1%})\n"
+                "💡 *Flash LED acionado e gravação em andamento!*"
+            )
+
+            url = f"{api_url.rstrip('/')}/message/sendMedia/{instance.strip()}"
+            headers = {
+                "apikey": api_key.strip(),
+                "Content-Type": "application/json",
+            }
+
+            for norm_num in numbers:
+                payload = {
+                    "number": norm_num,
+                    "mediatype": "image",
+                    "mimetype": "image/jpeg",
+                    "caption": caption,
+                    "media": b64_data,
+                    "fileName": os.path.basename(full_path) or "flagrante_x9.jpg",
+                    "delay": 1000,
+                }
+                try:
+                    r = requests.post(url, headers=headers, json=payload, timeout=20.0)
+                    if r.status_code in (200, 201):
+                        logger.info(f"[+] Foto de flagrante enviada via WhatsApp para +{norm_num}!")
+                    else:
+                        logger.warning(f"[-] Falha HTTP {r.status_code} ao enviar foto WhatsApp para +{norm_num}: {r.text[:150]}")
+                except Exception as e:
+                    logger.error(f"[-] Erro ao enviar foto no WhatsApp para +{norm_num}: {e}")
+        except Exception as e:
+            logger.error(f"[-] Erro geral no worker de foto WhatsApp: {e}")
+
+    def send_alert_video_async(self, video_path: str, confidence: float):
+        """Envia o clipe de vídeo (10s) de forma 100% assíncrona em background."""
+        threading.Thread(
+            target=self._send_video_worker,
+            args=(video_path, confidence),
+            daemon=True
+        ).start()
+
+    def _send_video_worker(self, video_path: str, confidence: float):
+        try:
+            cfg = get_whatsapp_config(decrypt_key=True)
+            if not cfg.get("enabled") or not cfg.get("send_video"):
+                return
+            
+            api_url = cfg.get("api_url")
+            api_key = cfg.get("api_key")
+            instance = cfg.get("instance_name")
+            target_number = cfg.get("target_number")
+
+            if not api_url or not api_key or not instance or not target_number:
+                return
+
+            numbers = self.parse_numbers(target_number)
+            if not numbers:
+                return
+
+            full_path = self._resolve_full_path(video_path)
+            if not full_path or not os.path.exists(full_path):
+                logger.warning(f"[WhatsApp] Arquivo de vídeo não encontrado: {video_path}")
+                return
+
+            with open(full_path, "rb") as f:
+                b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+            hora_formatada = get_now_str("%d/%m/%Y às %H:%M:%S")
+            caption = (
+                "📹 *X9 CAM DETECTOR - CLIPE DE VÍDEO (10s)*\n\n"
+                f"📅 *Horário:* {hora_formatada}\n"
+                f"👤 *Detecção:* Pessoa ({confidence:.1%})"
+            )
+
+            url = f"{api_url.rstrip('/')}/message/sendMedia/{instance.strip()}"
+            headers = {
+                "apikey": api_key.strip(),
+                "Content-Type": "application/json",
+            }
+
+            for norm_num in numbers:
+                payload = {
+                    "number": norm_num,
+                    "mediatype": "video",
+                    "mimetype": "video/mp4",
+                    "caption": caption,
+                    "media": b64_data,
+                    "fileName": os.path.basename(full_path) or "gravacao_x9.mp4",
+                    "delay": 1200,
+                }
+                try:
+                    r = requests.post(url, headers=headers, json=payload, timeout=40.0)
+                    if r.status_code in (200, 201):
+                        logger.info(f"[+] Vídeo de flagrante enviado via WhatsApp para +{norm_num}!")
+                    else:
+                        logger.warning(f"[-] Falha HTTP {r.status_code} ao enviar vídeo WhatsApp para +{norm_num}: {r.text[:150]}")
+                except Exception as e:
+                    logger.error(f"[-] Erro ao enviar vídeo no WhatsApp para +{norm_num}: {e}")
+        except Exception as e:
+            logger.error(f"[-] Erro geral no worker de vídeo WhatsApp: {e}")
+
+evolution_service = EvolutionService()

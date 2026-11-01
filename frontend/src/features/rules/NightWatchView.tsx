@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Clock, Zap, Camera, ShieldCheck, CheckCircle2, Sliders, CalendarDays } from 'lucide-react';
+import { Clock, Zap, Camera, ShieldCheck, CheckCircle2, Sliders, CalendarDays, MessageSquare, Settings2 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
+import { WhatsAppConfigModal } from './WhatsAppConfigModal';
 
 export function NightWatchView() {
   const { token } = useAuthStore();
@@ -13,6 +14,23 @@ export function NightWatchView() {
   const [enabled, setEnabled] = useState(true);
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [isWhatsappModalOpen, setIsWhatsappModalOpen] = useState(false);
+  const [whatsappStatus, setWhatsappStatus] = useState<{ enabled: boolean; target_number: string } | null>(null);
+
+  const fetchWhatsappStatus = () => {
+    if (!token) return;
+    fetch('/api/camera/whatsapp', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        setWhatsappStatus({
+          enabled: Boolean(data.enabled),
+          target_number: data.target_number || '',
+        });
+      })
+      .catch(() => {});
+  };
 
   useEffect(() => {
     if (!token) return;
@@ -30,6 +48,7 @@ export function NightWatchView() {
         if (data.enabled !== undefined) setEnabled(Boolean(data.enabled));
       })
       .catch(() => {});
+    fetchWhatsappStatus();
   }, [token]);
 
   const handleSave = async (e: React.FormEvent) => {
@@ -237,6 +256,40 @@ export function NightWatchView() {
                 HABILITADO
               </span>
             </div>
+
+            {/* Integração WhatsApp Evolution API v2 */}
+            <div className="p-3 sm:p-3.5 rounded-lg bg-[#131824] border border-slate-800 hover:border-emerald-500/30 transition-colors flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <MessageSquare className="w-5 h-5 text-emerald-400 shrink-0" />
+                <div>
+                  <div className="flex items-center gap-2">
+                    <p className="text-xs font-semibold text-slate-200">Alertas no WhatsApp (Evolution API v2)</p>
+                    {whatsappStatus?.enabled ? (
+                      <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
+                        ATIVO
+                      </span>
+                    ) : (
+                      <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 font-bold">
+                        DESATIVADO
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[10px] text-slate-400">
+                    {whatsappStatus?.enabled && whatsappStatus?.target_number
+                      ? `Enviando flagrantes com foto e vídeo para +${whatsappStatus.target_number}`
+                      : 'Receba fotos de flagrante e vídeo de 10s direto no WhatsApp ao detectar invasão'}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsWhatsappModalOpen(true)}
+                className="flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-300 text-xs font-semibold transition-all cursor-pointer shadow-sm shadow-emerald-500/10 min-h-[38px] self-start sm:self-auto"
+              >
+                <Settings2 className="w-4 h-4 text-emerald-400" />
+                <span>Configurar WhatsApp</span>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -251,6 +304,13 @@ export function NightWatchView() {
           </button>
         </div>
       </form>
+
+      {/* Modal de Configuração do WhatsApp */}
+      <WhatsAppConfigModal
+        isOpen={isWhatsappModalOpen}
+        onClose={() => setIsWhatsappModalOpen(false)}
+        onSaved={fetchWhatsappStatus}
+      />
     </div>
   );
 }

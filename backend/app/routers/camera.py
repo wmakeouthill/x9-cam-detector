@@ -7,6 +7,7 @@ from app.core.security import get_current_user
 from app.services.camera_service import camera_service
 from app.services.detector_service import detector_service
 from app.services.gdrive_service import gdrive_service
+from app.services.evolution_service import evolution_service
 from app.core.config import settings
 from app.db import (
     get_camera_config,
@@ -17,6 +18,8 @@ from app.db import (
     count_detection_events,
     delete_detection_event,
     delete_detection_events_batch,
+    get_whatsapp_config,
+    save_whatsapp_config,
 )
 
 router = APIRouter(prefix="/api/camera", tags=["camera"])
@@ -63,6 +66,7 @@ def get_camera_status(user: str = Depends(get_current_user)):
         "user": camera_service.user,
         "detector_active": detector_service.is_active,
         "person_detected": detector_service.last_person_detected,
+        "people_count": detector_service.people_count,
         "last_confidence": round(detector_service.last_confidence * 100, 1),
         "detections_count": detector_service.detections_count,
         "test_mode": detector_service.test_mode,
@@ -241,3 +245,69 @@ def update_config(req: CameraConfigRequest, user: str = Depends(get_current_user
     res_data = req.dict()
     res_data["password"] = "******"
     return {"status": "updated", "camera": res_data}
+
+class WhatsAppConfigRequest(BaseModel):
+    enabled: bool = False
+    api_url: str = ""
+    api_key: str = ""
+    instance_name: str = ""
+    target_number: str = ""
+    send_photo: bool = True
+    send_video: bool = True
+
+class WhatsAppTestRequest(BaseModel):
+    api_url: str = ""
+    api_key: str = ""
+    instance_name: str = ""
+    target_number: str = ""
+
+@router.get("/whatsapp")
+def get_whatsapp_settings(user: str = Depends(get_current_user)):
+    cfg = get_whatsapp_config(decrypt_key=False)
+    conn_info = {"connected": False, "state": "unconfigured", "message": "WhatsApp não configurado"}
+    if cfg["api_url"] and cfg["instance_name"] and cfg["has_key"]:
+        real_key = get_whatsapp_config(decrypt_key=True).get("api_key", "")
+        conn_info = evolution_service.test_connection(cfg["api_url"], real_key, cfg["instance_name"])
+    return {
+        **cfg,
+        "connection": conn_info,
+    }
+
+@router.post("/whatsapp")
+def update_whatsapp_settings(req: WhatsAppConfigRequest, user: str = Depends(get_current_user)):
+    save_whatsapp_config(
+        enabled=req.enabled,
+        api_url=req.api_url,
+        instance_name=req.instance_name,
+        target_number=req.target_number,
+        send_photo=req.send_photo,
+        send_video=req.send_video,
+        api_key=req.api_key,
+    )
+    return {"status": "ok", "message": "Configurações do WhatsApp salvas com sucesso."}
+
+@router.post("/whatsapp/test")
+def test_whatsapp_notification(req: WhatsAppTestRequest, user: str = Depends(get_current_user)):
+    current = get_whatsapp_config(decrypt_key=True)
+    api_url = (req.api_url or current["api_url"]).strip()
+    instance = (req.instance_name or current["instance_name"]).strip()
+    target = (req.target_number or current["target_number"]).strip()
+    key = req.api_key.strip() if (req.api_key and req.api_key.strip() != "••••••••") else current["api_key"]
+
+    if not api_url or not instance or not target or not key:
+        raise HTTPException(status_code=400, detail="Preencha URL, Instância, API Key e Número antes de testar.")
+
+    conn_res = evolution_service.test_connection(api_url, key, instance)
+    if not conn_res.get("connected"):
+        return {
+            "success": False,
+            "message": f"Falha na conexão com Evolution API: {conn_res.get('message')}",
+            "connection": conn_res
+        }
+
+    send_res = evolution_service.send_test_message(api_url, key, instance, target)
+    return {
+        "success": send_res.get("success", False),
+        "message": send_res.get("message"),
+        "connection": conn_res
+    }
