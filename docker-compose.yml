@@ -29,6 +29,12 @@ services:
       - ./backend/app:/app/app
       - ./token.json:/app/token.json
       - ./client_secret.json:/app/client_secret.json
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')\" || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 25s
     networks:
       - x9_net
 
@@ -41,7 +47,8 @@ services:
     ports:
       - "${FRONTEND_PORT:-39080}:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
       - x9_net
 
