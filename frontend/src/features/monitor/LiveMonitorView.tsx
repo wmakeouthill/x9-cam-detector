@@ -13,6 +13,7 @@ import {
   VolumeX,
   Volume1,
   Film,
+  Sliders,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -21,6 +22,7 @@ interface LiveMonitorViewProps {
   fps: number;
   resolution: string;
   cameraIp: string;
+  currentSubtype?: number;
   detectorActive?: boolean;
   personDetected?: boolean;
   peopleCount?: number;
@@ -35,6 +37,7 @@ export function LiveMonitorView({
   fps,
   resolution,
   cameraIp,
+  currentSubtype = 1,
   detectorActive,
   personDetected,
   peopleCount,
@@ -48,6 +51,7 @@ export function LiveMonitorView({
   const [flashLoading, setFlashLoading] = useState(false);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [recordLoading, setRecordLoading] = useState(false);
+  const [subtypeLoading, setSubtypeLoading] = useState(false);
   const [lastSnapshotUrl, setLastSnapshotUrl] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
 
@@ -95,6 +99,39 @@ export function LiveMonitorView({
   const handleRefreshStream = () => {
     setStreamKey(Date.now());
     onRefreshStatus();
+  };
+
+  const handleChangeSubtype = async (newSubtype: number) => {
+    if (subtypeLoading || currentSubtype === newSubtype) return;
+    setSubtypeLoading(true);
+    setActionMessage(null);
+    try {
+      const res = await fetch('/api/camera/subtype', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ subtype: newSubtype }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setActionMessage({
+          text: `Resolução alterada para ${data.name || (newSubtype === 0 ? '1080p FHD' : '480p Substream')}! Reconectando stream...`,
+          type: 'success',
+        });
+        setTimeout(() => {
+          setStreamKey(Date.now());
+          onRefreshStatus();
+        }, 1200);
+      } else {
+        throw new Error(data.detail || 'Falha ao alterar resolução.');
+      }
+    } catch (err: any) {
+      setActionMessage({ text: err.message || 'Erro ao alterar resolução da câmera.', type: 'error' });
+    } finally {
+      setSubtypeLoading(false);
+    }
   };
 
   const handleTriggerFlash = async () => {
@@ -439,12 +476,40 @@ export function LiveMonitorView({
           )}
         </div>
 
-        {/* HUD Superior Direito: Resolução & FPS */}
-        <div className="absolute top-2 right-2 sm:top-4 sm:right-4 flex items-center gap-1 sm:gap-2 pointer-events-none z-10">
-          <div className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-black/70 backdrop-blur-md border border-slate-700/60 text-slate-300 text-[10px] sm:text-xs font-mono">
+        {/* HUD Superior Direito: Seletor de Resolução & FPS */}
+        <div className="absolute top-2 right-2 sm:top-4 sm:right-4 flex items-center gap-1 sm:gap-2 z-10">
+          {/* Seletor Rápido de Resolução / Subtype */}
+          <div className="flex items-center bg-black/80 backdrop-blur-md border border-slate-700/80 rounded-lg p-0.5 shadow-lg shadow-black/40">
+            <button
+              onClick={() => handleChangeSubtype(1)}
+              disabled={subtypeLoading}
+              className={`px-2 py-0.5 sm:px-2.5 sm:py-1 rounded text-[10px] sm:text-xs font-mono font-bold transition-all cursor-pointer ${
+                currentSubtype === 1
+                  ? 'bg-emerald-500/30 text-emerald-300 border border-emerald-500/50 shadow-[0_0_8px_rgba(16,185,129,0.3)]'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Substream (480p / D1) - Leve para CPU e rede"
+            >
+              480p
+            </button>
+            <button
+              onClick={() => handleChangeSubtype(0)}
+              disabled={subtypeLoading}
+              className={`px-2 py-0.5 sm:px-2.5 sm:py-1 rounded text-[10px] sm:text-xs font-mono font-bold transition-all cursor-pointer ${
+                currentSubtype === 0
+                  ? 'bg-cyan-500/30 text-cyan-300 border border-cyan-500/50 shadow-[0_0_8px_rgba(6,182,212,0.3)]'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Stream Principal (1080p FHD) - Resolução nativa máxima"
+            >
+              1080p
+            </button>
+          </div>
+
+          <div className="hidden sm:inline-block px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-black/70 backdrop-blur-md border border-slate-700/60 text-slate-300 text-[10px] sm:text-xs font-mono pointer-events-none">
             {resolution}
           </div>
-          <div className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-black/70 backdrop-blur-md border border-cyan-500/30 text-cyan-400 text-[10px] sm:text-xs font-mono">
+          <div className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-black/70 backdrop-blur-md border border-cyan-500/30 text-cyan-400 text-[10px] sm:text-xs font-mono pointer-events-none">
             {fps} FPS
           </div>
         </div>
@@ -534,7 +599,18 @@ export function LiveMonitorView({
       </div>
 
       {/* Barra de Ações Rápidas da Câmera */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-2 sm:gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2 sm:gap-3">
+        {/* Alternar Resolução 480p / 1080p */}
+        <button
+          onClick={() => handleChangeSubtype(currentSubtype === 0 ? 1 : 0)}
+          disabled={subtypeLoading || !isOnline}
+          className="flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-2.5 sm:px-4 sm:py-3 rounded-lg bg-[#141A26] border border-cyan-500/30 hover:border-cyan-400 hover:bg-cyan-950/40 text-cyan-300 font-semibold text-[11px] sm:text-xs uppercase tracking-wider transition-all disabled:opacity-40 cursor-pointer min-h-[44px]"
+          title="Alterna entre 480p Substream (econômico) e 1080p FHD (alta definição)"
+        >
+          <Sliders className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-cyan-400 shrink-0" />
+          <span className="truncate">{subtypeLoading ? 'Trocando...' : currentSubtype === 0 ? 'Modo: 1080p' : 'Modo: 480p'}</span>
+        </button>
+
         {/* Disparar Flash */}
         <button
           onClick={handleTriggerFlash}

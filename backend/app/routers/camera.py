@@ -128,6 +128,8 @@ def record_clip(req: RecordRequest = RecordRequest(), user: str = Depends(get_cu
             gdrive_service.upload_file_async(filename, description="Gravação manual capturada pelo usuário")
 
         filename = camera_service.record_clip(seconds=req.seconds, on_complete=_on_done)
+        # Pré-registra na fila SQLite para resistir a quedas do processo durante a gravação
+        gdrive_service.enqueue_file(filename, description="Gravação manual capturada pelo usuário", file_type="recording")
         return {"status": "recording_started", "filename": filename, "duration": req.seconds}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -227,6 +229,10 @@ def get_gdrive_status(user: str = Depends(get_current_user)):
 def test_gdrive_connection(user: str = Depends(get_current_user)):
     return gdrive_service.test_connection()
 
+@router.post("/gdrive/sync")
+def sync_gdrive_now(user: str = Depends(get_current_user)):
+    return gdrive_service.sync_now()
+
 @router.post("/config")
 def update_config(req: CameraConfigRequest, user: str = Depends(get_current_user)):
     pwd = req.password.strip() if req.password else ""
@@ -246,6 +252,34 @@ def update_config(req: CameraConfigRequest, user: str = Depends(get_current_user
     res_data["password"] = "******"
     return {"status": "updated", "camera": res_data}
 
+class SubtypeRequest(BaseModel):
+    subtype: int # 0 = Principal (1080p), 1 = Substream (480p)
+
+@router.post("/subtype")
+def change_stream_subtype(req: SubtypeRequest, user: str = Depends(get_current_user)):
+    if req.subtype not in (0, 1):
+        raise HTTPException(status_code=400, detail="Subtype inválido. Use 0 (1080p) ou 1 (Substream).")
+    existing = get_camera_config()
+    pwd = existing.get("password") or settings.CAMERA_PASSWORD
+    ip = camera_service.ip or existing.get("ip") or settings.CAMERA_IP
+    user_name = camera_service.user or existing.get("user") or settings.CAMERA_USER
+    port = camera_service.port or existing.get("port") or settings.CAMERA_PORT
+    http_port = camera_service.http_port or existing.get("http_port") or settings.CAMERA_HTTP_PORT
+
+    camera_service.update_config(
+        ip=ip,
+        user=user_name,
+        password=pwd,
+        port=port,
+        http_port=http_port,
+        subtype=req.subtype,
+    )
+    return {
+        "status": "updated",
+        "subtype": req.subtype,
+        "name": "1080p FHD" if req.subtype == 0 else "480p Substream",
+    }
+
 class WhatsAppConfigRequest(BaseModel):
     enabled: bool = False
     api_url: str = ""
@@ -261,12 +295,26 @@ class WhatsAppTestRequest(BaseModel):
     instance_name: str = ""
     target_number: str = ""
 
+class WhatsAppConnectRequest(BaseModel):
+    api_url: str = ""
+    api_key: str = ""
+    instance_name: str = ""
+
 @router.get("/whatsapp")
 def get_whatsapp_settings(user: str = Depends(get_current_user)):
     cfg = get_whatsapp_config(decrypt_key=False)
+    # Valores default inteligentes para facilitar a vida do usuário
+    if not cfg["api_url"]:
+        cfg["api_url"] = settings.EVOLUTION_API_URL or "http://evolution-api:8080"
+    if not cfg["instance_name"]:
+        cfg["instance_name"] = settings.EVOLUTION_INSTANCE_NAME or "x9-vigia"
+    if not cfg["has_key"] and settings.EVOLUTION_API_KEY:
+        cfg["has_key"] = True
+        cfg["api_key"] = "••••••••"
+
     conn_info = {"connected": False, "state": "unconfigured", "message": "WhatsApp não configurado"}
     if cfg["api_url"] and cfg["instance_name"] and cfg["has_key"]:
-        real_key = get_whatsapp_config(decrypt_key=True).get("api_key", "")
+        real_key = get_whatsapp_config(decrypt_key=True).get("api_key", "") or settings.EVOLUTION_API_KEY or "x9-evolution-key-2026"
         conn_info = evolution_service.test_connection(cfg["api_url"], real_key, cfg["instance_name"])
     return {
         **cfg,
@@ -285,6 +333,18 @@ def update_whatsapp_settings(req: WhatsAppConfigRequest, user: str = Depends(get
         api_key=req.api_key,
     )
     return {"status": "ok", "message": "Configurações do WhatsApp salvas com sucesso."}
+
+@router.post("/whatsapp/connect")
+def connect_whatsapp_instance(req: WhatsAppConnectRequest, user: str = Depends(get_current_user)):
+    current = get_whatsapp_config(decrypt_key=True)
+    api_url = (req.api_url or current.get("api_url") or settings.EVOLUTION_API_URL or "http://evolution-api:8080").strip()
+    instance = (req.instance_name or current.get("instance_name") or settings.EVOLUTION_INSTANCE_NAME or "x9-vigia").strip()
+    key = req.api_key.strip() if (req.api_key and req.api_key.strip() != "••••••••") else current.get("api_key", "")
+    if not key:
+        key = settings.EVOLUTION_API_KEY or "x9-evolution-key-2026"
+
+    res = evolution_service.connect_or_get_qrcode(api_url, key, instance)
+    return res
 
 @router.post("/whatsapp/test")
 def test_whatsapp_notification(req: WhatsAppTestRequest, user: str = Depends(get_current_user)):

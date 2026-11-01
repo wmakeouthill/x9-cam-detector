@@ -38,7 +38,7 @@ class SimpleTracker:
     Garante ID consistente para cada pessoa e evita que a caixa pisque quando a
     confiança oscila por alguns quadros.
     """
-    def __init__(self, max_age_seconds: float = 2.0, iou_threshold: float = 0.20, min_hits: int = 1):
+    def __init__(self, max_age_seconds: float = 1.0, iou_threshold: float = 0.20, min_hits: int = 1):
         self.max_age_seconds = max_age_seconds
         self.iou_threshold = iou_threshold
         self.min_hits = min_hits
@@ -78,16 +78,16 @@ class SimpleTracker:
 
                     det_box = detections[det_idx]["box"]
                     old_box = self.tracks[tid]["box"]
-                    # Suavização espacial exponencial (75% atual + 25% anterior) contra tremor/jitter
+                    # Suavização espacial rápida contra jitter
                     self.tracks[tid]["box"] = [
-                        int(0.75 * det_box[i] + 0.25 * old_box[i])
+                        int(0.70 * det_box[i] + 0.30 * old_box[i])
                         for i in range(4)
                     ]
                     self.tracks[tid]["conf"] = detections[det_idx]["conf"]
                     self.tracks[tid]["last_seen"] = now
                     self.tracks[tid]["hits"] += 1
 
-        # 3. Registra novos tracks para detecções não pareadas
+        # 3. Registra novos tracks imediatamente (plot instantâneo no frame 1)
         for det_idx, det in enumerate(detections):
             if det_idx not in matched_detections:
                 tid = self.next_id
@@ -99,7 +99,6 @@ class SimpleTracker:
                     "hits": 1,
                 }
 
-        # Retorna tracks ativos com proteção contra ruído transitório (hits >= min_hits)
         return [
             {
                 "box": tuple(trk["box"]),
@@ -122,8 +121,10 @@ class DetectorService:
         self.current_model_type = "yolov8n"
         self.last_detection_time = 0.0
         self.last_cleanup_time = 0.0
-        self.cooldown_seconds = 20.0 # Intervalo mínimo entre disparos de flash para não ofuscar em excesso
-        self.tracker = SimpleTracker(max_age_seconds=2.0, iou_threshold=0.20, min_hits=2)
+        self.cooldown_seconds = 20.0
+        self.tracker = SimpleTracker(max_age_seconds=1.0, iou_threshold=0.20, min_hits=1)
+        self._cached_cfg = None
+        self._last_cfg_fetch = 0.0
         
         # Telemetria em tempo real
         self.is_active = False
@@ -177,10 +178,14 @@ class DetectorService:
     def _detection_loop(self):
         while self._running:
             try:
-                # 1. Ciclo de inferência a cada 200ms (~5 FPS de detecção leve para CPU)
-                time.sleep(0.2)
+                # 1. Ciclo de inferência a cada 350ms (~3 FPS leve para CPU, liberando recursos para RTSP)
+                time.sleep(0.35)
 
-                cfg = get_night_watch_config() or {}
+                now_sec = time.time()
+                if self._cached_cfg is None or (now_sec - self._last_cfg_fetch) > 2.0:
+                    self._cached_cfg = get_night_watch_config() or {}
+                    self._last_cfg_fetch = now_sec
+                cfg = self._cached_cfg
 
                 # Rotação de modelo se configurado outro
                 model_type = cfg.get("model_type", "yolov8n")
@@ -188,7 +193,6 @@ class DetectorService:
                     self.load_model(model_type)
 
                 # Limpeza periódica de retenção (1 vez por dia)
-                now_sec = time.time()
                 if now_sec - self.last_cleanup_time > 86400:
                     retention_days = cfg.get("retention_days", 15)
                     cleanup_retention(retention_days)
@@ -210,7 +214,7 @@ class DetectorService:
                     classes=[0],
                     conf=conf_thresh,
                     verbose=False,
-                    imgsz=480, # Otimizado para CPU rápida
+                    imgsz=640, # Padrão nativo do YOLOv8 (640x640)
                 )
 
                 detections = []
@@ -281,17 +285,26 @@ class DetectorService:
 
                     # 5. Grava clipe de vídeo MP4 em alta definição com áudio sincronizado (10 segundos)
                     # O upload para o Google Drive e WhatsApp é agendado para quando o ffmpeg terminar de renderizar o arquivo completo
+                    video_desc = f"Gravação Noturna X9: Vídeo de Invasão ({max_conf:.1%})"
                     def _upload_video_when_ready(fpath, fname):
                         logger.info(f"[+] Gravação finalizada, enviando vídeo ao Google Drive: {fname}")
                         gdrive_service.upload_file_async(
                             fname,
-                            description=f"Gravação Noturna X9: Vídeo de Invasão ({max_conf:.1%})",
+                            description=video_desc,
                             file_type="recording"
                         )
                         # Envio do vídeo de 10s no WhatsApp (assíncrono)
                         evolution_service.send_alert_video_async(fpath, max_conf)
 
                     video_filename = camera_service.record_clip(seconds=video_duration, on_complete=_upload_video_when_ready)
+
+                    # Pré-registra preventivamente o vídeo no SQLite: se o backend cair ou reiniciar
+                    # durante os 10s de gravação do ffmpeg, o vídeo já está garantido na fila de sincronização
+                    gdrive_service.enqueue_file(
+                        video_filename,
+                        description=video_desc,
+                        file_type="recording"
+                    )
 
                     # 6. Salva no SQLite o evento principal com a foto colorida com flash e o vídeo
                     log_detection_event(

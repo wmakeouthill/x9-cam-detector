@@ -92,6 +92,7 @@ export function App() {
               fps={camStatus.fps}
               resolution={camStatus.resolution}
               cameraIp={camStatus.ip}
+              currentSubtype={camStatus.subtype}
               detectorActive={camStatus.detector_active}
               personDetected={camStatus.person_detected}
               peopleCount={camStatus.people_count}
