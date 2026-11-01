@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Settings, Save, Server, Shield, CheckCircle, AlertCircle, RefreshCw, Terminal, Sliders, Radio } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -26,6 +26,19 @@ export function CameraConfigView({
   const [user, setUser] = useState(currentUser || 'admin');
   const [password, setPassword] = useState('');
   const [subtype, setSubtype] = useState(currentSubtype || 0);
+
+  const [hasLoaded, setHasLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!hasLoaded && currentIp) {
+      setIp(currentIp);
+      setPort(currentPort || 554);
+      setHttpPort(currentHttpPort || 80);
+      setUser(currentUser || 'admin');
+      if (currentSubtype !== undefined) setSubtype(currentSubtype);
+      setHasLoaded(true);
+    }
+  }, [currentIp, currentPort, currentHttpPort, currentUser, currentSubtype, hasLoaded]);
 
   const [saving, setSaving] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -63,11 +76,6 @@ export function CameraConfigView({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!password) {
-      setMessage({ text: 'Por favor, insira a senha da câmera.', type: 'error' });
-      return;
-    }
-
     setSaving(true);
     setMessage(null);
 
@@ -83,7 +91,7 @@ export function CameraConfigView({
           port: Number(port),
           http_port: Number(httpPort),
           user,
-          password,
+          password: password || '',
           subtype: Number(subtype),
         }),
       });
@@ -294,10 +302,12 @@ export function CameraConfigView({
                     type="password"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    placeholder="••••••••"
-                    required
+                    placeholder="•••••••• (deixe vazio para manter a atual)"
                     className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 sm:p-3 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none min-h-[42px]"
                   />
+                  <p className="text-[10px] sm:text-[11px] text-zinc-500 mt-1 font-mono">
+                    🔒 Deixe em branco para manter a senha já gravada no sistema.
+                  </p>
                 </div>
               </div>
 
