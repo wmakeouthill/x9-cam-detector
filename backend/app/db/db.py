@@ -51,7 +51,21 @@ def init_db():
         )
     """)
 
-    # Tabela 3: Eventos de Detecção de Pessoas
+    # Tabela 3: Fila de Sincronização e Reconciliação Offline com Google Drive
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gdrive_sync_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filepath TEXT UNIQUE NOT NULL,
+            file_type TEXT NOT NULL DEFAULT 'snapshot',
+            description TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            synced_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Tabela 4: Eventos de Detecção de Pessoas
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS detection_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -240,10 +254,75 @@ def delete_detection_events_batch(event_ids: list[int]) -> int:
     conn.close()
     return deleted_count
 
+def enqueue_sync_file(filepath: str, file_type: str = "snapshot", description: str = ""):
+    """Registra um arquivo na fila persistente de sincronização offline com o Google Drive."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR IGNORE INTO gdrive_sync_queue (filepath, file_type, description, status)
+        VALUES (?, ?, ?, 'pending')
+    """, (filepath, file_type, description))
+    conn.commit()
+    conn.close()
+
+def mark_file_synced(filepath: str):
+    """Marca um arquivo como sincronizado com sucesso no Google Drive."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE gdrive_sync_queue
+        SET status = 'synced', synced_at = CURRENT_TIMESTAMP
+        WHERE filepath = ?
+    """, (filepath,))
+    conn.commit()
+    conn.close()
+
+def increment_sync_retry(filepath: str):
+    """Incrementa contador de tentativas de sincronização para um arquivo."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE gdrive_sync_queue
+        SET retry_count = retry_count + 1
+        WHERE filepath = ?
+    """, (filepath,))
+    conn.commit()
+    conn.close()
+
+def get_pending_sync_files(limit: int = 50) -> list[dict]:
+    """Retorna arquivos locais que aguardam upload para o Google Drive."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM gdrive_sync_queue
+        WHERE status = 'pending'
+        ORDER BY id ASC
+        LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def is_file_synced_or_untracked(filepath: str) -> bool:
+    """
+    Verifica se o arquivo já foi sincronizado com sucesso no Google Drive.
+    Se o Google Drive estiver desativado ou o arquivo não constar na fila, retorna True para liberar limpeza.
+    """
+    if not settings.GOOGLE_DRIVE_ENABLED:
+        return True
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT status FROM gdrive_sync_queue WHERE filepath = ?", (filepath,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return True
+    return row["status"] == "synced"
+
 def cleanup_retention(retention_days: int = 15):
     """
-    Remove eventos, snapshots e vídeos mais antigos que retention_days.
-    Mantém o disco da VPS sempre enxuto.
+    Remove eventos, snapshots e vídeos locais mais antigos que retention_days (padrão 15 dias).
+    Proteção Offline: Arquivos locais NÃO são apagados se o upload para o Google Drive ainda estiver pendente!
     """
     cutoff = (get_now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
@@ -255,20 +334,40 @@ def cleanup_retention(retention_days: int = 15):
     for rec in old_records:
         snap = rec["snapshot_path"]
         vid = rec["video_path"]
-        if snap and os.path.exists(os.path.join("snapshots", snap)):
-            try:
-                os.remove(os.path.join("snapshots", snap))
-            except Exception:
-                pass
-        if vid and os.path.exists(os.path.join("recordings", vid)):
-            try:
-                os.remove(os.path.join("recordings", vid))
-            except Exception:
-                pass
+
+        # Proteção: só apaga snapshot se confirmado no Google Drive (ou Drive desativado)
+        if snap:
+            if is_file_synced_or_untracked(snap):
+                for base in ["snapshots", "backend/snapshots"]:
+                    target = os.path.join(base, snap)
+                    if os.path.exists(target):
+                        try:
+                            os.remove(target)
+                        except Exception:
+                            pass
+            else:
+                logger.warning(f"[Retenção Local] Mantendo snapshot ({snap}) pois upload para Google Drive ainda está pendente.")
+
+        # Proteção: só apaga vídeo se confirmado no Google Drive (ou Drive desativado)
+        if vid:
+            if is_file_synced_or_untracked(vid):
+                for base in ["recordings", "backend/recordings"]:
+                    target = os.path.join(base, vid)
+                    if os.path.exists(target):
+                        try:
+                            os.remove(target)
+                        except Exception:
+                            pass
+            else:
+                logger.warning(f"[Retenção Local] Mantendo vídeo ({vid}) pois upload para Google Drive ainda está pendente.")
 
     cursor.execute("DELETE FROM detection_events WHERE timestamp < ?", (cutoff,))
     deleted = cursor.rowcount
+    
+    # Limpa registros antigos da fila de sync para manter tabela enxuta
+    cursor.execute("DELETE FROM gdrive_sync_queue WHERE status = 'synced' AND created_at < ?", (cutoff,))
+    
     conn.commit()
     conn.close()
     if deleted > 0:
-        logger.info(f"Limpeza de retenção ({retention_days} dias): {deleted} registros antigos removidos.")
+        logger.info(f"Limpeza de retenção local ({retention_days} dias): {deleted} registros antigos removidos com proteção de nuvem.")

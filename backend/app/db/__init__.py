@@ -10,4 +10,9 @@ from app.db.db import (
     delete_detection_event,
     delete_detection_events_batch,
     cleanup_retention,
+    enqueue_sync_file,
+    mark_file_synced,
+    increment_sync_retry,
+    get_pending_sync_files,
+    is_file_synced_or_untracked,
 )

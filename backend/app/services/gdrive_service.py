@@ -3,7 +3,14 @@ import time
 import queue
 import threading
 import logging
+from datetime import datetime, timedelta, timezone
 from app.core.config import settings
+from app.db import (
+    enqueue_sync_file,
+    mark_file_synced,
+    increment_sync_retry,
+    get_pending_sync_files,
+)
 
 logger = logging.getLogger("x9.gdrive")
 
@@ -11,12 +18,42 @@ class GoogleDriveService:
     def __init__(self):
         self._queue = queue.Queue()
         self._worker_thread = None
+        self._reconcile_thread = None
         self._running = True
-        self._start_worker()
+        self.last_cloud_cleanup_time = 0.0
+        self._start_workers()
+        self._enqueue_existing_pending()
 
-    def _start_worker(self):
+    def _start_workers(self):
         self._worker_thread = threading.Thread(target=self._process_queue, daemon=True)
         self._worker_thread.start()
+        self._reconcile_thread = threading.Thread(target=self._reconciliation_loop, daemon=True)
+        self._reconcile_thread.start()
+
+    def _enqueue_existing_pending(self):
+        """Na inicialização do backend, enfileira arquivos pendentes salvos no SQLite."""
+        try:
+            pending = get_pending_sync_files(limit=50)
+            for item in pending:
+                full_path = self._resolve_full_path(item["filepath"])
+                if full_path and os.path.exists(full_path):
+                    self._queue.put({
+                        "filepath": full_path,
+                        "filename": item["filepath"],
+                        "description": item.get("description", "")
+                    })
+        except Exception as e:
+            logger.warning(f"[Google Drive] Erro ao recuperar fila pendente no startup: {e}")
+
+    def _resolve_full_path(self, filepath: str) -> str:
+        if os.path.isabs(filepath) and os.path.exists(filepath):
+            return filepath
+        filename = os.path.basename(filepath)
+        for base in ["snapshots", "backend/snapshots", "recordings", "backend/recordings", ""]:
+            cand = os.path.join(base, filename) if base else filepath
+            if os.path.exists(cand):
+                return cand
+        return ""
 
     @property
     def is_configured(self) -> bool:
@@ -27,22 +64,23 @@ class GoogleDriveService:
         has_sa = os.path.exists(creds_file) or os.path.exists(os.path.join("..", creds_file))
         return bool((has_token or has_sa) and settings.GOOGLE_DRIVE_FOLDER_ID)
 
-    def upload_file_async(self, filepath: str, description: str = ""):
-        """Enfileira um arquivo (snapshot ou vídeo) para upload em segundo plano."""
+    def upload_file_async(self, filepath: str, description: str = "", file_type: str = "snapshot"):
+        """Enfileira um arquivo (snapshot ou vídeo) para upload em segundo plano e persiste no SQLite."""
         if not settings.GOOGLE_DRIVE_ENABLED:
             logger.debug("[Google Drive] Desativado no .env (GOOGLE_DRIVE_ENABLED=false).")
             return
 
-        full_path = filepath
-        if not os.path.isabs(filepath):
-            if os.path.exists(filepath):
-                full_path = filepath
-            elif os.path.exists(os.path.join("snapshots", filepath)):
-                full_path = os.path.join("snapshots", filepath)
-            elif os.path.exists(os.path.join("recordings", filepath)):
-                full_path = os.path.join("recordings", filepath)
+        filename = os.path.basename(filepath)
+        full_path = self._resolve_full_path(filepath) or filepath
 
-        self._queue.put({"filepath": full_path, "description": description})
+        # 1. Registra no SQLite para garantir resiliência offline
+        try:
+            enqueue_sync_file(filename, file_type=file_type, description=description)
+        except Exception as e:
+            logger.warning(f"[Google Drive] Falha ao registrar na fila SQLite: {e}")
+
+        # 2. Enfileira na memória para tentativa imediata
+        self._queue.put({"filepath": full_path, "filename": filename, "description": description})
 
     def _process_queue(self):
         while self._running:
@@ -52,11 +90,68 @@ class GoogleDriveService:
                 continue
 
             try:
-                self._upload_file(task["filepath"], task.get("description", ""))
+                result = self._upload_file(task["filepath"], task.get("description", ""))
+                if result and result.get("status") == "success":
+                    mark_file_synced(task["filename"])
+                else:
+                    increment_sync_retry(task["filename"])
             except Exception as e:
-                logger.error(f"[Google Drive] Erro ao enviar {task['filepath']}: {e}")
+                increment_sync_retry(task.get("filename", os.path.basename(task.get("filepath", ""))))
+                logger.warning(f"[Google Drive Offline] Sem conexão ao enviar {task['filepath']}: {e}. Salvo localmente para sincronização automática.")
             finally:
                 self._queue.task_done()
+
+    def _reconciliation_loop(self):
+        """Worker em segundo plano: reconcilia pendências a cada 3 minutos e limpa nuvem a cada 24 horas."""
+        while self._running:
+            time.sleep(180)
+            if not self._running:
+                break
+
+            if self.is_configured:
+                try:
+                    self._sync_offline_pending()
+                except Exception as e:
+                    logger.debug(f"[Google Drive Sync] Ciclo offline pausado (rede indisponível): {e}")
+
+            # Limpeza automática na nuvem (arquivos com mais de 90 dias / 3 meses)
+            now_sec = time.time()
+            if self.is_configured and (now_sec - self.last_cloud_cleanup_time > 86400):
+                try:
+                    self.cleanup_old_drive_files(retention_days=90)
+                    self.last_cloud_cleanup_time = now_sec
+                except Exception as e:
+                    logger.warning(f"[Google Drive] Erro na limpeza da nuvem: {e}")
+
+    def _sync_offline_pending(self):
+        pending = get_pending_sync_files(limit=20)
+        if not pending:
+            return
+
+        logger.info(f"[Google Drive Sync] Encontrados {len(pending)} arquivo(s) pendente(s) de envio offline. Iniciando sincronização...")
+        service = self._get_service()
+        if not service:
+            return
+
+        for item in pending:
+            filename = item["filepath"]
+            full_path = self._resolve_full_path(filename)
+            if not full_path or not os.path.exists(full_path):
+                logger.warning(f"[Google Drive Sync] Arquivo local '{filename}' não encontrado no disco. Marcando como finalizado.")
+                mark_file_synced(filename)
+                continue
+
+            try:
+                res = self._upload_file(full_path, item.get("description", ""))
+                if res and res.get("status") == "success":
+                    mark_file_synced(filename)
+                    logger.info(f"[Google Drive Sync] [+] Sincronizado com sucesso na nuvem: {filename}")
+                else:
+                    increment_sync_retry(filename)
+            except Exception as err:
+                increment_sync_retry(filename)
+                logger.warning(f"[Google Drive Sync] Conexão falhou ao subir {filename} ({err}). Interrompendo lote até o próximo ciclo.")
+                break
 
     def _get_service(self):
         """
@@ -135,6 +230,17 @@ class GoogleDriveService:
         filename = os.path.basename(filepath)
         mime_type = "video/mp4" if filename.endswith(".mp4") else "image/jpeg"
 
+        # Anti-duplicação: verifica se arquivo com mesmo nome já existe na pasta
+        try:
+            q_exist = f"name = '{filename}' and '{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+            check_exist = service.files().list(q=q_exist, fields="files(id, webViewLink)").execute()
+            existing_files = check_exist.get("files", [])
+            if existing_files:
+                logger.info(f"[Google Drive] Arquivo '{filename}' já existe na nuvem. ID: {existing_files[0]['id']}")
+                return {"status": "success", "file_id": existing_files[0]["id"], "url": existing_files[0].get("webViewLink")}
+        except Exception:
+            pass
+
         file_metadata = {
             "name": filename,
             "parents": [settings.GOOGLE_DRIVE_FOLDER_ID],
@@ -146,6 +252,38 @@ class GoogleDriveService:
 
         logger.info(f"[Google Drive] Sucesso! Arquivo '{filename}' enviado. ID: {file.get('id')}")
         return {"status": "success", "file_id": file.get("id"), "url": file.get("webViewLink")}
+
+    def cleanup_old_drive_files(self, retention_days: int = 90) -> int:
+        """
+        Exclui arquivos na pasta do Google Drive com mais de retention_days (padrão 90 dias / 3 meses).
+        Mantém a nuvem limpa e sustentável.
+        """
+        if not settings.GOOGLE_DRIVE_ENABLED or not settings.GOOGLE_DRIVE_FOLDER_ID:
+            return 0
+        service = self._get_service()
+        if not service:
+            return 0
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        q = f"createdTime < '{cutoff}' and '{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+        deleted_count = 0
+
+        try:
+            res = service.files().list(q=q, fields="files(id, name, createdTime)", pageSize=100).execute()
+            files = res.get("files", [])
+            for f in files:
+                try:
+                    service.files().delete(fileId=f["id"]).execute()
+                    deleted_count += 1
+                    logger.info(f"[Google Drive Nuvem] Arquivo com mais de {retention_days} dias excluído: {f.get('name')} (ID: {f.get('id')})")
+                except Exception as del_err:
+                    logger.warning(f"[Google Drive Nuvem] Falha ao deletar arquivo {f.get('id')}: {del_err}")
+        except Exception as e:
+            logger.warning(f"[Google Drive Nuvem] Erro ao consultar arquivos antigos para limpeza: {e}")
+
+        if deleted_count > 0:
+            logger.info(f"[Google Drive Nuvem] Limpeza concluída: {deleted_count} arquivo(s) com mais de {retention_days} dias removidos da nuvem.")
+        return deleted_count
 
     def delete_file_by_name(self, filename: str) -> bool:
         """Exclui um arquivo da pasta do Google Drive pelo nome."""

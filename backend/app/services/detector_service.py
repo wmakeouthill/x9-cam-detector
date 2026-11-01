@@ -272,7 +272,8 @@ class DetectorService:
                         logger.info(f"[+] Gravação finalizada, enviando vídeo ao Google Drive: {fname}")
                         gdrive_service.upload_file_async(
                             fname,
-                            description=f"Gravação Noturna X9: Vídeo de Invasão ({max_conf:.1%})"
+                            description=f"Gravação Noturna X9: Vídeo de Invasão ({max_conf:.1%})",
+                            file_type="recording"
                         )
 
                     video_filename = camera_service.record_clip(seconds=video_duration, on_complete=_upload_video_when_ready)
@@ -289,11 +290,13 @@ class DetectorService:
                     # 7. Backup automático para Google Drive (foto flagrante P&B e foto flash colorido)
                     gdrive_service.upload_file_async(
                         snapshot_pb,
-                        description=f"Detecção Noturna X9 [Flagrante P&B]: Pessoa detectada ({max_conf:.1%})"
+                        description=f"Detecção Noturna X9 [Flagrante P&B]: Pessoa detectada ({max_conf:.1%})",
+                        file_type="snapshot"
                     )
                     gdrive_service.upload_file_async(
                         snapshot_flash,
-                        description=f"Detecção Noturna X9 [Flash Colorido]: Pessoa detectada ({max_conf:.1%})"
+                        description=f"Detecção Noturna X9 [Flash Colorido]: Pessoa detectada ({max_conf:.1%})",
+                        file_type="snapshot"
                     )
 
             except Exception as e:

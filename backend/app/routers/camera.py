@@ -204,9 +204,11 @@ def scan_network_cameras(
 
 @router.get("/gdrive/status")
 def get_gdrive_status(user: str = Depends(get_current_user)):
+    from app.db import get_pending_sync_files
     has_token = os.path.exists("token.json") or os.path.exists(os.path.join("..", "token.json"))
     creds_file = settings.GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE
     creds_found = os.path.exists(creds_file) or os.path.exists(os.path.join("..", creds_file))
+    pending_list = get_pending_sync_files(limit=100)
     return {
         "enabled": settings.GOOGLE_DRIVE_ENABLED,
         "is_configured": gdrive_service.is_configured,
@@ -214,6 +216,7 @@ def get_gdrive_status(user: str = Depends(get_current_user)):
         "service_account_file": creds_file,
         "credentials_found": has_token or creds_found,
         "folder_id_set": bool(settings.GOOGLE_DRIVE_FOLDER_ID),
+        "pending_sync_count": len(pending_list),
     }
 
 @router.post("/gdrive/test")
