@@ -20,6 +20,10 @@ services:
       - JWT_SECRET=${JWT_SECRET:-x9-cam-detector-altere-esta-chave-secreta-2026}
       - GOOGLE_DRIVE_ENABLED=${GOOGLE_DRIVE_ENABLED:-false}
       - GOOGLE_DRIVE_FOLDER_ID=${GOOGLE_DRIVE_FOLDER_ID:-}
+      - EVOLUTION_API_URL=${EVOLUTION_API_URL:-http://evolution-api:8080}
+      - EVOLUTION_API_KEY=${EVOLUTION_API_KEY:-x9-evolution-key-2026}
+      - EVOLUTION_INSTANCE_NAME=${EVOLUTION_INSTANCE_NAME:-x9-vigia}
+      - EVOLUTION_TARGET_NUMBERS=${EVOLUTION_TARGET_NUMBERS:-}
     ports:
       - "${BACKEND_PORT:-39000}:8000"
     volumes:
@@ -35,6 +39,9 @@ services:
       timeout: 3s
       retries: 10
       start_period: 25s
+    depends_on:
+      evolution-api:
+        condition: service_started
     networks:
       - x9_net
 
@@ -51,6 +58,58 @@ services:
         condition: service_healthy
     networks:
       - x9_net
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: x9_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: evolution_db
+      POSTGRES_USER: evolution_user
+      POSTGRES_PASSWORD: evolution_pass_2026
+    volumes:
+      - evolution_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evolution_user -d evolution_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - x9_net
+
+  evolution-api:
+    image: evoapicloud/evolution-api:${EVOLUTION_IMAGE_TAG:-v2.3.7}
+    container_name: x9_evolution
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - SERVER_URL=http://localhost:${EVOLUTION_PORT:-39082}
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY:-x9-evolution-key-2026}
+      - CONFIG_SESSION_PHONE_VERSION=${CONFIG_SESSION_PHONE_VERSION:-2.3000.1035194821}
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://evolution_user:evolution_pass_2026@postgres:5432/evolution_db?schema=evolution_api
+      - DATABASE_SAVE_DATA_INSTANCE=true
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=false
+      - DATABASE_SAVE_MESSAGE_UPDATE=false
+      - DATABASE_SAVE_DATA_CONTACTS=false
+      - DATABASE_SAVE_DATA_CHATS=false
+      - CACHE_REDIS_ENABLED=false
+      - QRCODE_LIMIT=50
+      - QRCODE_EXPIRATION_IN_SECONDS=60
+      - ALWAYS_ONLINE=true
+    ports:
+      - "${EVOLUTION_PORT:-39082}:8080"
+    volumes:
+      - evolution_instances:/evolution/instances
+    networks:
+      - x9_net
+
+volumes:
+  evolution_instances:
+  evolution_postgres_data:
 
 networks:
   x9_net:

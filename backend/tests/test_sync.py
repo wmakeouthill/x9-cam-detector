@@ -85,3 +85,70 @@ def test_cleanup_retention_protects_offline_pending_files(tmp_path, monkeypatch)
 
     # O arquivo pendente NUNCA deve ser deletado se ainda não foi pro Drive
     assert is_file_synced_or_untracked("snap_pending_old.jpg") is False
+
+def test_orphan_reconciliation_picks_unsynced_events_and_disk(tmp_path, monkeypatch):
+    from app.services.gdrive_service import gdrive_service, GoogleDriveService
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_ENABLED", True)
+
+    # 1. Simula arquivo que foi salvo no disco por um processo anterior que caiu
+    snap_dir = tmp_path / "snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    orphan_snap = snap_dir / "snapshot_orphan_123.jpg"
+    orphan_snap.write_text("dummy")
+
+    # Mocka resolve_full_path para apontar para tmp_path
+    original_resolve = gdrive_service._resolve_full_path
+    monkeypatch.setattr(
+        gdrive_service,
+        "_resolve_full_path",
+        lambda f: str(orphan_snap) if "orphan" in f else original_resolve(f)
+    )
+
+    # 2. Registra evento no banco sem que ele tenha entrado na fila de sync (simula crash pós-detecção)
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO detection_events (timestamp, confidence, flash_triggered, snapshot_path, video_path)
+        VALUES ('2026-11-01 10:00:00', 0.95, 1, 'snapshot_orphan_123.jpg', NULL)
+    """)
+    conn.commit()
+    conn.close()
+
+    # Executa a varredura de auto-cura
+    gdrive_service._reconcile_orphaned_files()
+
+    # O arquivo órfão agora foi resgatado e está pendente de envio para o Drive
+    pending = get_pending_sync_files(limit=100)
+    pending_files = [p["filepath"] for p in pending]
+    assert "snapshot_orphan_123.jpg" in pending_files
+
+def test_missing_file_never_marked_synced(monkeypatch):
+    from app.services.gdrive_service import gdrive_service, GoogleDriveService
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_ENABLED", True)
+    monkeypatch.setattr(GoogleDriveService, "is_configured", property(lambda self: True))
+    monkeypatch.setattr(gdrive_service, "_get_service", lambda: True)
+
+    enqueue_sync_file("non_existent_file.mp4", file_type="recording")
+    pending_before = get_pending_sync_files()
+    target_before = next(p for p in pending_before if p["filepath"] == "non_existent_file.mp4")
+    assert target_before["retry_count"] == 0
+
+    # Executa ciclo de sync
+    gdrive_service._sync_offline_pending()
+
+    # Arquivo inexistente NUNCA deve ser marcado como 'synced'! Deve continuar 'pending' com retry_count incrementado
+    pending_after = get_pending_sync_files()
+    target_after = next(p for p in pending_after if p["filepath"] == "non_existent_file.mp4")
+    assert target_after["status"] == "pending"
+    assert target_after["retry_count"] == 1
+
+def test_pre_enqueue_recording_persists_before_upload(monkeypatch):
+    from app.services.gdrive_service import gdrive_service
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_ENABLED", True)
+
+    video_name = "video_20261101_crash_test.mp4"
+    gdrive_service.enqueue_file(video_name, description="Vídeo gravando", file_type="recording")
+
+    # Verifica se já está no SQLite antes mesmo do upload terminar
+    pending = get_pending_sync_files()
+    assert any(p["filepath"] == video_name and p["status"] == "pending" for p in pending)

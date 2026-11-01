@@ -147,68 +147,71 @@ class CameraService:
                 if url != self.rtsp_url:
                     break
 
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    logger.warning("Falha ao ler frame do RTSP. Reconectando...")
-                    break
+                try:
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        logger.warning("Falha ao ler frame do RTSP. Reconectando...")
+                        break
 
-                now = time.time()
-                self.last_frame_time = now
-                h, w, _ = frame.shape
-                self.width = w
-                self.height = h
+                    now = time.time()
+                    self.last_frame_time = now
+                    h, w, _ = frame.shape
+                    self.width = w
+                    self.height = h
 
-                # Salva cópia limpa para inferência de IA e snapshots
-                raw_frame = frame.copy()
+                    # Salva cópia limpa para inferência de IA e snapshots
+                    raw_frame = frame.copy()
 
-                # Renderiza anotações de tracking no frame se houver detecções ativas (TTL de 2.0s)
-                with self._lock:
-                    self.latest_frame_raw = raw_frame
-                    tracks = [t for t in self._active_tracks if (now - t.get("last_seen", 0)) < 2.0]
-                    self._active_tracks = tracks
+                    # Renderiza anotações de tracking no frame se houver detecções ativas (TTL de 1.0s)
+                    with self._lock:
+                        self.latest_frame_raw = raw_frame
+                        tracks = [t for t in self._active_tracks if (now - t.get("last_seen", 0)) < 1.0]
+                        self._active_tracks = tracks
 
-                if tracks:
-                    # Paleta de cores vibrantes (BGR) para diferenciar cada pessoa na cena
-                    PERSON_PALETTE = [
-                        (255, 200, 0),   # Ciano Neon
-                        (0, 165, 255),   # Laranja Vibrante
-                        (50, 220, 50),   # Verde Neon
-                        (204, 50, 204),  # Magenta
-                        (0, 215, 255),   # Amarelo Ouro
-                        (255, 120, 120), # Azul Céu
-                    ]
-                    for idx, t in enumerate(tracks):
-                        track_id = t.get("track_id", idx + 1)
-                        color = PERSON_PALETTE[(track_id - 1) % len(PERSON_PALETTE)]
-                        x1, y1, x2, y2 = t["box"]
-                        conf = t.get("conf", 0.0)
+                    if tracks:
+                        # Paleta de cores vibrantes (BGR) para diferenciar cada pessoa na cena
+                        PERSON_PALETTE = [
+                            (255, 200, 0),   # Ciano Neon
+                            (0, 165, 255),   # Laranja Vibrante
+                            (50, 220, 50),   # Verde Neon
+                            (204, 50, 204),  # Magenta
+                            (0, 215, 255),   # Amarelo Ouro
+                            (255, 120, 120), # Azul Céu
+                        ]
+                        for idx, t in enumerate(tracks):
+                            track_id = t.get("track_id", idx + 1)
+                            color = PERSON_PALETTE[(track_id - 1) % len(PERSON_PALETTE)]
+                            x1, y1, x2, y2 = t["box"]
+                            conf = t.get("conf", 0.0)
 
-                        # Garante limites válidos dentro do frame
-                        x1, y1 = max(0, int(x1)), max(0, int(y1))
-                        x2, y2 = min(w - 1, int(x2)), min(h - 1, int(y2))
+                            # Garante limites válidos dentro do frame
+                            x1, y1 = max(0, int(x1)), max(0, int(y1))
+                            x2, y2 = min(w - 1, int(x2)), min(h - 1, int(y2))
 
-                        # Bounding box estilo segurança HUD com cor específica da pessoa
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                            # Bounding box estilo segurança HUD com cor específica da pessoa
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-                        # Label com fundo preenchido e ID da pessoa
-                        label = f"PESSOA #{track_id} ({int(conf * 100)}%)"
-                        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                        label_y = max(y1, th + 6)
-                        cv2.rectangle(frame, (x1, label_y - th - 6), (x1 + tw + 8, label_y + baseline), color, -1)
-                        cv2.putText(frame, label, (x1 + 4, label_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (10, 15, 20), 1, cv2.LINE_AA)
+                            # Label com fundo preenchido e ID da pessoa
+                            label = f"PESSOA #{track_id} ({int(conf * 100)}%)"
+                            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                            label_y = max(y1, th + 6)
+                            cv2.rectangle(frame, (x1, label_y - th - 6), (x1 + tw + 8, label_y + baseline), color, -1)
+                            cv2.putText(frame, label, (x1 + 4, label_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (10, 15, 20), 1, cv2.LINE_AA)
 
-                # Codifica para JPEG mantendo alta fidelidade visual (qualidade 85)
-                # Otimizado para CPU com compressão direta
-                _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                
-                with self._lock:
-                    self.latest_frame_jpeg = jpeg.tobytes()
+                    # Codifica para JPEG mantendo alta fidelidade visual (qualidade 80, leve para CPU)
+                    _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    
+                    with self._lock:
+                        self.latest_frame_jpeg = jpeg.tobytes()
 
-                frame_count += 1
-                if now - fps_timer >= 1.0:
-                    self.fps = round(frame_count / (now - fps_timer), 1)
-                    frame_count = 0
-                    fps_timer = now
+                    frame_count += 1
+                    if now - fps_timer >= 1.0:
+                        self.fps = round(frame_count / (now - fps_timer), 1)
+                        frame_count = 0
+                        fps_timer = now
+                except Exception as err:
+                    logger.warning(f"Erro momentâneo no processamento de frame: {err}")
+                    time.sleep(0.05)
 
             cap.release()
             self.status = "OFFLINE"

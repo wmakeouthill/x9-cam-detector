@@ -18,6 +18,7 @@ import {
   X,
   ShieldCheck,
   Film,
+  CloudUpload,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -66,6 +67,7 @@ export function SnapshotsView() {
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
@@ -140,6 +142,37 @@ export function SnapshotsView() {
 
   const clearSelection = () => {
     setSelectedIds(new Set());
+  };
+
+  // Força sincronização manual de todas as fotos e vídeos locais com o Google Drive
+  const handleManualSync = async () => {
+    if (!token || syncing) return;
+    setSyncing(true);
+    setFeedback(null);
+    try {
+      const res = await fetch('/api/camera/gdrive/sync', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        setFeedback({
+          text: data.message || 'Sincronização manual com o Google Drive iniciada!',
+          type: 'success',
+        });
+        fetchEvents(page);
+      } else {
+        setFeedback({
+          text: data.message || 'Falha ao acionar sincronização com o Google Drive.',
+          type: 'error',
+        });
+      }
+    } catch {
+      setFeedback({ text: 'Erro de comunicação ao sincronizar com o Google Drive.', type: 'error' });
+    } finally {
+      setSyncing(false);
+      setTimeout(() => setFeedback(null), 5000);
+    }
   };
 
   // Executa exclusão confirmada (individual ou em lote)
@@ -271,6 +304,16 @@ export function SnapshotsView() {
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
             <span>Atualizar</span>
+          </button>
+
+          <button
+            onClick={handleManualSync}
+            disabled={syncing || loading}
+            title="Varre todas as fotos e vídeos locais órfãos e sincroniza com o Google Drive"
+            className="flex items-center justify-center gap-1.5 px-3 py-2 sm:py-1.5 rounded-lg bg-cyan-950/40 border border-cyan-500/40 hover:border-cyan-400 text-xs text-cyan-300 hover:text-white transition-all cursor-pointer min-h-[40px] sm:min-h-0 disabled:opacity-50"
+          >
+            <CloudUpload className={`w-3.5 h-3.5 ${syncing ? 'animate-bounce text-cyan-400' : 'text-cyan-400'}`} />
+            <span>{syncing ? 'Sincronizando...' : 'Sincronizar Drive'}</span>
           </button>
         </div>
       </div>

@@ -8,7 +8,8 @@ docker compose up -d
 echo.
 echo ========================================================
 echo  Sistema ativo em segundo plano!
-echo  Painel Web: http://localhost:39080
-echo  Rede Local: http://[seu-ip-local]:39080
+echo  Painel Web:   http://localhost:39080
+echo  Rede Local:   http://[seu-ip-local]:39080
+echo  WhatsApp API: http://localhost:39082
 echo ========================================================
 pause

@@ -11,6 +11,7 @@ import {
   Camera,
   Film,
   Zap,
+  QrCode,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -33,6 +34,8 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
 
   const [loading, setLoading] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [qrCodeData, setQrCodeData] = useState<{ base64?: string; code?: string; message: string } | null>(null);
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [connectionState, setConnectionState] = useState<{ connected: boolean; state: string; message: string } | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -47,8 +50,11 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
       if (res.ok) {
         const data = await res.json();
         setEnabled(Boolean(data.enabled));
-        setApiUrl(data.api_url || '');
-        setInstanceName(data.instance_name || '');
+        const resolvedUrl = (!data.api_url || data.api_url.includes('localhost:39080') || data.api_url.includes('localhost:39082'))
+          ? 'http://evolution-api:8080'
+          : data.api_url;
+        setApiUrl(resolvedUrl);
+        setInstanceName(data.instance_name || 'x9-vigia');
         setTargetNumber(data.target_number || '');
         setSendPhoto(data.send_photo !== undefined ? Boolean(data.send_photo) : true);
         setSendVideo(data.send_video !== undefined ? Boolean(data.send_video) : true);
@@ -152,6 +158,59 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
     }
   };
 
+  const handleConnectQrCode = async () => {
+    setConnecting(true);
+    setQrCodeData(null);
+    setTestResult(null);
+    try {
+      const res = await fetch('/api/camera/whatsapp/connect', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          api_url: apiUrl || 'http://evolution-api:8080',
+          api_key: apiKey,
+          instance_name: instanceName || 'x9-vigia',
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (data.qrcode) {
+          setQrCodeData({
+            base64: data.qrcode,
+            code: data.code,
+            message: data.message || 'Escaneie o QR Code abaixo com seu WhatsApp:',
+          });
+        } else if (data.connected) {
+          setConnectionState({
+            connected: true,
+            state: 'open',
+            message: data.message || 'WhatsApp já conectado e pronto!',
+          });
+        } else {
+          setTestResult({
+            success: false,
+            message: data.message || 'Não foi possível gerar o QR Code no momento.',
+          });
+        }
+      } else {
+        setTestResult({
+          success: false,
+          message: data.detail || 'Falha ao contatar a Evolution API para gerar QR Code.',
+        });
+      }
+    } catch (err: any) {
+      setTestResult({
+        success: false,
+        message: `Erro ao conectar: ${err.message || 'Falha de comunicação'}`,
+      });
+    } finally {
+      setConnecting(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/85 backdrop-blur-md animate-fade-in select-none">
       <div className="relative w-full max-w-xl bg-[#090D14] border border-emerald-500/40 rounded-2xl shadow-[0_0_50px_rgba(16,185,129,0.15)] flex flex-col max-h-[92vh] overflow-hidden">
@@ -186,29 +245,86 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
           {/* Status de Conexão com a Evolution API */}
           {connectionState && (
             <div
-              className={`p-3 rounded-xl border flex items-center justify-between gap-3 text-xs font-mono ${
+              className={`p-3 rounded-xl border flex flex-col gap-2.5 text-xs font-mono ${
                 connectionState.connected
                   ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300'
                   : 'bg-amber-950/30 border-amber-500/40 text-amber-300'
               }`}
             >
-              <div className="flex items-center gap-2">
+              <div className="flex items-start gap-2">
                 <span
-                  className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                  className={`w-2.5 h-2.5 rounded-full shrink-0 mt-1 ${
                     connectionState.connected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
                   }`}
                 />
-                <span className="font-semibold">{connectionState.message}</span>
+                <span className="font-semibold break-all leading-relaxed flex-1">{connectionState.message}</span>
               </div>
+              <div className="flex items-center gap-2 w-full justify-end pt-1 border-t border-slate-800/40">
+                {!connectionState.connected && (
+                  <button
+                    type="button"
+                    onClick={handleConnectQrCode}
+                    disabled={connecting || loading}
+                    className="text-[11px] px-3 py-1.5 rounded-lg bg-emerald-700/70 hover:bg-emerald-600/80 text-emerald-100 border border-emerald-500/50 transition-colors flex items-center gap-1.5 cursor-pointer font-sans font-semibold disabled:opacity-50 shadow-sm"
+                  >
+                    <QrCode className={`w-3.5 h-3.5 ${connecting ? 'animate-spin' : ''}`} />
+                    <span>{connecting ? 'Gerando QR...' : 'Conectar WhatsApp (QR Code)'}</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={fetchConfig}
+                  disabled={loading}
+                  className="text-[11px] px-2.5 py-1.5 rounded-lg bg-black/40 hover:bg-black/60 text-slate-300 border border-slate-700/60 transition-colors flex items-center gap-1 cursor-pointer shrink-0"
+                  title="Recarregar status da Evolution API"
+                >
+                  <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
+                  <span>Atualizar</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Card de Leitura do QR Code */}
+          {qrCodeData?.base64 && (
+            <div className="p-4 rounded-xl bg-black/70 border border-emerald-500/50 flex flex-col items-center text-center space-y-3 animate-fade-in shadow-xl">
+              <div className="flex items-center justify-between w-full">
+                <span className="text-xs font-bold text-emerald-300 font-mono flex items-center gap-1.5">
+                  <QrCode className="w-4 h-4 text-emerald-400" /> Pareamento WhatsApp
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setQrCodeData(null)}
+                  className="text-[11px] text-slate-400 hover:text-slate-200"
+                >
+                  Fechar QR
+                </button>
+              </div>
+              <p className="text-xs text-slate-200">
+                {qrCodeData.message}
+              </p>
+              <div className="p-2.5 bg-white rounded-xl shadow-2xl inline-block border-2 border-emerald-500/40">
+                <img
+                  src={
+                    qrCodeData.base64.startsWith('data:')
+                      ? qrCodeData.base64
+                      : `data:image/png;base64,${qrCodeData.base64}`
+                  }
+                  alt="QR Code WhatsApp"
+                  className="w-52 h-52 object-contain"
+                />
+              </div>
+              <p className="text-[11px] text-slate-400 max-w-sm">
+                No celular: abra o <strong>WhatsApp</strong> &gt; <strong>Aparelhos conectados</strong> &gt; <strong>Conectar aparelho</strong> e aponte a câmera.
+              </p>
               <button
                 type="button"
                 onClick={fetchConfig}
                 disabled={loading}
-                className="text-[11px] px-2 py-1 rounded bg-black/40 hover:bg-black/60 text-slate-300 border border-slate-700/60 transition-colors flex items-center gap-1 cursor-pointer shrink-0"
-                title="Recarregar status da Evolution API"
+                className="text-xs px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold flex items-center gap-1.5 cursor-pointer shadow-md transition-all"
               >
-                <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
-                <span>Atualizar</span>
+                <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+                <span>Já apontei a câmera (Confirmar Conexão)</span>
               </button>
             </div>
           )}
@@ -240,14 +356,14 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
               </label>
               <input
                 type="text"
-                placeholder="http://localhost:8080 ou http://seu-ip:8080"
+                placeholder="http://evolution-api:8080 (Docker) ou http://localhost:39082"
                 value={apiUrl}
                 onChange={(e) => setApiUrl(e.target.value)}
                 className="w-full bg-[#0D121B] border border-slate-700/80 rounded-lg px-3 py-2 text-xs text-slate-100 font-mono focus:outline-none focus:border-emerald-500 transition-colors"
                 required={enabled}
               />
               <p className="text-[10px] text-slate-500 mt-1 font-mono">
-                Endereço do container ou servidor onde a Evolution API está em execução.
+                No Docker Compose integrado, use <code>http://evolution-api:8080</code> (comunicação interna direta).
               </p>
             </div>
 
@@ -258,7 +374,7 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
                 </label>
                 <input
                   type="text"
-                  placeholder="ex: mirassol-ti ou vigia-x9"
+                  placeholder="x9-vigia"
                   value={instanceName}
                   onChange={(e) => setInstanceName(e.target.value)}
                   className="w-full bg-[#0D121B] border border-slate-700/80 rounded-lg px-3 py-2 text-xs text-slate-100 font-mono focus:outline-none focus:border-emerald-500 transition-colors"
@@ -310,7 +426,7 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
               <div className="relative">
                 <input
                   type={showKey ? 'text' : 'password'}
-                  placeholder="AUTHENTICATION_API_KEY da Evolution API"
+                  placeholder="x9-evolution-key-2026"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
                   className="w-full bg-[#0D121B] border border-slate-700/80 rounded-lg pl-3 pr-10 py-2 text-xs text-slate-100 font-mono focus:outline-none focus:border-emerald-500 transition-colors"
@@ -325,7 +441,7 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
                 </button>
               </div>
               <p className="text-[10px] text-slate-500 mt-1 font-mono">
-                Protegido e criptografado com chave AES-256 no banco local.
+                Chave da Evolution configurada no docker-compose (padrão: <code>x9-evolution-key-2026</code>). Criptografada com AES-256 no banco local.
               </p>
             </div>
           </div>

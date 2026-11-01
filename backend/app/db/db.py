@@ -331,6 +331,38 @@ def get_pending_sync_files(limit: int = 50) -> list[dict]:
     conn.close()
     return rows
 
+def get_all_synced_filepaths() -> set[str]:
+    """Retorna um conjunto com os nomes de todos os arquivos já marcados como sincronizados."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT filepath FROM gdrive_sync_queue WHERE status = 'synced'")
+    rows = cursor.fetchall()
+    conn.close()
+    return {row["filepath"] for row in rows}
+
+def get_unsynced_detection_events() -> list[dict]:
+    """Retorna caminhos de snapshots e vídeos de eventos que não constam como sincronizados na fila."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT e.id, e.snapshot_path, e.video_path, e.confidence, e.timestamp
+        FROM detection_events e
+        WHERE (
+            e.snapshot_path IS NOT NULL AND e.snapshot_path NOT IN (
+                SELECT filepath FROM gdrive_sync_queue WHERE status = 'synced'
+            )
+        ) OR (
+            e.video_path IS NOT NULL AND e.video_path NOT IN (
+                SELECT filepath FROM gdrive_sync_queue WHERE status = 'synced'
+            )
+        )
+        ORDER BY e.id DESC
+        LIMIT 100
+    """)
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
 def is_file_synced_or_untracked(filepath: str) -> bool:
     """
     Verifica se o arquivo já foi sincronizado com sucesso no Google Drive.

@@ -10,6 +10,8 @@ from app.db import (
     mark_file_synced,
     increment_sync_retry,
     get_pending_sync_files,
+    get_all_synced_filepaths,
+    get_unsynced_detection_events,
 )
 
 logger = logging.getLogger("x9.gdrive")
@@ -24,16 +26,59 @@ class GoogleDriveService:
         self._start_workers()
         self._enqueue_existing_pending()
 
+    def start(self):
+        """Inicializa ou reativa workers e processa pendências do SQLite após o boot do banco."""
+        self._running = True
+        self._start_workers()
+        self._reconcile_orphaned_files()
+        self._enqueue_existing_pending()
+
+    def stop(self):
+        """Interrompe graciosamente as threads de sincronização."""
+        self._running = False
+
+    def sync_now(self) -> dict:
+        """Força varredura imediata de órfãos e dispara processamento da fila de envio."""
+        if not settings.GOOGLE_DRIVE_ENABLED:
+            return {
+                "ok": False,
+                "message": "Google Drive está desativado no .env (GOOGLE_DRIVE_ENABLED=false)."
+            }
+
+        if not self.is_configured:
+            return {
+                "ok": False,
+                "message": "Google Drive não está totalmente configurado (verifique Folder ID ou credenciais)."
+            }
+
+        # 1. Resgata qualquer arquivo órfão no banco ou disco
+        self._reconcile_orphaned_files()
+
+        # 2. Enfileira pendentes em memória
+        self._enqueue_existing_pending()
+
+        # 3. Dispara sincronização offline imediata em thread background
+        threading.Thread(target=self._sync_offline_pending, daemon=True).start()
+
+        pending = get_pending_sync_files(limit=100)
+        return {
+            "ok": True,
+            "message": f"Sincronização manual iniciada! {len(pending)} arquivo(s) na fila para o Google Drive.",
+            "pending_count": len(pending),
+        }
+
     def _start_workers(self):
-        self._worker_thread = threading.Thread(target=self._process_queue, daemon=True)
-        self._worker_thread.start()
-        self._reconcile_thread = threading.Thread(target=self._reconciliation_loop, daemon=True)
-        self._reconcile_thread.start()
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            self._worker_thread = threading.Thread(target=self._process_queue, daemon=True)
+            self._worker_thread.start()
+        if self._reconcile_thread is None or not self._reconcile_thread.is_alive():
+            self._reconcile_thread = threading.Thread(target=self._reconciliation_loop, daemon=True)
+            self._reconcile_thread.start()
 
     def _enqueue_existing_pending(self):
         """Na inicialização do backend, enfileira arquivos pendentes salvos no SQLite."""
         try:
-            pending = get_pending_sync_files(limit=50)
+            pending = get_pending_sync_files(limit=100)
             for item in pending:
                 full_path = self._resolve_full_path(item["filepath"])
                 if full_path and os.path.exists(full_path):
@@ -49,10 +94,19 @@ class GoogleDriveService:
         if os.path.isabs(filepath) and os.path.exists(filepath):
             return filepath
         filename = os.path.basename(filepath)
-        for base in ["snapshots", "backend/snapshots", "recordings", "backend/recordings", ""]:
+        candidates = [
+            "snapshots",
+            "backend/snapshots",
+            os.path.join("..", "snapshots"),
+            "recordings",
+            "backend/recordings",
+            os.path.join("..", "recordings"),
+            "",
+        ]
+        for base in candidates:
             cand = os.path.join(base, filename) if base else filepath
             if os.path.exists(cand):
-                return cand
+                return os.path.abspath(cand)
         return ""
 
     @property
@@ -63,6 +117,19 @@ class GoogleDriveService:
         creds_file = settings.GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE
         has_sa = os.path.exists(creds_file) or os.path.exists(os.path.join("..", creds_file))
         return bool((has_token or has_sa) and settings.GOOGLE_DRIVE_FOLDER_ID)
+
+    def enqueue_file(self, filepath: str, description: str = "", file_type: str = "snapshot"):
+        """
+        Registra preventivamente um arquivo no SQLite sem enfileirar em memória.
+        Garante que gravações em andamento resistam a crash do backend.
+        """
+        if not settings.GOOGLE_DRIVE_ENABLED:
+            return
+        filename = os.path.basename(filepath)
+        try:
+            enqueue_sync_file(filename, file_type=file_type, description=description)
+        except Exception as e:
+            logger.warning(f"[Google Drive] Falha ao pré-registrar arquivo no SQLite: {e}")
 
     def upload_file_async(self, filepath: str, description: str = "", file_type: str = "snapshot"):
         """Enfileira um arquivo (snapshot ou vídeo) para upload em segundo plano e persiste no SQLite."""
@@ -101,15 +168,57 @@ class GoogleDriveService:
             finally:
                 self._queue.task_done()
 
-    def _reconciliation_loop(self):
-        """Worker em segundo plano: reconcilia pendências a cada 3 minutos e limpa nuvem a cada 24 horas."""
-        while self._running:
-            time.sleep(180)
-            if not self._running:
-                break
+    def _reconcile_orphaned_files(self):
+        """
+        Varredura de Auto-Cura: resgata arquivos no disco ou em detection_events
+        que não foram sincronizados (ex: queda do backend durante a gravação/disparo).
+        Garante que nada fique 'apenas local'.
+        """
+        if not settings.GOOGLE_DRIVE_ENABLED:
+            return
 
+        try:
+            synced_files = get_all_synced_filepaths()
+
+            # 1. Resgata do banco de eventos itens não sincronizados
+            unsynced_events = get_unsynced_detection_events()
+            for ev in unsynced_events:
+                snap = ev.get("snapshot_path")
+                vid = ev.get("video_path")
+                if snap and snap not in synced_files:
+                    full_snap = self._resolve_full_path(snap)
+                    if full_snap and os.path.exists(full_snap):
+                        enqueue_sync_file(snap, file_type="snapshot", description="Snapshot recuperado por auto-cura")
+                if vid and vid not in synced_files:
+                    full_vid = self._resolve_full_path(vid)
+                    if full_vid and os.path.exists(full_vid):
+                        enqueue_sync_file(vid, file_type="recording", description="Vídeo recuperado por auto-cura")
+
+            # 2. Resgata arquivos físicos existentes nos diretórios de snapshots e gravações
+            scan_dirs = [
+                ("snapshots", "snapshot", "Snapshot local recuperado"),
+                ("backend/snapshots", "snapshot", "Snapshot local recuperado"),
+                ("recordings", "recording", "Gravação local recuperada"),
+                ("backend/recordings", "recording", "Gravação local recuperada"),
+            ]
+            for folder, ftype, desc in scan_dirs:
+                if not os.path.exists(folder):
+                    continue
+                for entry in os.listdir(folder):
+                    if entry.lower().endswith((".jpg", ".jpeg", ".mp4")):
+                        if entry not in synced_files:
+                            enqueue_sync_file(entry, file_type=ftype, description=desc)
+        except Exception as e:
+            logger.warning(f"[Google Drive Auto-Cura] Erro ao reconciliar arquivos locais órfãos: {e}")
+
+    def _reconciliation_loop(self):
+        """Worker em segundo plano: reconcilia pendências e órfãos no startup e a cada 3 minutos."""
+        # Pequena pausa inicial (2s) para boot suave
+        time.sleep(2)
+        while self._running:
             if self.is_configured:
                 try:
+                    self._reconcile_orphaned_files()
                     self._sync_offline_pending()
                 except Exception as e:
                     logger.debug(f"[Google Drive Sync] Ciclo offline pausado (rede indisponível): {e}")
@@ -123,8 +232,14 @@ class GoogleDriveService:
                 except Exception as e:
                     logger.warning(f"[Google Drive] Erro na limpeza da nuvem: {e}")
 
+            # Aguarda 180s ou até shutdown
+            for _ in range(180):
+                if not self._running:
+                    break
+                time.sleep(1)
+
     def _sync_offline_pending(self):
-        pending = get_pending_sync_files(limit=20)
+        pending = get_pending_sync_files(limit=50)
         if not pending:
             return
 
@@ -137,8 +252,10 @@ class GoogleDriveService:
             filename = item["filepath"]
             full_path = self._resolve_full_path(filename)
             if not full_path or not os.path.exists(full_path):
-                logger.warning(f"[Google Drive Sync] Arquivo local '{filename}' não encontrado no disco. Marcando como finalizado.")
-                mark_file_synced(filename)
+                # NUNCA marca como synced se o arquivo não existe!
+                # Incrementa contador de tentativa para não perder evidência
+                increment_sync_retry(filename)
+                logger.warning(f"[Google Drive Sync] Arquivo local '{filename}' ainda indisponível no disco (tentativa {item.get('retry_count', 0) + 1}). Mantendo na fila.")
                 continue
 
             try:

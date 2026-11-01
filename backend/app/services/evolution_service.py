@@ -40,6 +40,24 @@ class EvolutionService:
                 normalized_list.append(clean)
         return normalized_list
 
+    @classmethod
+    def resolve_api_url(cls, api_url: str) -> str:
+        """Resolve a URL da Evolution API, traduzindo automaticamente 'localhost' para o container interno quando roda no Docker."""
+        url = (api_url or "").strip().rstrip("/")
+        if not url:
+            return "http://evolution-api:8080"
+        
+        is_docker = os.path.exists("/.dockerenv") or os.getenv("DOCKER_ENV") == "true"
+        if is_docker:
+            for prefix in [
+                "http://localhost:39082", "http://127.0.0.1:39082",
+                "http://localhost:8080", "http://127.0.0.1:8080",
+                "http://localhost", "http://127.0.0.1"
+            ]:
+                if url == prefix or url.startswith(prefix + "/"):
+                    return "http://evolution-api:8080"
+        return url
+
     def _resolve_full_path(self, filepath: str) -> str:
         if not filepath:
             return ""
@@ -54,6 +72,7 @@ class EvolutionService:
 
     def test_connection(self, api_url: str, api_key: str, instance_name: str) -> Dict[str, Any]:
         """Testa o status de conexão da instância na Evolution API v2."""
+        api_url = self.resolve_api_url(api_url)
         if not api_url or not instance_name:
             return {"connected": False, "state": "error", "message": "URL e Nome da Instância são obrigatórios."}
         
@@ -80,8 +99,129 @@ class EvolutionService:
         except Exception as e:
             return {"connected": False, "state": "error", "message": f"Falha de rede ao conectar na Evolution API: {str(e)}"}
 
+    def connect_or_get_qrcode(self, api_url: str, api_key: str, instance_name: str) -> Dict[str, Any]:
+        """Gera ou recupera o QR Code para conectar a instância do WhatsApp na Evolution API v2."""
+        api_url = self.resolve_api_url(api_url)
+        if not api_url or not instance_name:
+            return {"success": False, "connected": False, "message": "URL e Nome da Instância são obrigatórios."}
+        
+        base_url = api_url.rstrip("/")
+        headers = {
+            "apikey": api_key.strip(),
+            "Content-Type": "application/json",
+        }
+
+        # 1. Checa estado atual
+        status_res = self.test_connection(api_url, api_key, instance_name)
+        if status_res.get("connected"):
+            return {
+                "success": True,
+                "connected": True,
+                "state": "open",
+                "message": "WhatsApp já está conectado e operacional!",
+            }
+
+        # 2. Se a instância não existe (404), cria com WHATSAPP-BAILEYS e qrcode=true
+        if status_res.get("state") == "not_found":
+            create_url = f"{base_url}/instance/create"
+            payload = {
+                "instanceName": instance_name.strip(),
+                "integration": "WHATSAPP-BAILEYS",
+                "qrcode": True,
+            }
+            try:
+                r = requests.post(create_url, headers=headers, json=payload, timeout=15.0)
+                if r.status_code in (200, 201):
+                    data = r.json()
+                    qr_b64 = ""
+                    if isinstance(data.get("qrcode"), dict):
+                        qr_b64 = data["qrcode"].get("base64") or ""
+                    elif isinstance(data.get("base64"), str):
+                        qr_b64 = data["base64"]
+
+                    code = data.get("code") or (data["qrcode"].get("code") if isinstance(data.get("qrcode"), dict) else "")
+
+                    if qr_b64:
+                        return {
+                            "success": True,
+                            "connected": False,
+                            "state": "connecting",
+                            "qrcode": qr_b64,
+                            "code": code,
+                            "message": "Instância criada com sucesso. Escaneie o QR Code abaixo com seu WhatsApp.",
+                        }
+                    return {
+                        "success": True,
+                        "connected": False,
+                        "state": "created",
+                        "message": "Instância criada. Clique em 'Gerar QR Code' para conectar.",
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "connected": False,
+                        "message": f"Erro ao criar instância na Evolution API (HTTP {r.status_code}): {r.text[:150]}"
+                    }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "connected": False,
+                    "message": f"Falha de conexão ao criar instância: {str(e)}"
+                }
+
+        # 3. Se a instância já existe mas está desconectada, busca o QR Code atualizado em /instance/connect/{name}
+        connect_url = f"{base_url}/instance/connect/{instance_name.strip()}"
+        try:
+            r = requests.get(connect_url, headers=headers, timeout=15.0)
+            if r.status_code in (200, 201):
+                data = r.json()
+                qr_b64 = ""
+                if isinstance(data.get("qrcode"), dict):
+                    qr_b64 = data["qrcode"].get("base64") or ""
+                elif isinstance(data.get("base64"), str):
+                    qr_b64 = data["base64"]
+
+                code = data.get("code") or (data.get("qrcode", {}).get("code") if isinstance(data.get("qrcode"), dict) else "")
+
+                if qr_b64:
+                    return {
+                        "success": True,
+                        "connected": False,
+                        "state": "connecting",
+                        "qrcode": qr_b64,
+                        "code": code,
+                        "message": "Escaneie o QR Code abaixo com seu WhatsApp (Aparelhos Conectados).",
+                    }
+                elif data.get("instance", {}).get("state") == "open":
+                    return {
+                        "success": True,
+                        "connected": True,
+                        "state": "open",
+                        "message": "WhatsApp já conectado e operacional!",
+                    }
+                else:
+                    return {
+                        "success": True,
+                        "connected": False,
+                        "state": "waiting",
+                        "message": "Aguardando geração do QR Code pela Evolution API. Tente novamente em alguns segundos.",
+                    }
+            else:
+                return {
+                    "success": False,
+                    "connected": False,
+                    "message": f"Erro HTTP {r.status_code} ao solicitar QR Code: {r.text[:150]}"
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "connected": False,
+                "message": f"Falha de conexão ao buscar QR Code: {str(e)}"
+            }
+
     def send_test_message(self, api_url: str, api_key: str, instance_name: str, target_number: str) -> Dict[str, Any]:
         """Envia mensagem de texto de teste para validar entrega no WhatsApp (para todos os números informados)."""
+        api_url = self.resolve_api_url(api_url)
         numbers = self.parse_numbers(target_number)
         if not numbers:
             return {"success": False, "message": "Nenhum número de telefone válido encontrado."}
@@ -134,7 +274,7 @@ class EvolutionService:
             if not cfg.get("enabled") or not cfg.get("send_photo"):
                 return
             
-            api_url = cfg.get("api_url")
+            api_url = self.resolve_api_url(cfg.get("api_url"))
             api_key = cfg.get("api_key")
             instance = cfg.get("instance_name")
             target_number = cfg.get("target_number")
@@ -204,7 +344,7 @@ class EvolutionService:
             if not cfg.get("enabled") or not cfg.get("send_video"):
                 return
             
-            api_url = cfg.get("api_url")
+            api_url = self.resolve_api_url(cfg.get("api_url"))
             api_key = cfg.get("api_key")
             instance = cfg.get("instance_name")
             target_number = cfg.get("target_number")
