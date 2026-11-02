@@ -9,6 +9,7 @@ from app.db import (
     enqueue_sync_file,
     mark_file_synced,
     increment_sync_retry,
+    delete_sync_file,
     get_pending_sync_files,
     get_all_synced_filepaths,
     get_unsynced_detection_events,
@@ -23,6 +24,7 @@ class GoogleDriveService:
         self._reconcile_thread = None
         self._running = True
         self.last_cloud_cleanup_time = 0.0
+        self._last_reconcile_time = 0.0
         self._start_workers()
         self._enqueue_existing_pending()
 
@@ -32,6 +34,7 @@ class GoogleDriveService:
         self._start_workers()
         self._reconcile_orphaned_files()
         self._enqueue_existing_pending()
+        self.reconcile_events_from_drive(force=True)
 
     def stop(self):
         """Interrompe graciosamente as threads de sincronização."""
@@ -54,16 +57,19 @@ class GoogleDriveService:
         # 1. Resgata qualquer arquivo órfão no banco ou disco
         self._reconcile_orphaned_files()
 
-        # 2. Enfileira pendentes em memória
+        # 2. Reconcilia galeria diretamente com o Google Drive como fonte de verdade
+        self.reconcile_events_from_drive(force=True)
+
+        # 3. Enfileira pendentes em memória
         self._enqueue_existing_pending()
 
-        # 3. Dispara sincronização offline imediata em thread background
+        # 4. Dispara sincronização offline imediata em thread background
         threading.Thread(target=self._sync_offline_pending, daemon=True).start()
 
         pending = get_pending_sync_files(limit=100)
         return {
             "ok": True,
-            "message": f"Sincronização manual iniciada! {len(pending)} arquivo(s) na fila para o Google Drive.",
+            "message": f"Sincronização iniciada com o Google Drive! {len(pending)} item(ns) na fila de envio.",
             "pending_count": len(pending),
         }
 
@@ -238,6 +244,18 @@ class GoogleDriveService:
                     break
                 time.sleep(1)
 
+    def _is_file_in_drive(self, filename: str) -> bool:
+        """Verifica se o arquivo já existe na pasta do Google Drive."""
+        try:
+            service = self._get_service()
+            if not service:
+                return False
+            q = f"name = '{filename}' and '{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+            res = service.files().list(q=q, fields="files(id)").execute()
+            return len(res.get("files", [])) > 0
+        except Exception:
+            return False
+
     def _sync_offline_pending(self):
         pending = get_pending_sync_files(limit=50)
         if not pending:
@@ -252,10 +270,20 @@ class GoogleDriveService:
             filename = item["filepath"]
             full_path = self._resolve_full_path(filename)
             if not full_path or not os.path.exists(full_path):
-                # NUNCA marca como synced se o arquivo não existe!
-                # Incrementa contador de tentativa para não perder evidência
+                # 1. Se o arquivo já está no Drive, confirma como sincronizado
+                if self._is_file_in_drive(filename):
+                    mark_file_synced(filename)
+                    logger.info(f"[Google Drive Sync] Arquivo '{filename}' já confirmado no Drive. Marcando como sincronizado.")
+                    continue
+
+                # 2. Se não está no Drive e não existe no disco após retentativas (ex: apagado pelo usuário)
+                if item.get("retry_count", 0) >= 3:
+                    delete_sync_file(filename)
+                    logger.info(f"[Google Drive Sync] Arquivo descartado da fila (não existe no disco nem no Drive): {filename}")
+                    continue
+
                 increment_sync_retry(filename)
-                logger.warning(f"[Google Drive Sync] Arquivo local '{filename}' ainda indisponível no disco (tentativa {item.get('retry_count', 0) + 1}). Mantendo na fila.")
+                logger.warning(f"[Google Drive Sync] Arquivo local '{filename}' ainda indisponível no disco (tentativa {item.get('retry_count', 0) + 1}).")
                 continue
 
             try:
@@ -278,8 +306,6 @@ class GoogleDriveService:
         """
         scopes = [
             "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/drive.metadata.readonly"
         ]
 
         # 1. OAuth pessoal (token.json)
@@ -420,6 +446,147 @@ class GoogleDriveService:
         except Exception as e:
             logger.warning(f"[Google Drive] Falha ao excluir '{filename}' da nuvem: {e}")
             return False
+
+    def _extract_timestamp(self, filename: str, fallback_iso: str | None = None) -> str:
+        import re
+        match = re.search(r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", filename)
+        if match:
+            y, m, d, h, mn, s = match.groups()
+            return f"{y}-{m}-{d} {h}:{mn}:{s}"
+        if fallback_iso:
+            try:
+                return fallback_iso.replace("Z", "").split(".")[0].replace("T", " ")
+            except Exception:
+                pass
+        from app.core.time import get_now_str
+        return get_now_str()
+
+    def list_drive_files(self) -> list[dict]:
+        """Lista todos os arquivos na pasta do Google Drive."""
+        if not self.is_configured:
+            return []
+        try:
+            service = self._get_service()
+            if not service:
+                return []
+            q = f"'{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+            files = []
+            page_token = None
+            while True:
+                res = service.files().list(
+                    q=q,
+                    fields="nextPageToken, files(id, name, createdTime, size, mimeType, webViewLink)",
+                    pageSize=100,
+                    pageToken=page_token
+                ).execute()
+                files.extend(res.get("files", []))
+                page_token = res.get("nextPageToken")
+                if not page_token:
+                    break
+            return files
+        except Exception as e:
+            logger.warning(f"[Google Drive] Erro ao listar arquivos do Drive: {e}")
+            return []
+
+    def get_file_bytes(self, filename: str) -> bytes | None:
+        """Busca e retorna o conteúdo binário de um arquivo armazenado no Google Drive."""
+        if not self.is_configured:
+            return None
+        try:
+            service = self._get_service()
+            if not service:
+                return None
+            q = f"name = '{filename}' and '{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+            res = service.files().list(q=q, fields="files(id)").execute()
+            files = res.get("files", [])
+            if not files:
+                return None
+            file_id = files[0]["id"]
+            return service.files().get_media(fileId=file_id).execute()
+        except Exception as e:
+            logger.warning(f"[Google Drive] Erro ao baixar '{filename}': {e}")
+            return None
+
+    def reconcile_events_from_drive(self, force: bool = False):
+        """
+        Sincroniza os eventos da galeria com o Google Drive como FONTE DE VERDADE.
+        1. Resgata do Drive qualquer gravação ou foto para detection_events.
+        2. Remove de detection_events itens já sincronizados que foram apagados no Drive.
+        3. Preserva gravações/fotos locais pendentes (buffer offline).
+        """
+        if not self.is_configured:
+            return
+
+        now = time.time()
+        if not force and (now - self._last_reconcile_time) < 10.0:
+            return
+        self._last_reconcile_time = now
+
+        try:
+            drive_files = self.list_drive_files()
+            drive_file_names = {f["name"]: f for f in drive_files}
+
+            from app.db import get_connection, mark_file_synced
+
+            conn = get_connection()
+            cursor = conn.cursor()
+
+            # Eventos atuais no SQLite
+            cursor.execute("SELECT id, snapshot_path, video_path FROM detection_events")
+            db_events = [dict(r) for r in cursor.fetchall()]
+
+            known_snapshots = {e["snapshot_path"]: e["id"] for e in db_events if e["snapshot_path"]}
+            known_videos = {e["video_path"]: e["id"] for e in db_events if e["video_path"]}
+
+            # 1. Adiciona itens do Drive que ainda não estão em detection_events
+            for fname, finfo in drive_file_names.items():
+                ftype = "recording" if fname.lower().endswith(".mp4") else "snapshot"
+                if ftype == "snapshot":
+                    if fname not in known_snapshots:
+                        ts = self._extract_timestamp(fname, finfo.get("createdTime"))
+                        flash = 1 if "flash" in fname.lower() else 0
+                        cursor.execute("""
+                            INSERT INTO detection_events (timestamp, confidence, flash_triggered, snapshot_path, video_path)
+                            VALUES (?, 1.0, ?, ?, NULL)
+                        """, (ts, flash, fname))
+                        known_snapshots[fname] = cursor.lastrowid
+                else:
+                    if fname not in known_videos:
+                        ts = self._extract_timestamp(fname, finfo.get("createdTime"))
+                        cursor.execute("""
+                            INSERT INTO detection_events (timestamp, confidence, flash_triggered, snapshot_path, video_path)
+                            VALUES (?, 1.0, 0, NULL, ?)
+                        """, (ts, fname))
+                        known_videos[fname] = cursor.lastrowid
+
+                # Marca como sincronizado no mesmo cursor (evita deadlock de conexões SQLite)
+                cursor.execute("""
+                    INSERT INTO gdrive_sync_queue (filepath, file_type, description, status, synced_at)
+                    VALUES (?, ?, 'Sincronizado no Google Drive', 'synced', CURRENT_TIMESTAMP)
+                    ON CONFLICT(filepath) DO UPDATE SET status = 'synced', synced_at = CURRENT_TIMESTAMP
+                """, (fname, ftype))
+
+            # 2. Remove do banco itens marcados como 'synced' que não existem mais no Drive (foi apagado na nuvem)
+            cursor.execute("SELECT filepath FROM gdrive_sync_queue WHERE status = 'synced'")
+            synced_paths = {row["filepath"] for row in cursor.fetchall()}
+
+            for ev in db_events:
+                snap = ev["snapshot_path"]
+                vid = ev["video_path"]
+                snap_gone = snap and (snap in synced_paths) and (snap not in drive_file_names)
+                vid_gone = vid and (vid in synced_paths) and (vid not in drive_file_names)
+                if snap_gone or vid_gone:
+                    cursor.execute("DELETE FROM detection_events WHERE id = ?", (ev["id"],))
+                    if snap:
+                        cursor.execute("DELETE FROM gdrive_sync_queue WHERE filepath = ?", (snap,))
+                    if vid:
+                        cursor.execute("DELETE FROM gdrive_sync_queue WHERE filepath = ?", (vid,))
+
+            conn.commit()
+            conn.close()
+            logger.info(f"[Google Drive] Galeria reconciliada com o Drive ({len(drive_files)} arquivo(s) na nuvem).")
+        except Exception as e:
+            logger.warning(f"[Google Drive] Erro ao reconciliar galeria com Drive: {e}")
 
     def test_connection(self) -> dict:
         if not settings.GOOGLE_DRIVE_FOLDER_ID:

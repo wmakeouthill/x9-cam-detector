@@ -1,7 +1,7 @@
 import os
 import time
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from app.core.security import get_current_user
 from app.services.camera_service import camera_service
@@ -141,9 +141,17 @@ def get_snapshot(filename: str, token: str | None = Query(None)):
         filepath = os.path.join("backend", "snapshots", filename)
     if not os.path.exists(filepath):
         filepath = os.path.join("..", "snapshots", filename)
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail="Snapshot não encontrado")
-    return FileResponse(filepath, media_type="image/jpeg")
+
+    if os.path.exists(filepath):
+        return FileResponse(filepath, media_type="image/jpeg")
+
+    # Fonte de verdade: se não está local, busca diretamente no Google Drive
+    if gdrive_service.is_configured:
+        data = gdrive_service.get_file_bytes(filename)
+        if data:
+            return Response(content=data, media_type="image/jpeg")
+
+    raise HTTPException(status_code=404, detail="Snapshot não encontrado")
 
 @router.get("/recordings/{filename}")
 def get_recording(filename: str, user: str = Depends(get_current_user)):
@@ -152,9 +160,17 @@ def get_recording(filename: str, user: str = Depends(get_current_user)):
         filepath = os.path.join("backend", "recordings", filename)
     if not os.path.exists(filepath):
         filepath = os.path.join("..", "recordings", filename)
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail="Gravação de vídeo não encontrada")
-    return FileResponse(filepath, media_type="video/mp4")
+
+    if os.path.exists(filepath):
+        return FileResponse(filepath, media_type="video/mp4")
+
+    # Fonte de verdade: se não está local, busca diretamente no Google Drive
+    if gdrive_service.is_configured:
+        data = gdrive_service.get_file_bytes(filename)
+        if data:
+            return Response(content=data, media_type="video/mp4")
+
+    raise HTTPException(status_code=404, detail="Gravação de vídeo não encontrada")
 
 @router.get("/nightwatch")
 def get_nightwatch_settings(user: str = Depends(get_current_user)):
@@ -175,6 +191,10 @@ def update_nightwatch_settings(req: NightWatchRequest, user: str = Depends(get_c
 
 @router.get("/events")
 def get_events(limit: int = 12, offset: int = 0, user: str = Depends(get_current_user)):
+    # Google Drive como Fonte de Verdade: reconcilia eventos do Drive com a galeria
+    if gdrive_service.is_configured:
+        gdrive_service.reconcile_events_from_drive()
+
     items = list_detection_events(limit=limit, offset=offset)
     total = count_detection_events()
     return {

@@ -14,7 +14,7 @@ DB_PATH = os.getenv("DB_PATH", os.path.join(DEFAULT_DB_DIR, "x9.db"))
 def get_connection():
     db_path = os.getenv("DB_PATH", DB_PATH)
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -250,6 +250,18 @@ def _remove_snapshot_and_video_files(snapshot_path: str | None, video_path: str 
     except Exception as e:
         logger.warning(f"Erro ao excluir arquivo correspondente no Google Drive: {e}")
 
+    # Remove também da fila de sincronização SQLite para não sobrar na fila
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        for p in [snapshot_path, video_path]:
+            if p:
+                c.execute("DELETE FROM gdrive_sync_queue WHERE filepath = ?", (p,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Erro ao remover arquivo da fila de sincronização: {e}")
+
 def delete_detection_event(event_id: int) -> bool:
     conn = get_connection()
     cursor = conn.cursor()
@@ -314,6 +326,14 @@ def increment_sync_retry(filepath: str):
         SET retry_count = retry_count + 1
         WHERE filepath = ?
     """, (filepath,))
+    conn.commit()
+    conn.close()
+
+def delete_sync_file(filepath: str):
+    """Remove um registro da fila de sincronização (ex: arquivo descartado/apagado)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM gdrive_sync_queue WHERE filepath = ?", (filepath,))
     conn.commit()
     conn.close()
 

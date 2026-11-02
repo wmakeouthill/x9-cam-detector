@@ -1,4 +1,5 @@
 from app.db.db import (
+    get_connection,
     init_db,
     get_camera_config,
     save_camera_config,
@@ -13,6 +14,7 @@ from app.db.db import (
     enqueue_sync_file,
     mark_file_synced,
     increment_sync_retry,
+    delete_sync_file,
     get_pending_sync_files,
     get_all_synced_filepaths,
     get_unsynced_detection_events,
