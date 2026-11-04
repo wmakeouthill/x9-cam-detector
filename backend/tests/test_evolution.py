@@ -85,3 +85,46 @@ def test_evolution_send_test_message(mock_post):
     assert mock_post.called
     call_args = mock_post.call_args
     assert "5511987654321" in call_args[1]["json"]["number"]
+
+@patch("requests.get")
+@patch("requests.delete")
+def test_evolution_enforce_single_session(mock_delete, mock_get):
+    # Simula 3 instâncias existentes no Evolution: 1 ativa ('x9-vigia') e 2 órfãs ('old-session', 'test-session')
+    mock_get_resp = MagicMock()
+    mock_get_resp.status_code = 200
+    mock_get_resp.json.return_value = [
+        {"name": "old-session"},
+        {"instanceName": "x9-vigia"},
+        {"name": "test-session"}
+    ]
+    mock_get.return_value = mock_get_resp
+
+    mock_del_resp = MagicMock()
+    mock_del_resp.status_code = 200
+    mock_delete.return_value = mock_del_resp
+
+    removed = evolution_service.enforce_single_session("http://localhost:8080", "secret", "x9-vigia")
+    assert removed == 2
+    assert mock_delete.call_count == 2
+    # Verifica que deletou as duas órfãs e NÃO deletou a ativa
+    deleted_urls = [call.args[0] for call in mock_delete.call_args_list]
+    assert any("old-session" in u for u in deleted_urls)
+    assert any("test-session" in u for u in deleted_urls)
+    assert not any("x9-vigia" in u for u in deleted_urls)
+
+@patch("requests.get")
+@patch("requests.delete")
+def test_evolution_reset_instance(mock_delete, mock_get):
+    mock_get_resp = MagicMock()
+    mock_get_resp.status_code = 200
+    mock_get_resp.json.return_value = [{"name": "x9-vigia"}]
+    mock_get.return_value = mock_get_resp
+
+    mock_del_resp = MagicMock()
+    mock_del_resp.status_code = 200
+    mock_delete.return_value = mock_del_resp
+
+    res = evolution_service.reset_instance("http://localhost:8080", "secret", "x9-vigia")
+    assert res["success"] is True
+    assert mock_delete.called
+    assert "x9-vigia" in mock_delete.call_args[0][0]

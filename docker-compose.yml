@@ -97,8 +97,7 @@ services:
       - DATABASE_SAVE_DATA_CONTACTS=false
       - DATABASE_SAVE_DATA_CHATS=false
       - CACHE_REDIS_ENABLED=false
-      - QRCODE_LIMIT=50
-      - QRCODE_EXPIRATION_IN_SECONDS=60
+      - QRCODE_LIMIT=6
       - ALWAYS_ONLINE=true
     ports:
       - "${EVOLUTION_PORT:-39082}:8080"

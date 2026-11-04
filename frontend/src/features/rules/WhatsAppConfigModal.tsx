@@ -12,6 +12,7 @@ import {
   Film,
   Zap,
   QrCode,
+  RotateCcw,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -35,6 +36,7 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
   const [loading, setLoading] = useState(false);
   const [testing, setTesting] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [qrCodeData, setQrCodeData] = useState<{ base64?: string; code?: string; message: string } | null>(null);
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [connectionState, setConnectionState] = useState<{ connected: boolean; state: string; message: string } | null>(null);
@@ -61,6 +63,9 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
         setApiKey(data.api_key || '');
         if (data.connection) {
           setConnectionState(data.connection);
+          if (data.connection.connected) {
+            setQrCodeData(null);
+          }
         }
       }
     } catch {
@@ -211,6 +216,40 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
     }
   };
 
+  const handleResetSession = async () => {
+    if (!window.confirm('Deseja realmente resetar a sessão do WhatsApp? Isso desconecta e apaga qualquer sessão travada ou órfã na Evolution API para liberar os recursos.')) {
+      return;
+    }
+    setResetting(true);
+    setTestResult(null);
+    setQrCodeData(null);
+    try {
+      const res = await fetch('/api/camera/whatsapp/reset', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          api_url: apiUrl || 'http://evolution-api:8080',
+          api_key: apiKey,
+          instance_name: instanceName || 'x9-vigia',
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setTestResult({ success: true, message: data.message });
+      } else {
+        setTestResult({ success: false, message: data.message || 'Falha ao resetar sessão.' });
+      }
+      fetchConfig();
+    } catch (err: any) {
+      setTestResult({ success: false, message: `Erro ao resetar: ${err.message}` });
+    } finally {
+      setResetting(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/85 backdrop-blur-md animate-fade-in select-none">
       <div className="relative w-full max-w-xl bg-[#090D14] border border-emerald-500/40 rounded-2xl shadow-[0_0_50px_rgba(16,185,129,0.15)] flex flex-col max-h-[92vh] overflow-hidden">
@@ -264,13 +303,23 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
                   <button
                     type="button"
                     onClick={handleConnectQrCode}
-                    disabled={connecting || loading}
+                    disabled={connecting || loading || resetting}
                     className="text-[11px] px-3 py-1.5 rounded-lg bg-emerald-700/70 hover:bg-emerald-600/80 text-emerald-100 border border-emerald-500/50 transition-colors flex items-center gap-1.5 cursor-pointer font-sans font-semibold disabled:opacity-50 shadow-sm"
                   >
                     <QrCode className={`w-3.5 h-3.5 ${connecting ? 'animate-spin' : ''}`} />
                     <span>{connecting ? 'Gerando QR...' : 'Conectar WhatsApp (QR Code)'}</span>
                   </button>
                 )}
+                <button
+                  type="button"
+                  onClick={handleResetSession}
+                  disabled={resetting || loading || connecting}
+                  className="text-[11px] px-2.5 py-1.5 rounded-lg bg-red-950/40 hover:bg-red-900/50 text-red-300 border border-red-800/50 transition-colors flex items-center gap-1 cursor-pointer shrink-0"
+                  title="Limpa sessões órfãs ou travadas na Evolution API"
+                >
+                  <RotateCcw className={`w-3 h-3 ${resetting ? 'animate-spin' : ''}`} />
+                  <span>{resetting ? 'Resetando...' : 'Resetar Sessão'}</span>
+                </button>
                 <button
                   type="button"
                   onClick={fetchConfig}
@@ -290,7 +339,7 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
             <div className="p-4 rounded-xl bg-black/70 border border-emerald-500/50 flex flex-col items-center text-center space-y-3 animate-fade-in shadow-xl">
               <div className="flex items-center justify-between w-full">
                 <span className="text-xs font-bold text-emerald-300 font-mono flex items-center gap-1.5">
-                  <QrCode className="w-4 h-4 text-emerald-400" /> Pareamento WhatsApp
+                  <QrCode className="w-4 h-4 text-emerald-400" /> Pareamento WhatsApp (Sessão Única)
                 </span>
                 <button
                   type="button"
@@ -317,15 +366,29 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
               <p className="text-[11px] text-slate-400 max-w-sm">
                 No celular: abra o <strong>WhatsApp</strong> &gt; <strong>Aparelhos conectados</strong> &gt; <strong>Conectar aparelho</strong> e aponte a câmera.
               </p>
-              <button
-                type="button"
-                onClick={fetchConfig}
-                disabled={loading}
-                className="text-xs px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold flex items-center gap-1.5 cursor-pointer shadow-md transition-all"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-                <span>Já apontei a câmera (Confirmar Conexão)</span>
-              </button>
+              <p className="text-[10px] text-amber-400 font-mono">
+                ⚠️ O QR Code expira rapidamente. Se a leitura falhar, clique em &quot;Novo QR Code&quot;.
+              </p>
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={handleConnectQrCode}
+                  disabled={connecting || loading}
+                  className="text-xs px-3.5 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-slate-200 font-semibold flex items-center gap-1.5 cursor-pointer border border-zinc-700 transition-all"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${connecting ? 'animate-spin' : ''}`} />
+                  <span>{connecting ? 'Gerando...' : 'Novo QR Code'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={fetchConfig}
+                  disabled={loading}
+                  className="text-xs px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold flex items-center gap-1.5 cursor-pointer shadow-md transition-all"
+                >
+                  <CheckCircle2 className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+                  <span>Já apontei (Confirmar Conexão)</span>
+                </button>
+              </div>
             </div>
           )}
 

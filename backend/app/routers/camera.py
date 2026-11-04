@@ -320,6 +320,11 @@ class WhatsAppConnectRequest(BaseModel):
     api_key: str = ""
     instance_name: str = ""
 
+class WhatsAppResetRequest(BaseModel):
+    api_url: str = ""
+    api_key: str = ""
+    instance_name: str = ""
+
 @router.get("/whatsapp")
 def get_whatsapp_settings(user: str = Depends(get_current_user)):
     cfg = get_whatsapp_config(decrypt_key=False)
@@ -364,6 +369,18 @@ def connect_whatsapp_instance(req: WhatsAppConnectRequest, user: str = Depends(g
         key = settings.EVOLUTION_API_KEY or "x9-evolution-key-2026"
 
     res = evolution_service.connect_or_get_qrcode(api_url, key, instance)
+    return res
+
+@router.post("/whatsapp/reset")
+def reset_whatsapp_instance(req: WhatsAppResetRequest, user: str = Depends(get_current_user)):
+    current = get_whatsapp_config(decrypt_key=True)
+    api_url = (req.api_url or current.get("api_url") or settings.EVOLUTION_API_URL or "http://evolution-api:8080").strip()
+    instance = (req.instance_name or current.get("instance_name") or settings.EVOLUTION_INSTANCE_NAME or "x9-vigia").strip()
+    key = req.api_key.strip() if (req.api_key and req.api_key.strip() != "••••••••") else current.get("api_key", "")
+    if not key:
+        key = settings.EVOLUTION_API_KEY or "x9-evolution-key-2026"
+
+    res = evolution_service.reset_instance(api_url, key, instance)
     return res
 
 @router.post("/whatsapp/test")

@@ -70,8 +70,75 @@ class EvolutionService:
                 return cand
         return ""
 
+    def list_instances(self, api_url: str, api_key: str) -> list[str]:
+        """Retorna os nomes de todas as instâncias existentes na Evolution API."""
+        api_url = self.resolve_api_url(api_url)
+        if not api_url or not api_key:
+            return []
+        url = f"{api_url.rstrip('/')}/instance/fetchInstances"
+        headers = {"apikey": api_key.strip()}
+        try:
+            r = requests.get(url, headers=headers, timeout=4.0)
+            if r.status_code == 200:
+                data = r.json()
+                instances = []
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            name = item.get("name") or item.get("instanceName") or (item.get("instance") or {}).get("instanceName")
+                            if name:
+                                instances.append(str(name).strip())
+                return instances
+        except Exception as e:
+            logger.warning(f"[WhatsApp] Falha ao listar instâncias da Evolution API: {e}")
+        return []
+
+    def delete_instance(self, api_url: str, api_key: str, instance_name: str) -> bool:
+        """Exclui completamente uma instância na Evolution API para liberar memória e sockets."""
+        api_url = self.resolve_api_url(api_url)
+        if not api_url or not instance_name:
+            return False
+        url = f"{api_url.rstrip('/')}/instance/delete/{instance_name.strip()}"
+        headers = {"apikey": api_key.strip()}
+        try:
+            r = requests.delete(url, headers=headers, timeout=5.0)
+            return r.status_code in (200, 204)
+        except Exception as e:
+            logger.warning(f"[WhatsApp] Falha ao deletar instância {instance_name}: {e}")
+            return False
+
+    def enforce_single_session(self, api_url: str, api_key: str, active_instance_name: str) -> int:
+        """Garante estritamente apenas uma sessão ativa no Evolution API, deletando quaisquer instâncias órfãs/antigas."""
+        active = (active_instance_name or "").strip()
+        if not active:
+            return 0
+        all_instances = self.list_instances(api_url, api_key)
+        removed = 0
+        for inst in all_instances:
+            if inst != active:
+                logger.info(f"[WhatsApp] Removendo instância órfã '{inst}' para manter sessão única ('{active}').")
+                if self.delete_instance(api_url, api_key, inst):
+                    removed += 1
+        return removed
+
+    def reset_instance(self, api_url: str, api_key: str, instance_name: str) -> Dict[str, Any]:
+        """Reseta a sessão do WhatsApp na Evolution API, deletando a instância para interromper loops de QR Code e limpar recursos."""
+        api_url = self.resolve_api_url(api_url)
+        instance = (instance_name or "").strip()
+        if not api_url or not instance:
+            return {"success": False, "message": "URL e Nome da Instância são obrigatórios."}
+        
+        # 1. Limpa instâncias órfãs
+        self.enforce_single_session(api_url, api_key, instance)
+        # 2. Deleta a própria instância ativa para limpar cache e Baileys
+        self.delete_instance(api_url, api_key, instance)
+        return {
+            "success": True,
+            "message": f"Sessão da instância '{instance}' resetada com sucesso. Qualquer geração pendente foi cancelada."
+        }
+
     def test_connection(self, api_url: str, api_key: str, instance_name: str) -> Dict[str, Any]:
-        """Testa o status de conexão da instância na Evolution API v2."""
+        """Testa o status de conexão da instância na Evolution API v2 com timeout ágil de 3.5s."""
         api_url = self.resolve_api_url(api_url)
         if not api_url or not instance_name:
             return {"connected": False, "state": "error", "message": "URL e Nome da Instância são obrigatórios."}
@@ -79,7 +146,7 @@ class EvolutionService:
         url = f"{api_url.rstrip('/')}/instance/connectionState/{instance_name.strip()}"
         headers = {"apikey": api_key.strip()}
         try:
-            r = requests.get(url, headers=headers, timeout=8.0)
+            r = requests.get(url, headers=headers, timeout=3.5)
             if r.status_code == 200:
                 data = r.json()
                 # Na Evolution v2: {"instance": {"state": "open"}}
@@ -95,12 +162,12 @@ class EvolutionService:
             else:
                 return {"connected": False, "state": f"http_{r.status_code}", "message": f"Erro HTTP {r.status_code} da Evolution API: {r.text[:120]}"}
         except requests.exceptions.Timeout:
-            return {"connected": False, "state": "timeout", "message": "Tempo limite esgotado ao contatar a Evolution API (verifique URL e firewall)."}
+            return {"connected": False, "state": "timeout", "message": "Tempo limite esgotado ao contatar a Evolution API (servidor ocupado ou gerando QR Code)."}
         except Exception as e:
             return {"connected": False, "state": "error", "message": f"Falha de rede ao conectar na Evolution API: {str(e)}"}
 
     def connect_or_get_qrcode(self, api_url: str, api_key: str, instance_name: str) -> Dict[str, Any]:
-        """Gera ou recupera o QR Code para conectar a instância do WhatsApp na Evolution API v2."""
+        """Gera ou recupera o QR Code para conectar a instância do WhatsApp na Evolution API v2, garantindo sessão única."""
         api_url = self.resolve_api_url(api_url)
         if not api_url or not instance_name:
             return {"success": False, "connected": False, "message": "URL e Nome da Instância são obrigatórios."}
@@ -111,7 +178,10 @@ class EvolutionService:
             "Content-Type": "application/json",
         }
 
-        # 1. Checa estado atual
+        # 1. Garante que qualquer outra sessão órfã seja eliminada do Evolution API
+        self.enforce_single_session(api_url, api_key, instance_name)
+
+        # 2. Checa estado atual
         status_res = self.test_connection(api_url, api_key, instance_name)
         if status_res.get("connected"):
             return {
@@ -121,7 +191,7 @@ class EvolutionService:
                 "message": "WhatsApp já está conectado e operacional!",
             }
 
-        # 2. Se a instância não existe (404), cria com WHATSAPP-BAILEYS e qrcode=true
+        # 3. Se a instância não existe (404), cria com WHATSAPP-BAILEYS e qrcode=true
         if status_res.get("state") == "not_found":
             create_url = f"{base_url}/instance/create"
             payload = {
@@ -130,7 +200,7 @@ class EvolutionService:
                 "qrcode": True,
             }
             try:
-                r = requests.post(create_url, headers=headers, json=payload, timeout=15.0)
+                r = requests.post(create_url, headers=headers, json=payload, timeout=7.0)
                 if r.status_code in (200, 201):
                     data = r.json()
                     qr_b64 = ""
@@ -169,10 +239,10 @@ class EvolutionService:
                     "message": f"Falha de conexão ao criar instância: {str(e)}"
                 }
 
-        # 3. Se a instância já existe mas está desconectada, busca o QR Code atualizado em /instance/connect/{name}
+        # 4. Se a instância já existe mas está desconectada, busca o QR Code atualizado em /instance/connect/{name}
         connect_url = f"{base_url}/instance/connect/{instance_name.strip()}"
         try:
-            r = requests.get(connect_url, headers=headers, timeout=15.0)
+            r = requests.get(connect_url, headers=headers, timeout=7.0)
             if r.status_code in (200, 201):
                 data = r.json()
                 qr_b64 = ""
