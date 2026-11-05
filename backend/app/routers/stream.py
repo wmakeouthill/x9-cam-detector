@@ -12,6 +12,17 @@ logger = logging.getLogger("x9.stream")
 
 router = APIRouter(prefix="/api/stream", tags=["stream"])
 
+# Cadeia de tratamento de áudio CFTV:
+# - aresample=async=1000: corrige jitter de pacotes RTSP sem cortes
+# - highpass=f=150: remove ronco grave (vento, vibração, rede 60Hz)
+# - lowpass=f=3500: remove chiado agudo metálico de alta frequência, mantendo voz nítida
+# - afftdn=nf=-25: denoiser FFT em tempo real contra ruído estático de fundo (hiss)
+# - volume=0.85,alimiter=limit=0.80: ganho confortável sem estourar (clipping)
+CLEAN_AUDIO_FILTER = (
+    "aresample=async=1000:min_hard_comp=0.100000:first_pts=0,"
+    "highpass=f=150,lowpass=f=3500,afftdn=nf=-25,volume=0.85,alimiter=limit=0.80"
+)
+
 async def frame_generator():
     """
     Gera o multipart MJPEG para visualização contínua com latência mínima no navegador.
@@ -81,13 +92,11 @@ def live_audio_stream(user: str = Depends(get_current_user)):
         "-nostats",
         "-loglevel", "warning",
         "-rtsp_transport", "tcp",
-        "-fflags", "nobuffer",
-        "-flags", "low_delay",
         "-probesize", "32",
         "-analyzeduration", "0",
         "-i", rtsp_url,
         "-vn",
-        "-af", "aresample=async=1:first_pts=0,volume=2.5",
+        "-af", CLEAN_AUDIO_FILTER,
         "-acodec", "libmp3lame",
         "-write_xing", "0",
         "-id3v2_version", "0",
@@ -113,7 +122,7 @@ def live_audio_stream(user: str = Depends(get_current_user)):
     def audio_generator():
         try:
             while True:
-                chunk = proc.stdout.read(512)
+                chunk = proc.stdout.read(2048)
                 if not chunk:
                     break
                 yield chunk
@@ -157,13 +166,11 @@ def live_audio_raw_stream(user: str = Depends(get_current_user)):
         "-nostats",
         "-loglevel", "warning",
         "-rtsp_transport", "tcp",
-        "-fflags", "nobuffer",
-        "-flags", "low_delay",
         "-probesize", "32",
         "-analyzeduration", "0",
         "-i", rtsp_url,
         "-vn",
-        "-af", "aresample=async=1:first_pts=0,volume=2.5",
+        "-af", CLEAN_AUDIO_FILTER,
         "-f", "s16le",
         "-acodec", "pcm_s16le",
         "-ar", "16000",
@@ -185,7 +192,7 @@ def live_audio_raw_stream(user: str = Depends(get_current_user)):
     def raw_generator():
         try:
             while True:
-                chunk = proc.stdout.read(1024)
+                chunk = proc.stdout.read(4096)
                 if not chunk:
                     break
                 yield chunk

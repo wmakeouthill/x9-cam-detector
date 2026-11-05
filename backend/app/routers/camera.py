@@ -1,12 +1,13 @@
 import os
 import time
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from app.core.security import get_current_user
 from app.services.camera_service import camera_service
 from app.services.detector_service import detector_service
 from app.services.gdrive_service import gdrive_service
+from app.services.dvr_service import dvr_service
 from app.services.evolution_service import evolution_service
 from app.core.config import settings
 from app.db import (
@@ -20,6 +21,11 @@ from app.db import (
     delete_detection_events_batch,
     get_whatsapp_config,
     save_whatsapp_config,
+    list_dvr_segments,
+    count_dvr_segments,
+    list_dvr_available_dates,
+    find_dvr_segment_for_seek,
+    delete_dvr_segment,
 )
 
 router = APIRouter(prefix="/api/camera", tags=["camera"])
@@ -408,3 +414,180 @@ def test_whatsapp_notification(req: WhatsAppTestRequest, user: str = Depends(get
         "message": send_res.get("message"),
         "connection": conn_res
     }
+
+# ==============================================================================
+# Endpoints de Gravação Contínua 24h (DVR 15 dias + Seek / Replay Instantâneo)
+# ==============================================================================
+
+class DvrToggleRequest(BaseModel):
+    enabled: bool
+
+@router.get("/dvr/status")
+def get_dvr_status(user: str = Depends(get_current_user)):
+    dvr_service.scan_local_segments()
+    return dvr_service.get_status()
+
+@router.post("/dvr/toggle")
+def toggle_dvr_recording(req: DvrToggleRequest, user: str = Depends(get_current_user)):
+    st = dvr_service.set_enabled(req.enabled)
+    return {
+        "status": "ok",
+        "enabled": st["enabled"],
+        "recording": st["recording"],
+    }
+
+@router.get("/dvr/segments")
+def get_dvr_segments(
+    date: str | None = Query(None, description="Filtro de data YYYY-MM-DD"),
+    hour: str | None = Query(None, description="Filtro de hora HH (00-23)"),
+    limit: int = 100,
+    offset: int = 0,
+    user: str = Depends(get_current_user),
+):
+    dvr_service.scan_local_segments()
+    if gdrive_service.is_configured:
+        gdrive_service.reconcile_dvr_from_drive()
+
+    items = list_dvr_segments(date_str=date, hour_str=hour, limit=limit, offset=offset)
+    total = count_dvr_segments(date_str=date, hour_str=hour)
+    available_dates = list_dvr_available_dates()
+    return {
+        "items": items,
+        "total": total,
+        "available_dates": available_dates,
+    }
+
+@router.get("/dvr/seek")
+def seek_dvr_recording(
+    seconds_ago: int = Query(30, ge=1),
+    target_time: str | None = Query(None),
+    user: str = Depends(get_current_user),
+):
+    dvr_service.scan_local_segments()
+    res = find_dvr_segment_for_seek(seconds_ago=seconds_ago, target_time_str=target_time)
+    if not res:
+        return {
+            "found": False,
+            "message": "Nenhuma gravação 24h disponível ainda.",
+        }
+    seg = res["segment"]
+    return {
+        "found": True,
+        "segment": seg,
+        "seek_offset": res["seek_offset"],
+        "url": f"/api/camera/dvr/video/{seg['filename']}",
+    }
+
+def _serve_video_with_range(request: Request, filepath: str | None = None, raw_bytes: bytes | None = None) -> Response:
+    """
+    Serve vídeo MP4 com suporte a HTTP Range (206 Partial Content) otimizado para mobile:
+    - Limita respostas de Range aberto (ex: 'bytes=0-') a chunks de 1 MB para início imediato do play.
+    - Evita carregar dezenas de MB na RAM de uma só vez.
+    """
+    MAX_RANGE_CHUNK = 1024 * 1024  # 1 MB por janela para streaming mobile instantâneo
+    range_header = request.headers.get("range")
+    if filepath and os.path.exists(filepath):
+        file_size = os.path.getsize(filepath)
+        if not range_header or file_size == 0:
+            return FileResponse(
+                filepath,
+                media_type="video/mp4",
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "private, max-age=3600",
+                },
+            )
+        try:
+            range_val = range_header.strip().lower().replace("bytes=", "")
+            start_str, end_str = (range_val.split("-", 1) + [""])[:2]
+            start = int(start_str) if start_str else 0
+            if end_str:
+                end = int(end_str)
+            else:
+                end = min(file_size - 1, start + MAX_RANGE_CHUNK - 1)
+            start = max(0, min(start, file_size - 1))
+            end = max(start, min(end, file_size - 1))
+            length = end - start + 1
+            with open(filepath, "rb") as f:
+                f.seek(start)
+                data = f.read(length)
+            return Response(
+                content=data,
+                status_code=206,
+                media_type="video/mp4",
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(len(data)),
+                    "Cache-Control": "private, max-age=3600",
+                },
+            )
+        except Exception:
+            return FileResponse(filepath, media_type="video/mp4")
+
+    if raw_bytes is not None:
+        total_size = len(raw_bytes)
+        if range_header and total_size > 0:
+            try:
+                range_val = range_header.strip().lower().replace("bytes=", "")
+                start_str, end_str = (range_val.split("-", 1) + [""])[:2]
+                start = int(start_str) if start_str else 0
+                if end_str:
+                    end = int(end_str)
+                else:
+                    end = min(total_size - 1, start + MAX_RANGE_CHUNK - 1)
+                start = max(0, min(start, total_size - 1))
+                end = max(start, min(end, total_size - 1))
+                chunk = raw_bytes[start : end + 1]
+                return Response(
+                    content=chunk,
+                    status_code=206,
+                    media_type="video/mp4",
+                    headers={
+                        "Content-Range": f"bytes {start}-{end}/{total_size}",
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": str(len(chunk)),
+                        "Cache-Control": "private, max-age=3600",
+                    },
+                )
+            except Exception:
+                pass
+        return Response(
+            content=raw_bytes,
+            media_type="video/mp4",
+            headers={"Accept-Ranges": "bytes"},
+        )
+
+    raise HTTPException(status_code=404, detail="Segmento DVR não encontrado")
+
+@router.get("/dvr/video/{filename}")
+def get_dvr_video(filename: str, request: Request, user: str = Depends(get_current_user)):
+    safe_name = os.path.basename(filename)
+    for folder in ["recordings_24h", os.path.join("backend", "recordings_24h"), os.path.join("..", "recordings_24h")]:
+        candidate = os.path.join(folder, safe_name)
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            return _serve_video_with_range(request, filepath=candidate)
+
+    if gdrive_service.is_configured:
+        data = gdrive_service.get_dvr_file_bytes(safe_name)
+        if data:
+            # Salva em cache no disco local para que todas as requisições Range subsequentes do player sejam instantâneas
+            cache_dir = dvr_service.recordings_dir
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(cache_dir, safe_name)
+            try:
+                with open(cache_path, "wb") as f:
+                    f.write(data)
+                return _serve_video_with_range(request, filepath=cache_path)
+            except Exception:
+                return _serve_video_with_range(request, raw_bytes=data)
+
+    raise HTTPException(status_code=404, detail="Gravação 24h não encontrada")
+
+@router.delete("/dvr/segments/{segment_id}")
+def remove_dvr_segment(segment_id: int, user: str = Depends(get_current_user)):
+    ok = delete_dvr_segment(segment_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Segmento DVR não encontrado")
+    return {"status": "ok", "deleted_id": segment_id}
+

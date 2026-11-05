@@ -20,6 +20,8 @@
 /backend/snapshots/
 /recordings/
 /backend/recordings/
+/recordings_24h/
+/backend/recordings_24h/
 *.db
 *.sqlite
 *.sqlite3
@@ -27,6 +29,7 @@
 # Arquivos de mídia gerados localmente por testes
 snapshot_*.jpg
 video_*.mp4
+dvr_*.mp4
 
 # Modelos binários PyTorch / YOLO (baixados automaticamente pelo Ultralytics)
 *.pt

@@ -14,6 +14,10 @@ import {
   Volume1,
   Film,
   Sliders,
+  Rewind,
+  FastForward,
+  Radio,
+  History,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -61,6 +65,22 @@ export function LiveMonitorView({
   const [volume, setVolume] = useState(80);
   const [audioPlaying, setAudioPlaying] = useState(false);
   const [audioConnecting, setAudioConnecting] = useState(false);
+
+  // Estados de DVR / Timeshift (Voltar no Tempo e Replay 24h em Runtime)
+  const [dvrMode, setDvrMode] = useState(false);
+  const [dvrVideoUrl, setDvrVideoUrl] = useState<string | null>(null);
+  const [dvrSegmentInfo, setDvrSegmentInfo] = useState<{
+    id?: number;
+    filename: string;
+    start_time: string;
+    end_time?: string;
+    duration_seconds?: number;
+    status?: string;
+  } | null>(null);
+  const [dvrSeekOffset, setDvrSeekOffset] = useState<number>(0);
+  const [dvrLoading, setDvrLoading] = useState<boolean>(false);
+  const [dvrSecondsAgo, setDvrSecondsAgo] = useState<number>(0);
+  const dvrVideoRef = useRef<HTMLVideoElement | null>(null);
 
   // Controles de Tela Cheia e Hover / Overlay
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -334,9 +354,12 @@ export function LiveMonitorView({
         }
 
         const now = ctx.currentTime;
-        // Se a reprodução estiver no passado ou houver acúmulo de buffer (> 50ms à frente):
-        if (nextPlayTime < now || nextPlayTime > now + 0.05) {
-          nextPlayTime = now + 0.01; // alinha na ponta do ao vivo (<20ms)
+        if (nextPlayTime < now) {
+          // Underrun: pré-carrega 200ms de margem para absorver jitter de pacotes RTSP
+          nextPlayTime = now + 0.20;
+        } else if (nextPlayTime > now + 1.5) {
+          // Apenas realinha se o atraso acumulado passar de 1.5s
+          nextPlayTime = now + 0.20;
         }
         source.start(nextPlayTime);
         nextPlayTime += audioBuf.duration;
@@ -359,6 +382,195 @@ export function LiveMonitorView({
     setAudioEnabled(false);
     setAudioPlaying(false);
     setAudioConnecting(false);
+  };
+
+  // Busca ponto no passado no DVR 24h (Timeshift) com suporte a colchão pré-carregado
+  const cushionSegmentRef = useRef<{
+    filename: string;
+    url: string;
+    start_time: string;
+    duration_seconds?: number;
+    status?: string;
+  } | null>(null);
+
+  // Pré-aquece silenciosamente o "colchão" do último bloco em background enquanto está no Ao Vivo
+  useEffect(() => {
+    if (!token || dvrMode) return;
+    let active = true;
+
+    const warmCushion = async () => {
+      try {
+        const res = await fetch('/api/camera/dvr/seek?seconds_ago=20', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok || !active) return;
+        const data = await res.json();
+        if (data.found && data.url && data.segment) {
+          const cleanUrl = `${data.url}?token=${token}`;
+          cushionSegmentRef.current = {
+            filename: data.segment.filename,
+            url: cleanUrl,
+            start_time: data.segment.start_time,
+            duration_seconds: data.segment.duration_seconds,
+            status: data.segment.status,
+          };
+          setDvrVideoUrl((prev) => (prev === cleanUrl ? prev : cleanUrl));
+        }
+      } catch {
+        // pré-carregamento silencioso
+      }
+    };
+
+    warmCushion();
+    const timer = setInterval(warmCushion, 15000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [token, dvrMode]);
+
+  const handleSeekBack = async (secondsAgo: number) => {
+    if (!token || dvrLoading) return;
+    const clampedSeconds = Math.max(5, Math.round(secondsAgo));
+
+    if (audioEnabled) {
+      stopLiveAudio();
+    }
+
+    // Fast-path instantâneo (0ms): se o colchão em background já está carregado para voltas curtas (<= 45s)
+    const videoEl = dvrVideoRef.current;
+    if (
+      !dvrMode &&
+      clampedSeconds <= 45 &&
+      cushionSegmentRef.current &&
+      videoEl &&
+      videoEl.readyState >= 1
+    ) {
+      const dur =
+        Number.isFinite(videoEl.duration) && videoEl.duration > 0
+          ? videoEl.duration
+          : cushionSegmentRef.current.duration_seconds || 60;
+      if (dur >= clampedSeconds) {
+        const instantOffset = Math.max(0, dur - clampedSeconds);
+        videoEl.currentTime = instantOffset;
+        videoEl.muted = false;
+        videoEl.play().catch(() => {});
+        setDvrSegmentInfo(cushionSegmentRef.current);
+        setDvrSeekOffset(instantOffset);
+        setDvrSecondsAgo(clampedSeconds);
+        setDvrMode(true);
+        return;
+      }
+    }
+
+    setDvrLoading(true);
+    setActionMessage(null);
+    try {
+      const res = await fetch(`/api/camera/dvr/seek?seconds_ago=${clampedSeconds}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (res.ok && data.found && data.url) {
+        const targetOffset = typeof data.seek_offset === 'number' ? data.seek_offset : 0;
+        const cleanUrl = `${data.url}?token=${token}`;
+        setDvrSegmentInfo(data.segment || null);
+        setDvrSeekOffset(targetOffset);
+        setDvrSecondsAgo(clampedSeconds);
+        setDvrMode(true);
+
+        if (dvrVideoUrl === cleanUrl && dvrVideoRef.current) {
+          dvrVideoRef.current.currentTime = targetOffset;
+          dvrVideoRef.current.muted = false;
+          dvrVideoRef.current.play().catch(() => {});
+        } else {
+          setDvrVideoUrl(cleanUrl);
+        }
+      } else {
+        setActionMessage({
+          text:
+            data.message ||
+            'Ainda não há bloco gravado para este horário (aguarde o primeiro minuto do gravador 24h).',
+          type: 'error',
+        });
+      }
+    } catch {
+      setActionMessage({
+        text: 'Erro ao consultar gravação 24h para voltar no tempo.',
+        type: 'error',
+      });
+    } finally {
+      setDvrLoading(false);
+    }
+  };
+
+  // Avança ou retrocede dentro do modo DVR / Timeshift
+  const handleSkipInDvr = (deltaSeconds: number) => {
+    if (dvrMode && dvrVideoRef.current) {
+      const video = dvrVideoRef.current;
+      const targetTime = video.currentTime + deltaSeconds;
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Infinity;
+
+      if (targetTime >= 0 && targetTime <= duration) {
+        video.currentTime = targetTime;
+        setDvrSecondsAgo((prev) => Math.max(0, prev - deltaSeconds));
+        return;
+      }
+
+      // Se tentou avançar além do fim do bloco atual e já está próximo do tempo real, volta ao Ao Vivo
+      const nextSecondsAgo = Math.max(0, (dvrSecondsAgo || 30) - deltaSeconds);
+      if (deltaSeconds > 0 && nextSecondsAgo <= 5) {
+        handleReturnToLive();
+        return;
+      }
+      handleSeekBack(Math.max(10, nextSecondsAgo));
+    } else {
+      handleSeekBack(Math.abs(deltaSeconds));
+    }
+  };
+
+  // Retorna imediatamente (0ms) para a transmissão Ao Vivo em tempo real sem desmontar o stream MJPEG
+  const handleReturnToLive = () => {
+    if (dvrVideoRef.current) {
+      dvrVideoRef.current.pause();
+      dvrVideoRef.current.muted = true;
+    }
+    setDvrMode(false);
+    setDvrSegmentInfo(null);
+    setDvrSeekOffset(0);
+    setDvrSecondsAgo(0);
+  };
+
+  // Quando um segmento termina no modo Replay, avança para o próximo ou retorna ao Ao Vivo
+  const handleDvrVideoEnded = async () => {
+    if (!token || !dvrSegmentInfo) {
+      handleReturnToLive();
+      return;
+    }
+    try {
+      const res = await fetch('/api/camera/dvr/segments?limit=30', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const items: any[] = Array.isArray(data) ? data : data.items || [];
+        // Lista vem do mais recente para o mais antigo; o próximo cronológico está no índice anterior
+        const currentIdx = items.findIndex((s) => s.filename === dvrSegmentInfo.filename);
+        if (currentIdx > 0) {
+          const nextSeg = items[currentIdx - 1];
+          setDvrSegmentInfo(nextSeg);
+          setDvrSeekOffset(0);
+          setDvrVideoUrl(`/api/camera/dvr/video/${nextSeg.filename}?token=${token}`);
+          return;
+        }
+      }
+    } catch {
+      // fallback para ao vivo
+    }
+    setActionMessage({
+      text: 'Replay alcançou o tempo real — de volta à transmissão Ao Vivo!',
+      type: 'success',
+    });
+    handleReturnToLive();
   };
 
   // Alterna ativação e mudo do áudio ao vivo
@@ -429,25 +641,81 @@ export function LiveMonitorView({
         onMouseEnter={triggerControls}
         onTouchStart={triggerControls}
         onMouseLeave={() => setControlsVisible(false)}
-        className="relative bg-[#05070A] border border-cyan-500/30 rounded-xl overflow-hidden shadow-[0_0_30px_rgba(0,0,0,0.8)] aspect-video flex items-center justify-center max-h-[55vh] sm:max-h-[70vh] group select-none"
+        className={`relative bg-[#05070A] border rounded-xl overflow-hidden shadow-[0_0_30px_rgba(0,0,0,0.8)] aspect-video flex items-center justify-center max-h-[55vh] sm:max-h-[70vh] group select-none ${
+          dvrMode ? 'border-amber-500/60 shadow-[0_0_35px_rgba(245,158,11,0.18)]' : 'border-cyan-500/30'
+        }`}
       >
-        {/* Stream de Vídeo com Auth Token */}
+        {/* Stream Ao Vivo (MJPEG) mantido sempre ativo no DOM para retorno em 0ms no celular */}
         <img
           key={streamKey}
           src={`/api/stream/live?token=${token}&_t=${streamKey}`}
           alt="Transmissão ao vivo da câmera Intelbras"
-          className="w-full h-full object-contain pointer-events-none"
+          className={
+            dvrMode
+              ? 'hidden'
+              : 'w-full h-full object-contain pointer-events-none'
+          }
         />
+
+        {/* Player DVR Timeshift com pré-carregamento de colchão em background */}
+        {dvrVideoUrl && (
+          <video
+            ref={dvrVideoRef}
+            src={dvrVideoUrl}
+            controls={dvrMode}
+            autoPlay={dvrMode}
+            muted={!dvrMode}
+            playsInline
+            preload="auto"
+            onLoadedMetadata={(e) => {
+              if (dvrMode && dvrSeekOffset > 0) {
+                e.currentTarget.currentTime = dvrSeekOffset;
+                e.currentTarget.muted = false;
+                e.currentTarget.play().catch(() => {});
+              }
+            }}
+            onEnded={() => {
+              if (dvrMode) {
+                handleDvrVideoEnded();
+              }
+            }}
+            className={
+              dvrMode
+                ? 'w-full h-full object-contain'
+                : 'hidden'
+            }
+          />
+        )}
 
         {/* Efeito scanline CCTV sutil */}
         <div className="absolute inset-0 cctv-scanline opacity-40 pointer-events-none" />
 
-        {/* HUD Superior Esquerdo: Badge LIVE e Câmera */}
-        <div className="absolute top-2 left-2 sm:top-4 sm:left-4 flex items-center gap-1.5 sm:gap-2 pointer-events-none flex-wrap max-w-[70%] sm:max-w-none z-10">
-          <div className="flex items-center gap-1.5 sm:gap-2 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-black/70 backdrop-blur-md border border-red-500/40 text-red-400">
-            <span className="w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full bg-red-500 animate-live shadow-[0_0_8px_#ef4444]" />
-            <span className="text-[10px] sm:text-xs font-mono font-bold tracking-wider">AO VIVO</span>
-          </div>
+        {/* HUD Superior Esquerdo: Badge LIVE / REPLAY DVR e Câmera */}
+        <div className="absolute top-2 left-2 sm:top-4 sm:left-4 flex items-center gap-1.5 sm:gap-2 pointer-events-none flex-wrap max-w-[75%] sm:max-w-none z-10">
+          {dvrMode ? (
+            <>
+              <div className="flex items-center gap-1.5 sm:gap-2 px-2.5 py-1 rounded bg-amber-950/90 backdrop-blur-md border border-amber-400/70 text-amber-300 shadow-[0_0_15px_rgba(245,158,11,0.35)]">
+                <span className="w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full bg-amber-400 animate-ping" />
+                <span className="text-[10px] sm:text-xs font-mono font-bold tracking-wider">
+                  ⏪ REPLAY DVR (GRAVANDO EM TEMPO REAL) {dvrSegmentInfo?.start_time ? `• ${dvrSegmentInfo.start_time}` : ''}
+                </span>
+              </div>
+
+              <button
+                onClick={handleReturnToLive}
+                className="pointer-events-auto flex items-center gap-1.5 px-2.5 py-1 rounded bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 text-white border border-red-400/80 text-[10px] sm:text-xs font-mono font-bold tracking-wider shadow-[0_0_18px_rgba(239,68,68,0.6)] transition-all cursor-pointer animate-pulse"
+                title="Voltar imediatamente para a transmissão Ao Vivo em tempo real"
+              >
+                <Radio className="w-3.5 h-3.5 text-white" />
+                <span>🔴 AO VIVO (TEMPO REAL)</span>
+              </button>
+            </>
+          ) : (
+            <div className="flex items-center gap-1.5 sm:gap-2 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-black/70 backdrop-blur-md border border-red-500/40 text-red-400">
+              <span className="w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full bg-red-500 animate-live shadow-[0_0_8px_#ef4444]" />
+              <span className="text-[10px] sm:text-xs font-mono font-bold tracking-wider">AO VIVO</span>
+            </div>
+          )}
 
           <div className="hidden sm:inline-block px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-black/70 backdrop-blur-md border border-slate-700/60 text-slate-300 text-[10px] sm:text-xs font-mono">
             INTELBRAS VIP 1230 FC+ • {cameraIp}
@@ -516,70 +784,138 @@ export function LiveMonitorView({
 
         {/* BARRA DE CONTROLE SOBREPOSTA NO VÍDEO (Hover no Desktop / Toque no Mobile) */}
         <div
-          className={`absolute bottom-0 left-0 right-0 p-2.5 sm:p-4 bg-gradient-to-t from-black/95 via-black/75 to-transparent flex items-center justify-between gap-3 transition-opacity duration-300 z-20 ${
-            controlsVisible ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
-          }`}
+          className={`absolute left-0 right-0 p-2.5 sm:p-4 bg-gradient-to-t from-black/95 via-black/75 to-transparent flex flex-wrap items-center justify-between gap-2 sm:gap-3 transition-opacity duration-300 z-20 ${
+            dvrMode ? 'bottom-12 sm:bottom-14' : 'bottom-0'
+          } ${controlsVisible ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}
           onClick={(e) => e.stopPropagation()}
         >
-          {/* Lado Esquerdo: Botão de Mudo/Ativar + Slider de Volume */}
-          <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
-            <button
-              onClick={toggleAudio}
-              className={`px-3 py-2 rounded-lg border flex items-center gap-2 font-mono text-xs transition-all cursor-pointer ${
-                audioEnabled && !isMuted && volume > 0
-                  ? 'bg-emerald-950/80 border-emerald-500/60 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.3)]'
-                  : 'bg-black/80 border-zinc-700/80 text-zinc-300 hover:text-white hover:border-zinc-500'
-              }`}
-              title={!audioEnabled ? 'Ativar microfone da câmera' : isMuted ? 'Desmutar' : 'Silenciar'}
-            >
-              {!audioEnabled || isMuted || volume === 0 ? (
-                <VolumeX className="w-4 h-4 text-amber-400 shrink-0" />
-              ) : (
-                <Volume2 className="w-4 h-4 text-emerald-400 shrink-0 animate-pulse" />
+          {/* Lado Esquerdo: Controles de Áudio Ao Vivo (quando em modo Live) */}
+          {!dvrMode ? (
+            <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+              <button
+                onClick={toggleAudio}
+                className={`px-3 py-2 rounded-lg border flex items-center gap-2 font-mono text-xs transition-all cursor-pointer ${
+                  audioEnabled && !isMuted && volume > 0
+                    ? 'bg-emerald-950/80 border-emerald-500/60 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.3)]'
+                    : 'bg-black/80 border-zinc-700/80 text-zinc-300 hover:text-white hover:border-zinc-500'
+                }`}
+                title={!audioEnabled ? 'Ativar microfone da câmera' : isMuted ? 'Desmutar' : 'Silenciar'}
+              >
+                {!audioEnabled || isMuted || volume === 0 ? (
+                  <VolumeX className="w-4 h-4 text-amber-400 shrink-0" />
+                ) : (
+                  <Volume2 className="w-4 h-4 text-emerald-400 shrink-0 animate-pulse" />
+                )}
+                <span className="font-semibold">
+                  {!audioEnabled
+                    ? 'Ativar Áudio'
+                    : audioConnecting
+                    ? 'Conectando...'
+                    : isMuted || volume === 0
+                    ? 'Mudo'
+                    : 'Ouvindo'}
+                </span>
+              </button>
+
+              {/* Slider Deslizante de Aumento / Redução de Volume */}
+              <div className="flex items-center gap-2 bg-black/80 border border-zinc-800/90 px-3 py-1.5 rounded-lg backdrop-blur-md">
+                <Volume1 className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="1"
+                  value={isMuted ? 0 : volume}
+                  onChange={(e) => handleVolumeChange(Number(e.target.value))}
+                  className="w-16 sm:w-28 accent-emerald-500 cursor-pointer h-1.5"
+                  title="Ajuste de volume do áudio ambiente"
+                />
+                <span className="text-[10px] sm:text-[11px] font-mono text-zinc-300 w-8 text-right font-semibold">
+                  {isMuted ? '0%' : `${volume}%`}
+                </span>
+              </div>
+
+              {/* Badge de Status do Microfone da Intelbras */}
+              {audioEnabled && !isMuted && audioPlaying && (
+                <div className="hidden lg:flex items-center gap-1.5 text-[9px] font-mono px-2 py-1 rounded bg-emerald-950/80 text-emerald-400 border border-emerald-500/40 font-semibold shadow-[0_0_10px_rgba(16,185,129,0.2)]">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                  <span>MIC AMBIENTE VIP 1230 ON</span>
+                </div>
               )}
-              <span className="font-semibold">
-                {!audioEnabled
-                  ? 'Ativar Áudio'
-                  : audioConnecting
-                  ? 'Conectando...'
-                  : isMuted || volume === 0
-                  ? 'Mudo'
-                  : 'Ouvindo'}
-              </span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 text-xs font-mono text-amber-300 bg-black/80 px-3 py-1.5 rounded-lg border border-amber-500/40">
+              <History className="w-4 h-4 text-amber-400" />
+              <span>Reproduzindo Gravação 24h: {dvrSegmentInfo?.filename}</span>
+            </div>
+          )}
+
+          {/* Centro / Direita: Controles Rápidos de DVR Timeshift + Tela Cheia */}
+          <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+            <button
+              onClick={() => (dvrMode ? handleSkipInDvr(-15) : handleSeekBack(15))}
+              disabled={dvrLoading}
+              className="px-2.5 py-1.5 rounded-lg bg-black/85 hover:bg-cyan-950/80 border border-cyan-500/40 hover:border-cyan-400 text-cyan-300 text-[11px] font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+              title="Voltar 15 segundos"
+            >
+              ⏪ -15s
+            </button>
+            <button
+              onClick={() => (dvrMode ? handleSkipInDvr(-30) : handleSeekBack(30))}
+              disabled={dvrLoading}
+              className="px-2.5 py-1.5 rounded-lg bg-black/85 hover:bg-cyan-950/80 border border-cyan-500/40 hover:border-cyan-400 text-cyan-300 text-[11px] font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+              title="Voltar 30 segundos"
+            >
+              ⏪ -30s
+            </button>
+            <button
+              onClick={() => (dvrMode ? handleSkipInDvr(-60) : handleSeekBack(60))}
+              disabled={dvrLoading}
+              className="px-2.5 py-1.5 rounded-lg bg-black/85 hover:bg-cyan-950/80 border border-cyan-500/40 hover:border-cyan-400 text-cyan-300 text-[11px] font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+              title="Voltar 1 minuto"
+            >
+              ⏪ -1m
+            </button>
+            <button
+              onClick={() => (dvrMode ? handleSkipInDvr(-300) : handleSeekBack(300))}
+              disabled={dvrLoading}
+              className="px-2.5 py-1.5 rounded-lg bg-black/85 hover:bg-cyan-950/80 border border-cyan-500/40 hover:border-cyan-400 text-cyan-300 text-[11px] font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+              title="Voltar 5 minutos"
+            >
+              ⏪ -5m
             </button>
 
-            {/* Slider Deslizante de Aumento / Redução de Volume */}
-            <div className="flex items-center gap-2 bg-black/80 border border-zinc-800/90 px-3 py-1.5 rounded-lg backdrop-blur-md">
-              <Volume1 className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-              <input
-                type="range"
-                min="0"
-                max="100"
-                step="1"
-                value={isMuted ? 0 : volume}
-                onChange={(e) => handleVolumeChange(Number(e.target.value))}
-                className="w-16 sm:w-28 accent-emerald-500 cursor-pointer h-1.5"
-                title="Ajuste de volume do áudio ambiente"
-              />
-              <span className="text-[10px] sm:text-[11px] font-mono text-zinc-300 w-8 text-right font-semibold">
-                {isMuted ? '0%' : `${volume}%`}
-              </span>
-            </div>
-
-            {/* Badge de Status do Microfone da Intelbras */}
-            {audioEnabled && !isMuted && audioPlaying && (
-              <div className="hidden md:flex items-center gap-1.5 text-[9px] font-mono px-2 py-1 rounded bg-emerald-950/80 text-emerald-400 border border-emerald-500/40 font-semibold shadow-[0_0_10px_rgba(16,185,129,0.2)]">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
-                <span>MIC AMBIENTE VIP 1230 ON</span>
-              </div>
+            {dvrMode && (
+              <>
+                <button
+                  onClick={() => handleSkipInDvr(15)}
+                  disabled={dvrLoading}
+                  className="px-2.5 py-1.5 rounded-lg bg-black/85 hover:bg-emerald-950/80 border border-emerald-500/40 hover:border-emerald-400 text-emerald-300 text-[11px] font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+                  title="Avançar 15 segundos"
+                >
+                  ⏩ +15s
+                </button>
+                <button
+                  onClick={() => handleSkipInDvr(30)}
+                  disabled={dvrLoading}
+                  className="px-2.5 py-1.5 rounded-lg bg-black/85 hover:bg-emerald-950/80 border border-emerald-500/40 hover:border-emerald-400 text-emerald-300 text-[11px] font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+                  title="Avançar 30 segundos"
+                >
+                  ⏩ +30s
+                </button>
+                <button
+                  onClick={handleReturnToLive}
+                  className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white border border-red-400 text-[11px] font-mono font-bold transition-all cursor-pointer shadow-[0_0_12px_rgba(239,68,68,0.5)]"
+                  title="Voltar ao Ao Vivo"
+                >
+                  🔴 Voltar ao Ao Vivo
+                </button>
+              </>
             )}
-          </div>
 
-          {/* Lado Direito: Botão de Tela Cheia Sobreposto */}
-          <div className="flex items-center gap-2">
             <button
               onClick={handleToggleFullscreen}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-black/80 hover:bg-zinc-800 border border-zinc-700/80 hover:border-cyan-500/60 text-zinc-200 hover:text-cyan-300 text-xs font-mono transition-all cursor-pointer shadow-lg shadow-black/50"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-black/80 hover:bg-zinc-800 border border-zinc-700/80 hover:border-cyan-500/60 text-zinc-200 hover:text-cyan-300 text-xs font-mono transition-all cursor-pointer shadow-lg shadow-black/50"
               title={isFullscreen ? 'Sair da Tela Cheia' : 'Tela Cheia'}
             >
               {isFullscreen ? (
@@ -595,6 +931,110 @@ export function LiveMonitorView({
               )}
             </button>
           </div>
+        </div>
+      </div>
+
+      {/* Barra Dedicada de DVR em Tempo Real (Timeshift / Voltar no Tempo e Ao Vivo) */}
+      <div className="p-2.5 sm:p-3 rounded-xl bg-[#0D111A] border border-cyan-500/25 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2.5 shadow-lg">
+        <div className="flex items-center gap-2">
+          <div
+            className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${
+              dvrMode
+                ? 'bg-amber-500/20 border-amber-500/50 text-amber-400'
+                : 'bg-cyan-500/15 border-cyan-500/30 text-cyan-400'
+            }`}
+          >
+            <History className="w-4 h-4" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold font-['Chakra_Petch'] uppercase tracking-wider text-slate-100">
+                DVR Timeshift 24h
+              </span>
+              <span
+                className={`text-[10px] font-mono px-1.5 py-0.5 rounded font-bold border ${
+                  dvrMode
+                    ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                    : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                }`}
+              >
+                {dvrMode ? 'MODO REPLAY' : 'GRAVANDO 24H'}
+              </span>
+            </div>
+            <p className="text-[10px] sm:text-[11px] text-slate-400 font-mono">
+              {dvrMode
+                ? `Assistindo bloco ${dvrSegmentInfo?.start_time || ''} • Áudio e marcações IA sincronizados`
+                : 'Volte instantaneamente na gravação contínua sem sair do monitor'}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+          <button
+            onClick={() => (dvrMode ? handleSkipInDvr(-15) : handleSeekBack(15))}
+            disabled={dvrLoading}
+            className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+          >
+            <Rewind className="w-3.5 h-3.5 text-cyan-400" />
+            <span>-15s</span>
+          </button>
+
+          <button
+            onClick={() => (dvrMode ? handleSkipInDvr(-30) : handleSeekBack(30))}
+            disabled={dvrLoading}
+            className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+          >
+            <Rewind className="w-3.5 h-3.5 text-cyan-400" />
+            <span>-30s</span>
+          </button>
+
+          <button
+            onClick={() => (dvrMode ? handleSkipInDvr(-60) : handleSeekBack(60))}
+            disabled={dvrLoading}
+            className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+          >
+            <Rewind className="w-3.5 h-3.5 text-cyan-400" />
+            <span>-1 min</span>
+          </button>
+
+          <button
+            onClick={() => (dvrMode ? handleSkipInDvr(-300) : handleSeekBack(300))}
+            disabled={dvrLoading}
+            className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+          >
+            <Rewind className="w-3.5 h-3.5 text-cyan-400" />
+            <span>-5 min</span>
+          </button>
+
+          {dvrMode && (
+            <>
+              <button
+                onClick={() => handleSkipInDvr(15)}
+                disabled={dvrLoading}
+                className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/30 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+              >
+                <FastForward className="w-3.5 h-3.5 text-emerald-400" />
+                <span>+15s</span>
+              </button>
+
+              <button
+                onClick={() => handleSkipInDvr(30)}
+                disabled={dvrLoading}
+                className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/30 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+              >
+                <FastForward className="w-3.5 h-3.5 text-emerald-400" />
+                <span>+30s</span>
+              </button>
+
+              <button
+                onClick={handleReturnToLive}
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 text-white border border-red-400 font-mono text-xs font-bold uppercase tracking-wider transition-all cursor-pointer shadow-[0_0_15px_rgba(239,68,68,0.4)]"
+              >
+                <Radio className="w-3.5 h-3.5" />
+                <span>🔴 AO VIVO (TEMPO REAL)</span>
+              </button>
+            </>
+          )}
         </div>
       </div>
 

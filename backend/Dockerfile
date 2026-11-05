@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir torch torchvision --index-url https://download.py
 COPY . .
 
 # Diretório para persistência de snapshots, gravações e banco SQLite
-RUN mkdir -p snapshots recordings data
+RUN mkdir -p snapshots recordings recordings_24h data
 
 EXPOSE 8000
 

@@ -29,6 +29,7 @@ services:
     volumes:
       - ./backend/snapshots:/app/snapshots
       - ./backend/recordings:/app/recordings
+      - ./backend/recordings_24h:/app/recordings_24h
       - ./backend/data:/app/data
       - ./backend/app:/app/app
       - ./token.json:/app/token.json

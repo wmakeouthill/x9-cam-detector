@@ -1,6 +1,6 @@
-import { Video, Clock, Settings, Image as ImageIcon, Shield } from 'lucide-react';
+import { Video, Clock, Settings, Image as ImageIcon, Shield, Film } from 'lucide-react';
 
-export type NavTab = 'live' | 'rules' | 'config' | 'snapshots';
+export type NavTab = 'live' | 'dvr' | 'rules' | 'config' | 'snapshots';
 
 interface SidebarProps {
   activeTab: NavTab;
@@ -15,6 +15,13 @@ export function Sidebar({ activeTab, onTabChange }: SidebarProps) {
       shortLabel: 'Ao Vivo',
       icon: Video,
       badge: 'LIVE',
+    },
+    {
+      id: 'dvr' as NavTab,
+      label: 'Gravações 24h',
+      shortLabel: '24 Horas',
+      icon: Film,
+      badge: '15D',
     },
     {
       id: 'rules' as NavTab,

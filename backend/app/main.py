@@ -5,6 +5,7 @@ from app.routers import auth, stream, camera
 from app.services.camera_service import camera_service
 from app.services.detector_service import detector_service
 from app.services.gdrive_service import gdrive_service
+from app.services.dvr_service import dvr_service
 from app.db import init_db
 from app.core.config import settings
 
@@ -16,10 +17,13 @@ async def lifespan(app: FastAPI):
     camera_service.start()
     # Inicia detector YOLO em background
     detector_service.start()
+    # Inicia gravação contínua 24h (DVR 15 dias)
+    dvr_service.start()
     # Inicia sincronização e auto-cura Google Drive (recupera pendências pós-queda)
     gdrive_service.start()
     yield
     # Encerra graciosamente
+    dvr_service.stop()
     gdrive_service.stop()
     detector_service.stop()
     camera_service.stop()

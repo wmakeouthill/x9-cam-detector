@@ -30,7 +30,7 @@ class CameraService:
         self.http_port = db_cfg.get("http_port") or settings.CAMERA_HTTP_PORT
         self.user = db_cfg.get("user") or settings.CAMERA_USER
         self.password = db_cfg.get("password") or settings.CAMERA_PASSWORD
-        self.subtype = db_cfg.get("subtype", 1) # 1 = Substream por padrão (leve)
+        self.subtype = db_cfg.get("subtype", settings.CAMERA_SUBTYPE) # 0 = 1080p FHD por padrão
 
         self._running = False
         self._thread = None
@@ -79,6 +79,69 @@ class CameraService:
         """Atualiza a lista de tracks/caixas rastreadas para sobreposição no streaming."""
         with self._lock:
             self._active_tracks = tracks
+
+    def get_active_tracks(self) -> list:
+        """Retorna as caixas YOLO ativas (com TTL de 1.0s)."""
+        now = time.time()
+        with self._lock:
+            tracks = [t for t in self._active_tracks if (now - t.get("last_seen", 0)) < 1.0]
+            self._active_tracks = tracks
+            return list(tracks)
+
+    def draw_tracks_on_frame(self, frame: np.ndarray, tracks: list | None = None) -> np.ndarray:
+        """Desenha as marcações HUD do YOLO (caixas + PESSOA #ID (%)) proporcionalmente à resolução do frame."""
+        if tracks is None:
+            tracks = self.get_active_tracks()
+        if not tracks or frame is None:
+            return frame
+
+        h, w = frame.shape[:2]
+        src_w = self.width if self.width > 0 else w
+        src_h = self.height if self.height > 0 else h
+        scale_x = w / float(src_w)
+        scale_y = h / float(src_h)
+        ui_scale = max(1.0, w / 960.0)
+        box_thickness = max(2, int(2 * ui_scale))
+        font_scale = 0.45 * ui_scale
+        font_thickness = max(1, int(1 * ui_scale))
+
+        PERSON_PALETTE = [
+            (255, 200, 0),   # Ciano Neon
+            (0, 165, 255),   # Laranja Vibrante
+            (50, 220, 50),   # Verde Neon
+            (204, 50, 204),  # Magenta
+            (0, 215, 255),   # Amarelo Ouro
+            (255, 120, 120), # Azul Céu
+        ]
+        for idx, t in enumerate(tracks):
+            track_id = t.get("track_id", idx + 1)
+            color = PERSON_PALETTE[(track_id - 1) % len(PERSON_PALETTE)]
+            bx1, by1, bx2, by2 = t["box"]
+            conf = t.get("conf", 0.0)
+
+            x1 = max(0, int(bx1 * scale_x))
+            y1 = max(0, int(by1 * scale_y))
+            x2 = min(w - 1, int(bx2 * scale_x))
+            y2 = min(h - 1, int(by2 * scale_y))
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness)
+
+            label = f"PESSOA #{track_id} ({int(conf * 100)}%)"
+            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+            pad = int(6 * ui_scale)
+            label_y = max(y1, th + pad)
+            cv2.rectangle(frame, (x1, label_y - th - pad), (x1 + tw + pad + 2, label_y + baseline), color, -1)
+            cv2.putText(
+                frame,
+                label,
+                (x1 + int(4 * ui_scale), label_y - int(2 * ui_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (10, 15, 20),
+                font_thickness,
+                cv2.LINE_AA,
+            )
+        return frame
 
     def start(self):
         if self._running:
@@ -169,37 +232,10 @@ class CameraService:
                         self._active_tracks = tracks
 
                     if tracks:
-                        # Paleta de cores vibrantes (BGR) para diferenciar cada pessoa na cena
-                        PERSON_PALETTE = [
-                            (255, 200, 0),   # Ciano Neon
-                            (0, 165, 255),   # Laranja Vibrante
-                            (50, 220, 50),   # Verde Neon
-                            (204, 50, 204),  # Magenta
-                            (0, 215, 255),   # Amarelo Ouro
-                            (255, 120, 120), # Azul Céu
-                        ]
-                        for idx, t in enumerate(tracks):
-                            track_id = t.get("track_id", idx + 1)
-                            color = PERSON_PALETTE[(track_id - 1) % len(PERSON_PALETTE)]
-                            x1, y1, x2, y2 = t["box"]
-                            conf = t.get("conf", 0.0)
+                        self.draw_tracks_on_frame(frame, tracks)
 
-                            # Garante limites válidos dentro do frame
-                            x1, y1 = max(0, int(x1)), max(0, int(y1))
-                            x2, y2 = min(w - 1, int(x2)), min(h - 1, int(y2))
-
-                            # Bounding box estilo segurança HUD com cor específica da pessoa
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-                            # Label com fundo preenchido e ID da pessoa
-                            label = f"PESSOA #{track_id} ({int(conf * 100)}%)"
-                            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                            label_y = max(y1, th + 6)
-                            cv2.rectangle(frame, (x1, label_y - th - 6), (x1 + tw + 8, label_y + baseline), color, -1)
-                            cv2.putText(frame, label, (x1 + 4, label_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (10, 15, 20), 1, cv2.LINE_AA)
-
-                    # Codifica para JPEG mantendo alta fidelidade visual (qualidade 80, leve para CPU)
-                    _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    # Codifica para JPEG mantendo alta fidelidade visual (qualidade 82, leve para CPU)
+                    _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
                     
                     with self._lock:
                         self.latest_frame_jpeg = jpeg.tobytes()
@@ -378,14 +414,12 @@ class CameraService:
 
     def record_clip(self, seconds: int = 10, on_complete=None) -> str:
         """
-        Grava um clipe de vídeo MP4 com áudio sincronizado a partir do RTSP.
-        Prioriza sempre o Stream Principal (1080p nativo) para gerar evidências de máxima definição,
-        independentemente de o monitor ao vivo estar operando no Substream leve.
-        Usa -c:v copy (zero overhead de CPU, qualidade 1080p original do sensor) e -c:a aac.
-        Os fluxos de áudio e vídeo compartilham a sincronização de tempo de hardware da câmera.
+        Grava um clipe de vídeo MP4 com áudio sincronizado e marcações YOLO.
+        Prioriza os quadros anotados pelo YOLO em tempo real + áudio RTSP da câmera,
+        com fallback automático para cópia direta do Stream Principal (1080p nativo).
         """
         import subprocess
-        import shutil
+        from app.routers.stream import resolve_ffmpeg_bin, CLEAN_AUDIO_FILTER
         timestamp = get_now_str("%Y%m%d_%H%M%S")
         filename = f"video_{timestamp}.mp4"
         rec_dir = "backend/recordings" if os.path.exists("backend/recordings") else "recordings"
@@ -393,8 +427,8 @@ class CameraService:
         filepath = os.path.join(rec_dir, filename)
 
         rtsp_target = self.mainstream_rtsp_url
-        ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
-        cmd = [
+        ffmpeg_bin = resolve_ffmpeg_bin()
+        direct_cmd = [
             ffmpeg_bin,
             "-nostats",
             "-loglevel", "error",
@@ -404,6 +438,7 @@ class CameraService:
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "64k",
+            "-af", CLEAN_AUDIO_FILTER,
             "-movflags", "+faststart",
             "-y",
             filepath
@@ -411,14 +446,75 @@ class CameraService:
 
         def _worker():
             try:
-                logger.info(f"Iniciando gravação de vídeo MP4 1080p sincronizado ({seconds}s): {filename}")
-                try:
-                    subprocess.run(cmd, timeout=seconds + 10, check=True)
-                except subprocess.CalledProcessError:
-                    logger.warning("[!] Falha no stream 1080p para gravação, usando fallback para stream ativo...")
-                    fallback_cmd = list(cmd)
-                    fallback_cmd[fallback_cmd.index(rtsp_target)] = self.rtsp_url
-                    subprocess.run(fallback_cmd, timeout=seconds + 10, check=True)
+                logger.info(f"Iniciando gravação de vídeo MP4 1080p sincronizado com YOLO ({seconds}s): {filename}")
+                recorded_annotated = False
+                if self.status == "ONLINE" and self.latest_frame_jpeg is not None:
+                    fps = 12
+                    annotated_cmd = [
+                        ffmpeg_bin,
+                        "-nostats",
+                        "-loglevel", "error",
+                        "-thread_queue_size", "512",
+                        "-f", "image2pipe",
+                        "-vcodec", "mjpeg",
+                        "-framerate", str(fps),
+                        "-i", "pipe:0",
+                        "-thread_queue_size", "512",
+                        "-rtsp_transport", "tcp",
+                        "-i", self.rtsp_url,
+                        "-map", "0:v:0",
+                        "-map", "1:a:0?",
+                        "-t", str(seconds),
+                        "-c:v", "libx264",
+                        "-preset", "ultrafast",
+                        "-crf", "23",
+                        "-pix_fmt", "yuv420p",
+                        "-c:a", "aac",
+                        "-b:a", "64k",
+                        "-af", CLEAN_AUDIO_FILTER,
+                        "-movflags", "+faststart",
+                        "-y",
+                        filepath,
+                    ]
+                    try:
+                        proc = subprocess.Popen(
+                            annotated_cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        total_frames = int(seconds * fps)
+                        interval = 1.0 / fps
+                        for _ in range(total_frames):
+                            if proc.poll() is not None:
+                                break
+                            jpg = self.get_latest_jpeg()
+                            if jpg and proc.stdin:
+                                try:
+                                    proc.stdin.write(jpg)
+                                    proc.stdin.flush()
+                                except Exception:
+                                    break
+                            time.sleep(interval)
+                        if proc.stdin:
+                            try:
+                                proc.stdin.close()
+                            except Exception:
+                                pass
+                        proc.wait(timeout=10)
+                        if os.path.exists(filepath) and os.path.getsize(filepath) > 1024:
+                            recorded_annotated = True
+                    except Exception as pipe_err:
+                        logger.warning(f"Fallback gravação direta RTSP ({pipe_err})...")
+
+                if not recorded_annotated:
+                    try:
+                        subprocess.run(direct_cmd, timeout=seconds + 10, check=True)
+                    except subprocess.CalledProcessError:
+                        logger.warning("[!] Falha no stream 1080p para gravação, usando fallback para stream ativo...")
+                        fallback_cmd = list(direct_cmd)
+                        fallback_cmd[fallback_cmd.index(rtsp_target)] = self.rtsp_url
+                        subprocess.run(fallback_cmd, timeout=seconds + 10, check=True)
 
                 logger.info(f"[+] Vídeo MP4 gravado com áudio sincronizado: {filepath}")
                 if on_complete:

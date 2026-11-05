@@ -4,6 +4,7 @@ import { LoginPage } from '@/features/auth/LoginPage';
 import { Header } from '@/shared/components/Layout/Header';
 import { Sidebar, NavTab } from '@/shared/components/Layout/Sidebar';
 import { LiveMonitorView } from '@/features/monitor/LiveMonitorView';
+import { DvrRecordingsView } from '@/features/dvr/DvrRecordingsView';
 import { CameraConfigView } from '@/features/config/CameraConfigView';
 import { NightWatchView } from '@/features/rules/NightWatchView';
 import { SnapshotsView } from '@/features/snapshots/SnapshotsView';
@@ -102,6 +103,8 @@ export function App() {
               onRefreshStatus={fetchStatus}
             />
           )}
+
+          {activeTab === 'dvr' && <DvrRecordingsView />}
 
           {activeTab === 'rules' && <NightWatchView />}
 

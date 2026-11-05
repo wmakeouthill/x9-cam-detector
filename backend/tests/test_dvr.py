@@ -1,0 +1,245 @@
+import os
+import pytest
+import numpy as np
+from datetime import timedelta
+from unittest.mock import MagicMock, patch
+from starlette.requests import Request
+from app.core.time import get_now
+from app.core.config import settings
+from app.db.db import (
+    init_db,
+    get_dvr_config,
+    save_dvr_config,
+    upsert_dvr_segment,
+    mark_dvr_segment_synced,
+    list_dvr_segments,
+    count_dvr_segments,
+    list_dvr_available_dates,
+    find_dvr_segment_for_seek,
+    delete_dvr_segment,
+    cleanup_dvr_retention,
+    log_detection_event,
+    list_detection_events,
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_db(monkeypatch, tmp_path):
+    test_db = str(tmp_path / "test_dvr_x9.db")
+    monkeypatch.setenv("DB_PATH", test_db)
+    init_db()
+    yield test_db
+
+
+def test_dvr_config_defaults_and_update():
+    cfg = get_dvr_config()
+    assert cfg["enabled"] is True
+    assert cfg["segment_seconds"] == 60
+    assert cfg["retention_days"] == 15
+    assert cfg["subtype"] == 0
+
+    save_dvr_config(enabled=False, segment_seconds=60, retention_days=15, subtype=0)
+    updated = get_dvr_config()
+    assert updated["enabled"] is False
+    assert updated["subtype"] == 0
+
+
+def test_dvr_segments_crud_and_filters():
+    upsert_dvr_segment(
+        filename="dvr_20261104_100000.mp4",
+        start_time="2026-11-04 10:00:00",
+        end_time="2026-11-04 10:05:00",
+        duration_seconds=300,
+        size_bytes=1024000,
+        status="synced",
+        drive_file_id="drv_1",
+    )
+    upsert_dvr_segment(
+        filename="dvr_20261105_180000.mp4",
+        start_time="2026-11-05 18:00:00",
+        end_time="2026-11-05 18:05:00",
+        duration_seconds=300,
+        size_bytes=2048000,
+        status="local",
+    )
+    upsert_dvr_segment(
+        filename="dvr_20261105_190000.mp4",
+        start_time="2026-11-05 19:00:00",
+        end_time=None,
+        duration_seconds=120,
+        size_bytes=512000,
+        status="recording",
+    )
+
+    # Listagem geral ordenada DESC
+    all_segs = list_dvr_segments()
+    assert len(all_segs) == 3
+    assert all_segs[0]["filename"] == "dvr_20261105_190000.mp4"
+
+    # Filtro por data
+    nov05 = list_dvr_segments(date_str="2026-11-05")
+    assert len(nov05) == 2
+    assert count_dvr_segments(date_str="2026-11-05") == 2
+
+    # Filtro por data + hora
+    nov05_18h = list_dvr_segments(date_str="2026-11-05", hour_str="18")
+    assert len(nov05_18h) == 1
+    assert nov05_18h[0]["filename"] == "dvr_20261105_180000.mp4"
+
+    # Datas disponíveis
+    dates = list_dvr_available_dates()
+    assert dates == ["2026-11-05", "2026-11-04"]
+
+    # Marcar como sincronizado preserva status='synced' mesmo se re-escaneado como 'local'
+    mark_dvr_segment_synced("dvr_20261105_180000.mp4", drive_file_id="drv_2")
+    upsert_dvr_segment(
+        filename="dvr_20261105_180000.mp4",
+        start_time="2026-11-05 18:00:00",
+        end_time="2026-11-05 18:05:00",
+        duration_seconds=300,
+        size_bytes=2048000,
+        status="local",
+    )
+    refreshed = list_dvr_segments(date_str="2026-11-05", hour_str="18")[0]
+    assert refreshed["status"] == "synced"
+    assert refreshed["drive_file_id"] == "drv_2"
+
+
+def test_find_dvr_segment_for_seek():
+    now_dt = get_now().replace(tzinfo=None)
+    seg1_start = now_dt - timedelta(seconds=400)
+    seg1_end = now_dt - timedelta(seconds=100)
+    seg2_start = now_dt - timedelta(seconds=100)
+
+    upsert_dvr_segment(
+        filename="dvr_prev.mp4",
+        start_time=seg1_start.strftime("%Y-%m-%d %H:%M:%S"),
+        end_time=seg1_end.strftime("%Y-%m-%d %H:%M:%S"),
+        duration_seconds=300,
+        size_bytes=5000000,
+        status="local",
+    )
+    upsert_dvr_segment(
+        filename="dvr_curr.mp4",
+        start_time=seg2_start.strftime("%Y-%m-%d %H:%M:%S"),
+        end_time=None,
+        duration_seconds=100,
+        size_bytes=1500000,
+        status="recording",
+    )
+
+    # Voltar 30s deve cair dentro do segmento atual em gravação (offset ~70s)
+    res_30s = find_dvr_segment_for_seek(seconds_ago=30)
+    assert res_30s is not None
+    assert res_30s["segment"]["filename"] == "dvr_curr.mp4"
+    assert 65 <= res_30s["seek_offset"] <= 75
+
+    # Voltar 200s (3m20s) deve cair no segmento anterior (offset ~200s a partir de seg1_start)
+    res_200s = find_dvr_segment_for_seek(seconds_ago=200)
+    assert res_200s is not None
+    assert res_200s["segment"]["filename"] == "dvr_prev.mp4"
+    assert 195 <= res_200s["seek_offset"] <= 205
+
+
+def test_cleanup_dvr_retention_15_days(monkeypatch):
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_ENABLED", True)
+    now_dt = get_now().replace(tzinfo=None)
+    old_ts = (now_dt - timedelta(days=16)).strftime("%Y-%m-%d %H:%M:%S")
+    recent_ts = (now_dt - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. Antigo (16 dias) já sincronizado -> DEVE ser removido
+    upsert_dvr_segment(
+        filename="dvr_old_synced.mp4",
+        start_time=old_ts,
+        duration_seconds=300,
+        status="synced",
+        drive_file_id="id_old_synced",
+    )
+    # 2. Antigo (16 dias) ainda local/pendente -> DEVE ser preservado
+    upsert_dvr_segment(
+        filename="dvr_old_pending.mp4",
+        start_time=old_ts,
+        duration_seconds=300,
+        status="local",
+    )
+    # 3. Recente (2 dias) -> DEVE ser preservado
+    upsert_dvr_segment(
+        filename="dvr_recent.mp4",
+        start_time=recent_ts,
+        duration_seconds=300,
+        status="synced",
+    )
+
+    deleted = cleanup_dvr_retention(retention_days=15)
+    assert deleted == 1
+
+    remaining = {s["filename"] for s in list_dvr_segments()}
+    assert "dvr_old_synced.mp4" not in remaining
+    assert "dvr_old_pending.mp4" in remaining
+    assert "dvr_recent.mp4" in remaining
+
+
+def test_isolation_between_gallery_events_and_dvr_24h(monkeypatch):
+    from app.services.gdrive_service import gdrive_service, GoogleDriveService
+
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_ENABLED", True)
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_FOLDER_ID", "root_folder_123")
+    monkeypatch.setattr(GoogleDriveService, "is_configured", property(lambda self: True))
+
+    # Simula list_drive_files retornando foto da galeria e subpasta Gravacoes_24h (caso viesse)
+    monkeypatch.setattr(
+        gdrive_service,
+        "list_drive_files",
+        lambda: [
+            {"id": "f_snap", "name": "snapshot_20261105_120000.jpg", "mimeType": "image/jpeg", "createdTime": "2026-11-05T12:00:00Z"},
+            {"id": "f_folder", "name": "Gravacoes_24h", "mimeType": "application/vnd.google-apps.folder", "createdTime": "2026-11-05T00:00:00Z"},
+        ],
+    )
+    monkeypatch.setattr(
+        gdrive_service,
+        "list_dvr_drive_files",
+        lambda: [
+            {"id": "f_dvr1", "name": "dvr_20261105_120000.mp4", "mimeType": "video/mp4", "size": "10485760", "createdTime": "2026-11-05T12:00:00Z"},
+        ],
+    )
+
+    gdrive_service.reconcile_events_from_drive(force=True)
+    gdrive_service.reconcile_dvr_from_drive(force=True)
+
+    # Galeria contém APENAS o snapshot, nunca a pasta Gravacoes_24h nem o bloco DVR
+    events = list_detection_events(limit=50)
+    assert len(events) == 1
+    assert events[0]["snapshot_path"] == "snapshot_20261105_120000.jpg"
+
+    # DVR contém APENAS o bloco de 5 min da subpasta Gravacoes_24h
+    dvr_segs = list_dvr_segments()
+    assert len(dvr_segs) == 1
+    assert dvr_segs[0]["filename"] == "dvr_20261105_120000.mp4"
+    assert dvr_segs[0]["drive_file_id"] == "f_dvr1"
+
+
+def test_yolo_annotations_drawn_on_1080p_frame_and_range_streaming(tmp_path):
+    from app.services.camera_service import camera_service
+    from app.routers.camera import _serve_video_with_range
+
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    tracks = [{"box": (200, 150, 500, 800), "track_id": 1, "conf": 0.91}]
+    annotated = camera_service.draw_tracks_on_frame(frame.copy(), tracks)
+    # Deve ter desenhado os pixels da caixa e label no frame 1080p
+    assert int(annotated.sum()) > 0
+
+    # Testa suporte a HTTP Range (206 Partial Content) para seek instantâneo em arquivo MP4
+    dummy_mp4 = tmp_path / "dvr_20261105_180000.mp4"
+    dummy_mp4.write_bytes(b"0123456789ABCDEF" * 100)
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/camera/dvr/video/dvr_20261105_180000.mp4",
+        "headers": [(b"range", b"bytes=10-25")],
+    }
+    req = Request(scope)
+    resp = _serve_video_with_range(req, filepath=str(dummy_mp4))
+    assert resp.status_code == 206
+    assert resp.headers["Content-Range"] == "bytes 10-25/1600"
+    assert len(resp.body) == 16

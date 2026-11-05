@@ -18,6 +18,8 @@ from app.db import (
 logger = logging.getLogger("x9.gdrive")
 
 class GoogleDriveService:
+    DVR_FOLDER_NAME = "Gravacoes_24h"
+
     def __init__(self):
         self._queue = queue.Queue()
         self._worker_thread = None
@@ -25,6 +27,8 @@ class GoogleDriveService:
         self._running = True
         self.last_cloud_cleanup_time = 0.0
         self._last_reconcile_time = 0.0
+        self._last_dvr_reconcile_time = 0.0
+        self._dvr_folder_id: str | None = None
         self._start_workers()
         self._enqueue_existing_pending()
 
@@ -229,11 +233,12 @@ class GoogleDriveService:
                 except Exception as e:
                     logger.debug(f"[Google Drive Sync] Ciclo offline pausado (rede indisponível): {e}")
 
-            # Limpeza automática na nuvem (arquivos com mais de 90 dias / 3 meses)
+            # Limpeza automática na nuvem (arquivos com mais de 90 dias / 3 meses e DVR 24h > 15 dias)
             now_sec = time.time()
             if self.is_configured and (now_sec - self.last_cloud_cleanup_time > 86400):
                 try:
                     self.cleanup_old_drive_files(retention_days=90)
+                    self.cleanup_old_dvr_drive_files(retention_days=15)
                     self.last_cloud_cleanup_time = now_sec
                 except Exception as e:
                     logger.warning(f"[Google Drive] Erro na limpeza da nuvem: {e}")
@@ -408,7 +413,10 @@ class GoogleDriveService:
             return 0
 
         cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        q = f"createdTime < '{cutoff}' and '{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+        q = (
+            f"createdTime < '{cutoff}' and '{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents "
+            f"and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
+        )
         deleted_count = 0
 
         try:
@@ -462,14 +470,17 @@ class GoogleDriveService:
         return get_now_str()
 
     def list_drive_files(self) -> list[dict]:
-        """Lista todos os arquivos na pasta do Google Drive."""
+        """Lista todos os arquivos na pasta do Google Drive (ignorando subpastas como Gravacoes_24h)."""
         if not self.is_configured:
             return []
         try:
             service = self._get_service()
             if not service:
                 return []
-            q = f"'{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false"
+            q = (
+                f"'{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents "
+                f"and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
+            )
             files = []
             page_token = None
             while True:
@@ -540,6 +551,8 @@ class GoogleDriveService:
 
             # 1. Adiciona itens do Drive que ainda não estão em detection_events
             for fname, finfo in drive_file_names.items():
+                if finfo.get("mimeType") == "application/vnd.google-apps.folder" or fname.startswith("dvr_"):
+                    continue
                 ftype = "recording" if fname.lower().endswith(".mp4") else "snapshot"
                 if ftype == "snapshot":
                     if fname not in known_snapshots:
@@ -587,6 +600,251 @@ class GoogleDriveService:
             logger.info(f"[Google Drive] Galeria reconciliada com o Drive ({len(drive_files)} arquivo(s) na nuvem).")
         except Exception as e:
             logger.warning(f"[Google Drive] Erro ao reconciliar galeria com Drive: {e}")
+
+    # ==========================================================================
+    # Subpasta Exclusiva: Gravacoes_24h (DVR Contínuo 15 dias)
+    # ==========================================================================
+
+    def get_or_create_dvr_folder_id(self) -> str | None:
+        """Retorna o ID da subpasta 'Gravacoes_24h' dentro de GOOGLE_DRIVE_FOLDER_ID, criando-a se não existir."""
+        if not self.is_configured:
+            return None
+        if self._dvr_folder_id:
+            return self._dvr_folder_id
+
+        try:
+            service = self._get_service()
+            if not service:
+                return None
+
+            q = (
+                f"name = '{self.DVR_FOLDER_NAME}' "
+                f"and mimeType = 'application/vnd.google-apps.folder' "
+                f"and '{settings.GOOGLE_DRIVE_FOLDER_ID}' in parents "
+                f"and trashed = false"
+            )
+            res = service.files().list(q=q, fields="files(id, name)").execute()
+            files = res.get("files", [])
+            if files:
+                self._dvr_folder_id = files[0]["id"]
+                return self._dvr_folder_id
+
+            folder_meta = {
+                "name": self.DVR_FOLDER_NAME,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [settings.GOOGLE_DRIVE_FOLDER_ID],
+                "description": "X9 Cam Detector - Gravações Contínuas 24h (Retenção 15 dias)",
+            }
+            created = service.files().create(body=folder_meta, fields="id").execute()
+            self._dvr_folder_id = created.get("id")
+            logger.info(f"[Google Drive DVR] Subpasta '{self.DVR_FOLDER_NAME}' criada com ID: {self._dvr_folder_id}")
+            return self._dvr_folder_id
+        except Exception as e:
+            logger.warning(f"[Google Drive DVR] Erro ao obter/criar subpasta '{self.DVR_FOLDER_NAME}': {e}")
+            return None
+
+    def upload_dvr_segment(self, filepath: str) -> dict:
+        """Faz upload resumable de um segmento .mp4 de gravação 24h para a subpasta Gravacoes_24h."""
+        if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+            return {"status": "file_not_found"}
+
+        if not self.is_configured:
+            return {"status": "not_configured"}
+
+        try:
+            from googleapiclient.http import MediaFileUpload
+        except ImportError:
+            return {"status": "dependencies_missing"}
+
+        service = self._get_service()
+        if not service:
+            return {"status": "missing_credentials"}
+
+        dvr_folder_id = self.get_or_create_dvr_folder_id()
+        if not dvr_folder_id:
+            return {"status": "missing_dvr_folder"}
+
+        filename = os.path.basename(filepath)
+
+        try:
+            q_exist = f"name = '{filename}' and '{dvr_folder_id}' in parents and trashed = false"
+            check_exist = service.files().list(q=q_exist, fields="files(id, webViewLink)").execute()
+            existing_files = check_exist.get("files", [])
+            if existing_files:
+                return {
+                    "status": "success",
+                    "file_id": existing_files[0]["id"],
+                    "url": existing_files[0].get("webViewLink"),
+                }
+        except Exception:
+            pass
+
+        file_metadata = {
+            "name": filename,
+            "parents": [dvr_folder_id],
+            "description": "X9 Cam Detector - Gravação Contínua 24h (1080p + YOLO + Áudio)",
+        }
+        media = MediaFileUpload(filepath, mimetype="video/mp4", resumable=True)
+        file = service.files().create(body=file_metadata, media_body=media, fields="id, webViewLink").execute()
+        logger.info(f"[Google Drive DVR] Segmento 24h enviado para '{self.DVR_FOLDER_NAME}': {filename} (ID: {file.get('id')})")
+        return {"status": "success", "file_id": file.get("id"), "url": file.get("webViewLink")}
+
+    def list_dvr_drive_files(self) -> list[dict]:
+        """Lista todos os vídeos MP4 armazenados na subpasta Gravacoes_24h."""
+        if not self.is_configured:
+            return []
+        try:
+            service = self._get_service()
+            if not service:
+                return []
+            dvr_folder_id = self.get_or_create_dvr_folder_id()
+            if not dvr_folder_id:
+                return []
+            q = (
+                f"'{dvr_folder_id}' in parents "
+                f"and mimeType != 'application/vnd.google-apps.folder' "
+                f"and trashed = false"
+            )
+            files = []
+            page_token = None
+            while True:
+                res = service.files().list(
+                    q=q,
+                    fields="nextPageToken, files(id, name, createdTime, size, mimeType, webViewLink)",
+                    pageSize=100,
+                    pageToken=page_token,
+                ).execute()
+                files.extend(res.get("files", []))
+                page_token = res.get("nextPageToken")
+                if not page_token:
+                    break
+            return files
+        except Exception as e:
+            logger.warning(f"[Google Drive DVR] Erro ao listar segmentos na subpasta '{self.DVR_FOLDER_NAME}': {e}")
+            return []
+
+    def get_dvr_file_bytes(self, filename: str, drive_file_id: str | None = None) -> bytes | None:
+        """Baixa os bytes de um segmento DVR na subpasta Gravacoes_24h."""
+        if not self.is_configured:
+            return None
+        try:
+            service = self._get_service()
+            if not service:
+                return None
+
+            target_id = drive_file_id
+            if not target_id:
+                dvr_folder_id = self.get_or_create_dvr_folder_id()
+                if not dvr_folder_id:
+                    return None
+                q = f"name = '{filename}' and '{dvr_folder_id}' in parents and trashed = false"
+                res = service.files().list(q=q, fields="files(id)").execute()
+                files = res.get("files", [])
+                if not files:
+                    return None
+                target_id = files[0]["id"]
+
+            return service.files().get_media(fileId=target_id).execute()
+        except Exception as e:
+            logger.warning(f"[Google Drive DVR] Erro ao baixar segmento '{filename}': {e}")
+            return None
+
+    def delete_dvr_file_by_name(self, filename: str, drive_file_id: str | None = None) -> bool:
+        """Exclui um segmento DVR da subpasta Gravacoes_24h."""
+        if not self.is_configured:
+            return False
+        try:
+            service = self._get_service()
+            if not service:
+                return False
+
+            deleted = False
+            if drive_file_id:
+                try:
+                    service.files().delete(fileId=drive_file_id).execute()
+                    deleted = True
+                except Exception:
+                    pass
+
+            dvr_folder_id = self.get_or_create_dvr_folder_id()
+            if dvr_folder_id:
+                q = f"name = '{filename}' and '{dvr_folder_id}' in parents and trashed = false"
+                res = service.files().list(q=q, fields="files(id, name)").execute()
+                for f in res.get("files", []):
+                    try:
+                        service.files().delete(fileId=f["id"]).execute()
+                        deleted = True
+                    except Exception:
+                        pass
+            return deleted
+        except Exception as e:
+            logger.warning(f"[Google Drive DVR] Falha ao excluir '{filename}' da nuvem: {e}")
+            return False
+
+    def cleanup_old_dvr_drive_files(self, retention_days: int = 15) -> int:
+        """Exclui arquivos na subpasta Gravacoes_24h com mais de retention_days (padrão 15 dias)."""
+        if not self.is_configured:
+            return 0
+        service = self._get_service()
+        if not service:
+            return 0
+        dvr_folder_id = self.get_or_create_dvr_folder_id()
+        if not dvr_folder_id:
+            return 0
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        q = f"createdTime < '{cutoff}' and '{dvr_folder_id}' in parents and trashed = false"
+        deleted_count = 0
+
+        try:
+            res = service.files().list(q=q, fields="files(id, name, createdTime)", pageSize=100).execute()
+            for f in res.get("files", []):
+                try:
+                    service.files().delete(fileId=f["id"]).execute()
+                    deleted_count += 1
+                    logger.info(f"[Google Drive DVR] Segmento > {retention_days} dias excluído: {f.get('name')}")
+                except Exception as del_err:
+                    logger.warning(f"[Google Drive DVR] Falha ao deletar {f.get('id')}: {del_err}")
+        except Exception as e:
+            logger.warning(f"[Google Drive DVR] Erro ao limpar segmentos antigos na nuvem: {e}")
+
+        return deleted_count
+
+    def reconcile_dvr_from_drive(self, force: bool = False):
+        """Sincroniza a tabela dvr_segments com os arquivos presentes na subpasta Gravacoes_24h do Google Drive."""
+        if not self.is_configured:
+            return
+
+        now = time.time()
+        if not force and (now - self._last_dvr_reconcile_time) < 15.0:
+            return
+        self._last_dvr_reconcile_time = now
+
+        try:
+            from app.db import upsert_dvr_segment
+            drive_files = self.list_dvr_drive_files()
+            for finfo in drive_files:
+                fname = finfo.get("name", "")
+                if not fname.lower().endswith(".mp4"):
+                    continue
+                start_ts = self._extract_timestamp(fname, finfo.get("createdTime"))
+                try:
+                    start_dt = datetime.strptime(start_ts, "%Y-%m-%d %H:%M:%S")
+                    end_ts = (start_dt + timedelta(seconds=300)).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    end_ts = None
+                size_bytes = int(finfo.get("size") or 0)
+                upsert_dvr_segment(
+                    filename=fname,
+                    start_time=start_ts,
+                    end_time=end_ts,
+                    duration_seconds=300,
+                    size_bytes=size_bytes,
+                    status="synced",
+                    drive_file_id=finfo.get("id"),
+                )
+        except Exception as e:
+            logger.warning(f"[Google Drive DVR] Erro ao reconciliar segmentos DVR do Drive: {e}")
 
     def test_connection(self) -> dict:
         if not settings.GOOGLE_DRIVE_FOLDER_ID:
