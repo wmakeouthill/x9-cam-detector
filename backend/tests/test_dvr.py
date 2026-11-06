@@ -306,3 +306,121 @@ def test_clean_audio_filter_and_camera_aac_16khz_rpc(monkeypatch):
     assert updated_table[0]["ExtraFormat"][0]["Audio"]["Compression"] == "AAC"
     assert updated_table[0]["ExtraFormat"][0]["Audio"]["Frequency"] == 16000
 
+
+def test_camera_image_wdr_day_night_and_flash_restore_rpc(monkeypatch):
+    from app.services.camera_service import camera_service
+
+    calls = []
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeSession:
+        def post(self, url, json=None, timeout=5.0):
+            calls.append((url, json))
+            method = (json or {}).get("method")
+            params = (json or {}).get("params") or {}
+            name = params.get("name")
+            if method == "global.login" and not params.get("password"):
+                return FakeResp({"session": "sid123", "params": {"realm": "Login", "random": "999"}})
+            if method == "global.login" and params.get("password"):
+                return FakeResp({"result": True, "session": "sid123"})
+            if method == "configManager.getConfig":
+                if name == "NTP":
+                    return FakeResp({"result": True, "params": {"table": {"Enable": False, "Address": "a.ntp.br", "TimeZone": 22}}})
+                if name == "VideoInBacklight":
+                    return FakeResp({"result": True, "params": {"table": [[{"Mode": "Off", "WideDynamicRange": 50} for _ in range(3)]]}})
+                if name == "VideoInExposure":
+                    return FakeResp({"result": True, "params": {"table": [[{"Compensation": 50, "GainMax": 50, "WideDynamicRangeMode": 0, "WideDynamicRange": 0} for _ in range(3)]]}})
+                if name == "VideoInDayNight":
+                    return FakeResp({"result": True, "params": {"table": [[{"Mode": "Color", "Sensitivity": 2, "Delay": 2} for _ in range(3)]]}})
+                if name == "LightingScheme":
+                    return FakeResp({"result": True, "params": {"table": [[{"LightingMode": "WhiteMode"} for _ in range(3)]]}})
+                if name == "Lighting_V2":
+                    return FakeResp({
+                        "result": True,
+                        "params": {
+                            "table": [[
+                                [
+                                    {"LightType": "InfraredLight", "Mode": "Manual", "Correction": 50, "MiddleLight": [{"Light": 100, "Angle": 50}]},
+                                    {"LightType": "WhiteLight", "Mode": "Manual", "PercentOfMaxBrightness": 100, "NearLight": [{"Light": 100, "Angle": 50}]},
+                                ]
+                                for _ in range(3)
+                            ]]
+                        },
+                    })
+                if name == "VideoColor":
+                    return FakeResp({"result": True, "params": {"table": [[{"Brightness": 50, "Contrast": 50, "Saturation": 50, "Gamma": 50, "TimeSection": "0 00:00:00-24:00:00"} for _ in range(3)]]}})
+                if name == "VideoInSharpness":
+                    return FakeResp({"result": True, "params": {"table": [[{"Sharpness": 50, "Level": 50} for _ in range(3)]]}})
+                if name == "VideoInDenoise":
+                    return FakeResp({"result": True, "params": {"table": [[{"2DEnable": True, "2DLevel": 3, "3DType": "Auto", "3DAutoType": {"AutoLevel": 50}} for _ in range(3)]]}})
+                if name == "VideoInOptions":
+                    return FakeResp({"result": True, "params": {"table": [{"WideDynamicRangeMode": 0, "NightOptions": {}, "NormalOptions": {}}]}})
+                if name == "VideoInMode":
+                    return FakeResp({"result": True, "params": {"table": [{"Mode": 0, "Config": [0], "TimeSection": []}]}})
+            return FakeResp({"result": True})
+
+    import requests
+    monkeypatch.setattr(requests, "Session", FakeSession)
+    monkeypatch.setattr(camera_service, "_is_night_window", lambda: True)
+
+    ok_img = camera_service._ensure_optimal_camera_image_rpc()
+    assert ok_img is True
+
+    set_Configs = {
+        c[1]["params"]["name"]: c[1]["params"]["table"]
+        for c in calls
+        if c[1].get("method") == "configManager.setConfig"
+    }
+    assert set_Configs["NTP"]["Enable"] is True
+    assert set_Configs["VideoInBacklight"][0][0]["Mode"] == "WideDynamic"
+    assert set_Configs["VideoInBacklight"][0][0]["WideDynamicRange"] == 38
+    assert set_Configs["VideoInBacklight"][0][1]["WideDynamicRange"] == 38
+    assert set_Configs["VideoInExposure"][0][0]["Compensation"] == 40
+    assert set_Configs["VideoInDayNight"][0][0]["Mode"] == "BlackWhite"
+    assert set_Configs["VideoInDayNight"][0][1]["Mode"] == "BlackWhite"
+    assert set_Configs["Lighting_V2"][0][0][0]["Mode"] == "Auto"
+    assert set_Configs["VideoInMode"][0]["TimeSection"][0][1] == "0 05:00:00-18:59:59"
+    assert set_Configs["VideoInMode"][0]["TimeSection"][0][2] == "1 19:00:00-24:00:00"
+
+    # Testa acionamento do flash (on=True): deve desativar WDR e aplicar 6_flash_wdr_off
+    calls.clear()
+    ok_flash_on = camera_service._set_camera_lighting_rpc(on=True)
+    assert ok_flash_on is True
+    on_configs = {
+        c[1]["params"]["name"]: c[1]["params"]["table"]
+        for c in calls
+        if c[1].get("method") == "configManager.setConfig"
+    }
+    assert on_configs["VideoInBacklight"][0][0]["Mode"] == "Off"
+    assert on_configs["VideoInExposure"][0][0]["WideDynamicRangeMode"] == 0
+    assert on_configs["VideoInOptions"][0]["WideDynamicRangeMode"] == 0
+    assert on_configs["VideoColor"][0][0]["Contrast"] == 56
+    assert on_configs["VideoColor"][0][0]["Gamma"] == 46
+    assert on_configs["VideoColor"][0][0]["Saturation"] == 56
+
+    # Testa restauração pós-flash à noite (on=False): restaura 4_ir_with_wdr38 em todos os slots [0..2]
+    calls.clear()
+    ok_flash_off = camera_service._set_camera_lighting_rpc(on=False)
+    assert ok_flash_off is True
+    off_configs = {
+        c[1]["params"]["name"]: c[1]["params"]["table"]
+        for c in calls
+        if c[1].get("method") == "configManager.setConfig"
+    }
+    assert [p["Mode"] for p in off_configs["VideoInDayNight"][0]] == ["BlackWhite", "BlackWhite", "BlackWhite"]
+    assert off_configs["Lighting_V2"][0][0][0]["Mode"] == "Auto"
+    assert off_configs["Lighting_V2"][0][0][1]["Mode"] == "Off"
+    assert off_configs["VideoInBacklight"][0][0]["Mode"] == "WideDynamic"
+    assert off_configs["VideoInBacklight"][0][0]["WideDynamicRange"] == 38
+    assert off_configs["VideoInExposure"][0][0]["WideDynamicRangeMode"] == 1
+    assert off_configs["VideoInOptions"][0]["WideDynamicRange"] == 38
+    assert off_configs["VideoColor"][0][0]["Contrast"] == 62
+    assert off_configs["VideoColor"][0][0]["Gamma"] == 40
+
+

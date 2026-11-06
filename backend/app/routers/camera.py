@@ -101,9 +101,9 @@ def take_snapshot(req: SnapshotRequest = SnapshotRequest(), user: str = Depends(
             log_detection_event(confidence=1.0, flash_triggered=False, snapshot_path=snapshot_pb)
             gdrive_service.upload_file_async(snapshot_pb, description="Snapshot manual [Flagrante P&B]")
 
-            # Aciona Flash de Luz Branca (3s)
-            camera_service.trigger_flash(seconds=3.0)
-            time.sleep(1.2)
+            # Aciona Flash de Luz Branca (3.5s) e aguarda 1.8s para transição óptica completa (6_flash_wdr_off)
+            camera_service.trigger_flash(seconds=3.5)
+            time.sleep(1.8)
 
             # Foto 2: Foto com Flash 1080p colorida com ambiente iluminado
             snapshot_flash = camera_service.take_snapshot(prefix="snapshot_flash")

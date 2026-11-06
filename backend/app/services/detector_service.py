@@ -254,9 +254,9 @@ class DetectorService:
                     self.last_detection_time = now_sec
                     self.detections_count += 1
                     video_duration = 10
-                    # Flash cobre o snapshot e a gravação de vídeo completa em cores nítidas
+                    # Flash cobre a transição óptica (1.8s), o snapshot colorido e os 10s inteiros de vídeo no modo 6_flash_wdr_off
                     configured_flash = cfg.get("flash_duration", 2.5)
-                    flash_duration = max(float(configured_flash), float(video_duration) + 1.0)
+                    flash_duration = max(float(configured_flash), float(video_duration) + 3.5)
 
                     logger.warning(
                         f"[!] MODO VIGIA: PESSOA DETECTADA ({max_conf:.1%})! Luz Branca ({flash_duration:.1f}s), Foto 1080p e Vídeo ({video_duration}s)..."
@@ -272,11 +272,11 @@ class DetectorService:
                     )
                     logger.info(f"[+] Foto 1 (Flagrante P&B) capturada: {snapshot_pb}")
 
-                    # 2. Aciona Flash de Luz Branca (WhiteMode que cobrirá foto colorida e gravação)
+                    # 2. Aciona Flash de Luz Branca (WhiteMode + WDR Off que cobrirá foto colorida e gravação)
                     camera_service.trigger_flash(seconds=flash_duration)
                     
-                    # 3. Aguarda 1.2s para comutação mecânica do filtro IR-cut, auto-exposição e luz plena
-                    time.sleep(1.2)
+                    # 3. Aguarda 1.8s para comutação mecânica do filtro IR-cut, desligamento do WDR e luz plena
+                    time.sleep(1.8)
                     
                     # 4. Foto 2: Foto com Flash (Full Color 1080p nítida com o ambiente 100% iluminado)
                     snapshot_flash = camera_service.take_snapshot(prefix="snapshot_flash")
