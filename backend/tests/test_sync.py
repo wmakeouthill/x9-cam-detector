@@ -10,6 +10,7 @@ from app.db.db import (
     get_pending_sync_files,
     is_file_synced_or_untracked,
     cleanup_retention,
+    cleanup_synced_local_files,
     get_connection,
 )
 from app.core.config import settings
@@ -152,3 +153,57 @@ def test_pre_enqueue_recording_persists_before_upload(monkeypatch):
     # Verifica se já está no SQLite antes mesmo do upload terminar
     pending = get_pending_sync_files()
     assert any(p["filepath"] == video_name and p["status"] == "pending" for p in pending)
+
+
+def test_cleanup_synced_local_files_deletes_only_old_synced_and_keeps_db(tmp_path, monkeypatch):
+    import time
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_ENABLED", True)
+    monkeypatch.chdir(tmp_path)
+
+    snap_dir = tmp_path / "snapshots"
+    rec_dir = tmp_path / "recordings"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    rec_dir.mkdir(parents=True, exist_ok=True)
+
+    old_synced_snap = snap_dir / "snap_old_synced.jpg"
+    old_pending_snap = snap_dir / "snap_old_pending.jpg"
+    recent_synced_vid = rec_dir / "vid_recent_synced.mp4"
+
+    old_synced_snap.write_text("img1")
+    old_pending_snap.write_text("img2")
+    recent_synced_vid.write_text("vid1")
+
+    # Envelhece os dois primeiros arquivos para 26 horas atrás
+    old_mtime = time.time() - (26 * 3600)
+    os.utime(old_synced_snap, (old_mtime, old_mtime))
+    os.utime(old_pending_snap, (old_mtime, old_mtime))
+
+    enqueue_sync_file("snap_old_synced.jpg", file_type="snapshot")
+    mark_file_synced("snap_old_synced.jpg")
+
+    enqueue_sync_file("snap_old_pending.jpg", file_type="snapshot")
+
+    enqueue_sync_file("vid_recent_synced.mp4", file_type="recording")
+    mark_file_synced("vid_recent_synced.mp4")
+
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO detection_events (timestamp, confidence, flash_triggered, snapshot_path, video_path)
+        VALUES ('2026-11-04 10:00:00', 0.9, 1, 'snap_old_synced.jpg', 'vid_recent_synced.mp4')
+    """)
+    conn.commit()
+    conn.close()
+
+    removed = cleanup_synced_local_files(older_than_hours=24)
+    assert removed == 1
+    assert not old_synced_snap.exists()
+    assert old_pending_snap.exists()
+    assert recent_synced_vid.exists()
+
+    # Registro no banco continua intacto para que a Galeria busque do Google Drive
+    conn = get_connection()
+    count = conn.execute("SELECT COUNT(*) FROM detection_events WHERE snapshot_path = 'snap_old_synced.jpg'").fetchone()[0]
+    conn.close()
+    assert count == 1
+

@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import time
 import logging
 from datetime import datetime, timedelta
 from app.core.crypto import encrypt_credential, decrypt_credential
@@ -493,6 +494,68 @@ def cleanup_retention(retention_days: int = 15):
     conn.close()
     if deleted > 0:
         logger.info(f"Limpeza de retenção local ({retention_days} dias): {deleted} registros antigos removidos com proteção de nuvem.")
+
+def cleanup_synced_local_files(older_than_hours: int = 24) -> int:
+    """
+    Libera espaço do disco local diariamente apagando APENAS os arquivos físicos (.jpg e .mp4)
+    de snapshots e gravações que já foram sincronizados com sucesso no Google Drive
+    e têm mais de older_than_hours (padrão 24h = 1 dia).
+    Mantém os registros em detection_events e gdrive_sync_queue intactos para que a
+    Galeria continue exibindo tudo direto da nuvem.
+    """
+    if not settings.GOOGLE_DRIVE_ENABLED:
+        return 0
+
+    synced_files = get_all_synced_filepaths()
+    if not synced_files:
+        return 0
+
+    now_ts = time.time()
+    min_age_seconds = max(0, older_than_hours) * 3600
+    removed_count = 0
+
+    scan_dirs = [
+        "snapshots",
+        os.path.join("backend", "snapshots"),
+        os.path.join("..", "snapshots"),
+        "recordings",
+        os.path.join("backend", "recordings"),
+        os.path.join("..", "recordings"),
+    ]
+    seen_realpaths = set()
+    for folder in scan_dirs:
+        if not os.path.exists(folder):
+            continue
+        try:
+            entries = os.listdir(folder)
+        except Exception:
+            continue
+
+        for fname in entries:
+            if not fname.lower().endswith((".jpg", ".jpeg", ".mp4")):
+                continue
+            if fname not in synced_files:
+                continue
+
+            fpath = os.path.join(folder, fname)
+            try:
+                real_p = os.path.abspath(fpath)
+                if real_p in seen_realpaths:
+                    continue
+                seen_realpaths.add(real_p)
+
+                stat = os.stat(fpath)
+                if (now_ts - stat.st_mtime) >= min_age_seconds:
+                    os.remove(fpath)
+                    removed_count += 1
+            except OSError:
+                continue
+
+    if removed_count > 0:
+        logger.info(
+            f"[Limpeza Diária Disco] {removed_count} snapshot(s)/vídeo(s) local(is) já sincronizados no Google Drive foram removidos do disco local."
+        )
+    return removed_count
 
 def get_whatsapp_config(decrypt_key: bool = False) -> dict:
     conn = get_connection()

@@ -11,6 +11,7 @@ from app.db.db import (
     delete_detection_event,
     delete_detection_events_batch,
     cleanup_retention,
+    cleanup_synced_local_files,
     enqueue_sync_file,
     mark_file_synced,
     increment_sync_retry,

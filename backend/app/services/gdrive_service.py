@@ -13,6 +13,7 @@ from app.db import (
     get_pending_sync_files,
     get_all_synced_filepaths,
     get_unsynced_detection_events,
+    cleanup_synced_local_files,
 )
 
 logger = logging.getLogger("x9.gdrive")
@@ -39,6 +40,7 @@ class GoogleDriveService:
         self._reconcile_orphaned_files()
         self._enqueue_existing_pending()
         self.reconcile_events_from_drive(force=True)
+        cleanup_synced_local_files(older_than_hours=24)
 
     def stop(self):
         """Interrompe graciosamente as threads de sincronização."""
@@ -64,6 +66,9 @@ class GoogleDriveService:
         # 2. Reconcilia galeria e DVR 24h diretamente com o Google Drive como fonte de verdade
         self.reconcile_events_from_drive(force=True)
         self.reconcile_dvr_from_drive(force=True)
+
+        # 3. Limpa arquivos locais (>24h) que já estão confirmados no Google Drive
+        cleanup_synced_local_files(older_than_hours=24)
 
         # 3. Enfileira pendentes em memória
         self._enqueue_existing_pending()
@@ -231,6 +236,7 @@ class GoogleDriveService:
                 try:
                     self._reconcile_orphaned_files()
                     self._sync_offline_pending()
+                    cleanup_synced_local_files(older_than_hours=24)
                 except Exception as e:
                     logger.debug(f"[Google Drive Sync] Ciclo offline pausado (rede indisponível): {e}")
 
