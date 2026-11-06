@@ -35,6 +35,9 @@ class CameraService:
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
+        self._rpc_lock = threading.Lock()
+        self._flash_active = False
+        self._flash_until = 0.0
         
         self.latest_frame_raw = None
         self.latest_frame_jpeg = None
@@ -81,10 +84,10 @@ class CameraService:
             self._active_tracks = tracks
 
     def get_active_tracks(self) -> list:
-        """Retorna as caixas YOLO ativas (com TTL de 1.0s)."""
+        """Retorna as caixas YOLO ativas (watchdog TTL de 3.5s para suportar yolov8m em 1080p sem piscar)."""
         now = time.time()
         with self._lock:
-            tracks = [t for t in self._active_tracks if (now - t.get("last_seen", 0)) < 1.0]
+            tracks = [t for t in self._active_tracks if (now - t.get("last_seen", 0)) < 3.5]
             self._active_tracks = tracks
             return list(tracks)
 
@@ -227,10 +230,10 @@ class CameraService:
                     # Salva cópia limpa para inferência de IA e snapshots
                     raw_frame = frame.copy()
 
-                    # Renderiza anotações de tracking no frame se houver detecções ativas (TTL de 1.0s)
+                    # Renderiza anotações de tracking no frame se houver detecções ativas (watchdog TTL de 3.5s)
                     with self._lock:
                         self.latest_frame_raw = raw_frame
-                        tracks = [t for t in self._active_tracks if (now - t.get("last_seen", 0)) < 1.0]
+                        tracks = [t for t in self._active_tracks if (now - t.get("last_seen", 0)) < 3.5]
                         self._active_tracks = tracks
 
                     if tracks:
@@ -327,6 +330,25 @@ class CameraService:
 
         return s, sid, _rpc
 
+    def _rpc_logout(self, s, sid, timeout: float = 2.0):
+        """Encerra explicitamente a sessão JSON-RPC 2.0 na câmera para nunca esgotar o limite de logins simultâneos."""
+        if not s:
+            return
+        try:
+            if sid:
+                s.post(
+                    f"http://{self.ip}:{self.http_port}/RPC2",
+                    json={"method": "global.logout", "params": None, "id": 99, "session": sid},
+                    timeout=timeout,
+                )
+        except Exception:
+            pass
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
     def _ensure_optimal_camera_hardware_rpc(self, timeout: float = 5.0) -> bool:
         """Executa a calibração completa de áudio (AAC 16kHz) e imagem (WDR Dia/Noite + Smart IR + Relógio)."""
         ok_audio = self._ensure_optimal_camera_audio_rpc(timeout=timeout)
@@ -338,49 +360,62 @@ class CameraService:
         Garante que o hardware da câmera Intelbras capture áudio em AAC 16000Hz (16-bit)
         com volume de microfone em 100%, além de elevar o bitrate de vídeo 1080p para 3584 kbps.
         """
+        s, sid = None, None
         try:
-            _, _, _rpc = self._rpc_login(timeout=timeout)
-            if not _rpc:
-                return False
+            with self._rpc_lock:
+                s, sid, _rpc = self._rpc_login(timeout=timeout)
+                if not _rpc:
+                    return False
 
-            # 1. Garante ganho do microfone em 100%
-            vol_cfg = _rpc("configManager.getConfig", {"name": "AudioInputVolume"})
-            if vol_cfg.get("result") and vol_cfg.get("params", {}).get("table") != [100]:
-                _rpc("configManager.setConfig", {"name": "AudioInputVolume", "table": [100]})
+                # 1. Garante ganho do microfone em 100%
+                vol_cfg = _rpc("configManager.getConfig", {"name": "AudioInputVolume"})
+                if vol_cfg.get("result") and vol_cfg.get("params", {}).get("table") != [100]:
+                    _rpc("configManager.setConfig", {"name": "AudioInputVolume", "table": [100]})
 
-            # 2. Garante codec AAC 16000Hz (16-bit) e bitrate ótimo de vídeo no MainFormat (1080p) e ExtraFormat (480p)
-            enc_cfg = _rpc("configManager.getConfig", {"name": "Encode"})
-            if enc_cfg.get("result"):
-                table = enc_cfg["params"]["table"]
-                changed = False
-                target_video_bitrates = {"MainFormat": (3584, 6), "ExtraFormat": (768, 5)}
-                for stream_group, (target_br, target_q) in target_video_bitrates.items():
-                    formats = table[0].get(stream_group, [])
-                    for fmt in formats:
-                        if isinstance(fmt.get("Audio"), dict):
-                            audio = fmt["Audio"]
-                            if (
-                                audio.get("Compression") != "AAC"
-                                or audio.get("Frequency") != 16000
-                                or not fmt.get("AudioEnable")
-                            ):
-                                audio["Compression"] = "AAC"
-                                audio["Frequency"] = 16000
-                                fmt["AudioEnable"] = True
-                                changed = True
-                        if isinstance(fmt.get("Video"), dict):
-                            video = fmt["Video"]
-                            if video.get("BitRate") != target_br or video.get("Quality") != target_q:
-                                video["BitRate"] = target_br
-                                video["Quality"] = target_q
-                                changed = True
-                if changed:
-                    _rpc("configManager.setConfig", {"name": "Encode", "table": table})
-                    logger.info("[Áudio/Vídeo Hardware] Câmera configurada para AAC 16kHz + 1080p 3584kbps.")
-            return True
+                # 2. Garante codec AAC 16000Hz (16-bit) e bitrate ótimo de vídeo no MainFormat (1080p) e ExtraFormat (480p)
+                enc_cfg = _rpc("configManager.getConfig", {"name": "Encode"})
+                if enc_cfg.get("result"):
+                    table = enc_cfg["params"]["table"]
+                    changed = False
+                    target_video_bitrates = {"MainFormat": (3584, 6), "ExtraFormat": (768, 5)}
+                    for stream_group, (target_br, target_q) in target_video_bitrates.items():
+                        formats = table[0].get(stream_group, [])
+                        for fmt in formats:
+                            if isinstance(fmt.get("Audio"), dict):
+                                audio = fmt["Audio"]
+                                if (
+                                    audio.get("Compression") != "AAC"
+                                    or audio.get("Frequency") != 16000
+                                    or not fmt.get("AudioEnable")
+                                ):
+                                    audio["Compression"] = "AAC"
+                                    audio["Frequency"] = 16000
+                                    fmt["AudioEnable"] = True
+                                    changed = True
+                            if isinstance(fmt.get("Video"), dict):
+                                video = fmt["Video"]
+                                if (
+                                    video.get("BitRate") != target_br
+                                    or video.get("Quality") != target_q
+                                    or video.get("Compression") != "H.264"
+                                    or video.get("FPS") != 20
+                                ):
+                                    video["BitRate"] = target_br
+                                    video["Quality"] = target_q
+                                    video["Compression"] = "H.264"
+                                    video["Profile"] = "High"
+                                    video["FPS"] = 20
+                                    video["GOP"] = 40
+                                    changed = True
+                    if changed:
+                        _rpc("configManager.setConfig", {"name": "Encode", "table": table})
+                        logger.info("[Áudio/Vídeo Hardware] Câmera configurada para AAC 16kHz + 1080p 3584kbps.")
+                return True
         except Exception as e:
             logger.debug(f"[Áudio Hardware] Não foi possível verificar/ajustar AAC 16kHz via RPC2: {e}")
             return False
+        finally:
+            self._rpc_logout(s, sid)
 
     def _ensure_optimal_camera_image_rpc(self, timeout: float = 5.0) -> bool:
         """
@@ -392,10 +427,12 @@ class CameraService:
           (impede que a luz fraca do poste da rua estoure o portão em branco e ilumina a garagem por igual).
         - 3D-DNR em 42 para evitar rastro fantasma (motion blur) quando uma pessoa caminha.
         """
+        s, sid = None, None
         try:
-            _, _, _rpc = self._rpc_login(timeout=timeout)
-            if not _rpc:
-                return False
+            with self._rpc_lock:
+                s, sid, _rpc = self._rpc_login(timeout=timeout)
+                if not _rpc:
+                    return False
 
             # 1. Sincroniza relógio da câmera com horário de Brasília e habilita NTP
             now_str = get_now_str("%Y-%m-%d %H:%M:%S")
@@ -437,6 +474,9 @@ class CameraService:
                 for p in range(len(exp_table[0])):
                     exp_table[0][p]["Compensation"] = active_comp
                     exp_table[0][p]["GainMax"] = 38
+                    exp_table[0][p]["Mode"] = 0
+                    exp_table[0][p]["Value1"] = 0
+                    exp_table[0][p]["Value2"] = 33.33
                     exp_table[0][p]["WideDynamicRangeMode"] = 1
                     exp_table[0][p]["WideDynamicRange"] = active_wdr
                 _rpc("configManager.setConfig", {"name": "VideoInExposure", "table": exp_table})
@@ -510,6 +550,10 @@ class CameraService:
                             "WideDynamicRangeMode": 1,
                             "WideDynamicRange": active_wdr,
                             "ExposureCompensation": active_comp,
+                            "ExposureMode": 0,
+                            "ExposureValue1": 0,
+                            "ExposureValue2": 33.33,
+                            "ReferenceLevel": 50,
                             "GainMax": 38,
                             "DayNightColor": active_dn_color,
                         })
@@ -539,6 +583,8 @@ class CameraService:
         except Exception as e:
             logger.debug(f"[Imagem Hardware] Não foi possível calibrar imagem via RPC2: {e}")
             return False
+        finally:
+            self._rpc_logout(s, sid)
 
     def _set_camera_lighting_rpc(self, on: bool = True, intensity: int = 100, timeout: float = 5.0) -> bool:
         """
@@ -548,134 +594,213 @@ class CameraService:
         - on=False: Restaura exatamente o perfil vigente de repouso (Noite 19h-05h = 4_ir_with_wdr38 | Dia 05h-19h = Color + WDR 60)
           em todos os slots [0..2], garantindo que o WDR e o Smart IR nunca se percam após o flash!
         """
+        s, sid = None, None
         try:
-            _, _, _rpc = self._rpc_login(timeout=timeout)
-            if not _rpc:
-                logger.error("Autenticação RPC2 falhou ao controlar iluminação da câmera.")
-                return False
+            with self._rpc_lock:
+                s, sid, _rpc = self._rpc_login(timeout=timeout)
+                if not _rpc:
+                    logger.error("Autenticação RPC2 falhou ao controlar iluminação da câmera.")
+                    return False
 
-            is_night = self._is_night_window()
-            rest_wdr = 38 if is_night else 60
-            rest_comp = 40 if is_night else 46
-            rest_dn_mode = "BlackWhite" if is_night else "Color"
-            rest_dn_color = 2 if is_night else 0
-            rest_brightness = 45 if is_night else 48
-            rest_contrast = 62 if is_night else 56
-            rest_gamma = 40 if is_night else 46
-            rest_saturation = 50 if is_night else 55
+                is_night = self._is_night_window()
+                rest_wdr = 38 if is_night else 60
+                rest_comp = 40 if is_night else 46
+                rest_dn_mode = "BlackWhite" if is_night else "Color"
+                rest_dn_color = 2 if is_night else 0
+                rest_brightness = 45 if is_night else 48
+                rest_contrast = 62 if is_night else 56
+                rest_gamma = 40 if is_night else 46
+                rest_saturation = 50 if is_night else 55
 
-            mode = "WhiteMode" if on else "InfraredMode"
+                mode = "WhiteMode" if on else "InfraredMode"
 
-            # 1. LightingScheme
-            scheme_cfg = _rpc("configManager.getConfig", {"name": "LightingScheme"})
-            if scheme_cfg.get("result"):
-                scheme = scheme_cfg["params"]["table"]
-                for p in range(len(scheme[0])):
-                    scheme[0][p]["LightingMode"] = mode
-                _rpc("configManager.setConfig", {"name": "LightingScheme", "table": scheme})
+                # 1. LightingScheme
+                scheme_cfg = _rpc("configManager.getConfig", {"name": "LightingScheme"})
+                if scheme_cfg.get("result"):
+                    scheme = scheme_cfg["params"]["table"]
+                    for p in range(len(scheme[0])):
+                        scheme[0][p]["LightingMode"] = mode
+                    _rpc("configManager.setConfig", {"name": "LightingScheme", "table": scheme})
 
-            # 2. VideoInDayNight: durante o flash (on=True) força Color; ao desligar (on=False)
-            # restaura o modo vigente em todos os slots [0..2] (BlackWhite à noite, Color de dia)
-            daynight_cfg = _rpc("configManager.getConfig", {"name": "VideoInDayNight"})
-            if daynight_cfg.get("result"):
-                daynight = daynight_cfg["params"]["table"]
-                for p in range(len(daynight[0])):
-                    daynight[0][p]["Mode"] = "Color" if on else rest_dn_mode
-                _rpc("configManager.setConfig", {"name": "VideoInDayNight", "table": daynight})
+                # 2. VideoInDayNight: durante o flash (on=True) força Color; ao desligar (on=False)
+                # restaura o modo vigente em todos os slots [0..2] (BlackWhite à noite, Color de dia)
+                daynight_cfg = _rpc("configManager.getConfig", {"name": "VideoInDayNight"})
+                if daynight_cfg.get("result"):
+                    daynight = daynight_cfg["params"]["table"]
+                    for p in range(len(daynight[0])):
+                        daynight[0][p]["Mode"] = "Color" if on else rest_dn_mode
+                    _rpc("configManager.setConfig", {"name": "VideoInDayNight", "table": daynight})
 
-            # 3. Lighting_V2
-            lighting_v2_cfg = _rpc("configManager.getConfig", {"name": "Lighting_V2"})
-            if lighting_v2_cfg.get("result"):
-                lighting_v2 = lighting_v2_cfg["params"]["table"]
-                for p in range(len(lighting_v2[0])):
-                    # Index 1 = WhiteLight (Luz Branca / Flash)
-                    lighting_v2[0][p][1]["Mode"] = "Manual" if on else "Off"
-                    lighting_v2[0][p][1]["PercentOfMaxBrightness"] = 100
-                    lighting_v2[0][p][1]["NearLight"][0]["Light"] = intensity if on else 0
-                    lighting_v2[0][p][1]["NearLight"][0]["Angle"] = 50
-                    if on:
-                        # Desliga o IR durante o flash para fotos e vídeos em cores puras
-                        lighting_v2[0][p][0]["MiddleLight"][0]["Light"] = 0
-                        lighting_v2[0][p][0]["Mode"] = "Off"
-                    else:
-                        # Restaura o Smart IR automático (Mode="Auto") no modo de espera noturno
-                        lighting_v2[0][p][0]["Mode"] = "Auto" if is_night else "Off"
-                        lighting_v2[0][p][0]["Correction"] = 50
-                        lighting_v2[0][p][0]["MiddleLight"][0]["Light"] = 100 if is_night else 0
-                _rpc("configManager.setConfig", {"name": "Lighting_V2", "table": lighting_v2})
+                # 3. Lighting_V2
+                lighting_v2_cfg = _rpc("configManager.getConfig", {"name": "Lighting_V2"})
+                if lighting_v2_cfg.get("result"):
+                    lighting_v2 = lighting_v2_cfg["params"]["table"]
+                    for p in range(len(lighting_v2[0])):
+                        # Index 1 = WhiteLight (Luz Branca / Flash)
+                        lighting_v2[0][p][1]["Mode"] = "Manual" if on else "Off"
+                        lighting_v2[0][p][1]["PercentOfMaxBrightness"] = 100
+                        lighting_v2[0][p][1]["NearLight"][0]["Light"] = intensity if on else 0
+                        lighting_v2[0][p][1]["NearLight"][0]["Angle"] = 50
+                        if on:
+                            # Desliga o IR durante o flash para fotos e vídeos em cores puras
+                            lighting_v2[0][p][0]["MiddleLight"][0]["Light"] = 0
+                            lighting_v2[0][p][0]["Mode"] = "Off"
+                        else:
+                            # Restaura o Smart IR automático (Mode="Auto") no modo de espera noturno
+                            lighting_v2[0][p][0]["Mode"] = "Auto" if is_night else "Off"
+                            lighting_v2[0][p][0]["Correction"] = 50
+                            lighting_v2[0][p][0]["MiddleLight"][0]["Light"] = 100 if is_night else 0
+                    _rpc("configManager.setConfig", {"name": "Lighting_V2", "table": lighting_v2})
 
-            # 4. WDR, Exposição e Cor dinâmicos no Flash (6_flash_wdr_off quando on=True -> 4_ir_with_wdr38 quando on=False)
-            bl_cfg = _rpc("configManager.getConfig", {"name": "VideoInBacklight"})
-            if bl_cfg.get("result"):
-                bl_table = bl_cfg["params"]["table"]
-                for p in range(len(bl_table[0])):
-                    bl_table[0][p]["Mode"] = "Off" if on else "WideDynamic"
-                    if not on:
-                        bl_table[0][p]["WideDynamicRange"] = rest_wdr
-                _rpc("configManager.setConfig", {"name": "VideoInBacklight", "table": bl_table})
+                # 4. WDR, Exposição e Cor dinâmicos no Flash (6_flash_wdr_off quando on=True -> 4_ir_with_wdr38 quando on=False)
+                bl_cfg = _rpc("configManager.getConfig", {"name": "VideoInBacklight"})
+                if bl_cfg.get("result"):
+                    bl_table = bl_cfg["params"]["table"]
+                    for p in range(len(bl_table[0])):
+                        bl_table[0][p]["Mode"] = "Off" if on else "WideDynamic"
+                        if not on:
+                            bl_table[0][p]["WideDynamicRange"] = rest_wdr
+                    _rpc("configManager.setConfig", {"name": "VideoInBacklight", "table": bl_table})
 
-            exp_cfg = _rpc("configManager.getConfig", {"name": "VideoInExposure"})
-            if exp_cfg.get("result"):
-                exp_table = exp_cfg["params"]["table"]
-                for p in range(len(exp_table[0])):
-                    exp_table[0][p]["WideDynamicRangeMode"] = 0 if on else 1
-                    exp_table[0][p]["WideDynamicRange"] = 0 if on else rest_wdr
-                    exp_table[0][p]["Compensation"] = 48 if on else rest_comp
-                    exp_table[0][p]["GainMax"] = 38
-                _rpc("configManager.setConfig", {"name": "VideoInExposure", "table": exp_table})
+                exp_cfg = _rpc("configManager.getConfig", {"name": "VideoInExposure"})
+                if exp_cfg.get("result"):
+                    exp_table = exp_cfg["params"]["table"]
+                    for p in range(len(exp_table[0])):
+                        exp_table[0][p]["WideDynamicRangeMode"] = 0 if on else 1
+                        exp_table[0][p]["WideDynamicRange"] = 0 if on else rest_wdr
+                        exp_table[0][p]["Compensation"] = 48 if on else rest_comp
+                        exp_table[0][p]["GainMax"] = 38
+                    _rpc("configManager.setConfig", {"name": "VideoInExposure", "table": exp_table})
 
-            opt_cfg = _rpc("configManager.getConfig", {"name": "VideoInOptions"})
-            if opt_cfg.get("result"):
-                opt_table = opt_cfg["params"]["table"]
-                root = opt_table[0]
-                for node in [root, root.get("NightOptions"), root.get("NormalOptions")]:
-                    if isinstance(node, dict):
-                        node["WideDynamicRangeMode"] = 0 if on else 1
-                        node["WideDynamicRange"] = 0 if on else rest_wdr
-                        node["ExposureCompensation"] = 48 if on else rest_comp
-                        node["GainMax"] = 38
-                        node["DayNightColor"] = 0 if on else rest_dn_color
-                _rpc("configManager.setConfig", {"name": "VideoInOptions", "table": opt_table})
+                opt_cfg = _rpc("configManager.getConfig", {"name": "VideoInOptions"})
+                if opt_cfg.get("result"):
+                    opt_table = opt_cfg["params"]["table"]
+                    root = opt_table[0]
+                    for node in [root, root.get("NightOptions"), root.get("NormalOptions")]:
+                        if isinstance(node, dict):
+                            node["WideDynamicRangeMode"] = 0 if on else 1
+                            node["WideDynamicRange"] = 0 if on else rest_wdr
+                            node["ExposureCompensation"] = 48 if on else rest_comp
+                            node["GainMax"] = 38
+                            node["DayNightColor"] = 0 if on else rest_dn_color
+                    _rpc("configManager.setConfig", {"name": "VideoInOptions", "table": opt_table})
 
-            vc_cfg = _rpc("configManager.getConfig", {"name": "VideoColor"})
-            if vc_cfg.get("result"):
-                vc_table = vc_cfg["params"]["table"]
-                for p in range(len(vc_table[0])):
-                    vc_table[0][p].update({
-                        "Brightness": 48 if on else rest_brightness,
-                        "Contrast": 56 if on else rest_contrast,
-                        "Saturation": 56 if on else rest_saturation,
-                        "Gamma": 46 if on else rest_gamma,
-                    })
-                _rpc("configManager.setConfig", {"name": "VideoColor", "table": vc_table})
+                vc_cfg = _rpc("configManager.getConfig", {"name": "VideoColor"})
+                if vc_cfg.get("result"):
+                    vc_table = vc_cfg["params"]["table"]
+                    for p in range(len(vc_table[0])):
+                        vc_table[0][p].update({
+                            "Brightness": 48 if on else rest_brightness,
+                            "Contrast": 56 if on else rest_contrast,
+                            "Saturation": 56 if on else rest_saturation,
+                            "Gamma": 46 if on else rest_gamma,
+                        })
+                    _rpc("configManager.setConfig", {"name": "VideoColor", "table": vc_table})
 
-            return True
+                return True
         except Exception as e:
             logger.error(f"Erro ao controlar iluminação via RPC: {e}")
             return False
+        finally:
+            self._rpc_logout(s, sid)
 
     def trigger_flash(self, seconds: float = 2.0) -> dict:
         """
         Dispara o LED de luz branca da câmera Intelbras VIP 1230 FC+ por N segundos.
-        Executa em thread assíncrona para não bloquear a API nem o loop do detector.
+        Deduplica cliques múltiplos estendendo o timer sem criar threads concorrentes.
         """
+        now = time.time()
+        target_until = now + max(0.05, float(seconds))
+        with self._lock:
+            if target_until > self._flash_until:
+                self._flash_until = target_until
+            if self._flash_active:
+                return {"status": "triggered", "duration": seconds, "extended": True}
+            self._flash_active = True
+
         def _flash_worker():
             try:
                 logger.info(f"[FLASH] Ligando LED de luz branca por {seconds}s...")
                 success = self._set_camera_lighting_rpc(on=True, intensity=100)
                 if not success:
-                    logger.warning("[FLASH] Falha no acionamento RPC do flash.")
-                
-                time.sleep(seconds)
+                    logger.warning("[FLASH] Falha no acionamento RPC do flash, tentando novamente...")
+                    time.sleep(0.3)
+                    self._set_camera_lighting_rpc(on=True, intensity=100)
 
-                logger.info("[FLASH] Desligando LED de luz branca (restaurando AIMode)...")
-                self._set_camera_lighting_rpc(on=False)
+                while True:
+                    with self._lock:
+                        remaining = self._flash_until - time.time()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(remaining, 0.25))
+
+                logger.info("[FLASH] Desligando LED de luz branca (restaurando perfil WDR vigente)...")
+                if not self._set_camera_lighting_rpc(on=False):
+                    time.sleep(0.4)
+                    self._set_camera_lighting_rpc(on=False)
             except Exception as e:
                 logger.error(f"[FLASH] Erro no worker de flash: {e}")
+            finally:
+                with self._lock:
+                    self._flash_active = False
 
         t = threading.Thread(target=_flash_worker, daemon=True)
         t.start()
         return {"status": "triggered", "duration": seconds}
+
+    def reboot_camera(self, timeout: float = 5.0) -> dict:
+        """
+        Reinicia o hardware da câmera Intelbras VIP 1230 FC+ remotamente.
+        1. Tenta via CGI HTTP Digest stateless (/cgi-bin/magicBox.cgi?action=reboot), que funciona
+           mesmo quando o pool de sessões RPC2 está travado/cheio.
+        2. Fallback via JSON-RPC 2.0 (magicBox.reboot).
+        Após o reboot (~35s), o _capture_loop reconecta sozinho e recalibra áudio e WDR.
+        """
+        rebooted = False
+        method_used = None
+
+        # 1. Tentativa via CGI HTTP Digest stateless (independente de sessão RPC2)
+        try:
+            url = f"http://{self.ip}:{self.http_port}/cgi-bin/magicBox.cgi?action=reboot"
+            resp = requests.get(url, auth=HTTPDigestAuth(self.user, self.password), timeout=timeout)
+            if resp.status_code == 200 and ("OK" in resp.text.upper() or resp.text.strip() == ""):
+                rebooted = True
+                method_used = "CGI magicBox.reboot"
+        except Exception as e:
+            logger.debug(f"[Reboot] Tentativa CGI magicBox falhou: {e}")
+
+        # 2. Tentativa via JSON-RPC 2.0 (magicBox.reboot)
+        if not rebooted:
+            s, sid = None, None
+            try:
+                with self._rpc_lock:
+                    s, sid, _rpc = self._rpc_login(timeout=timeout)
+                    if _rpc:
+                        res = _rpc("magicBox.reboot")
+                        if res.get("result"):
+                            rebooted = True
+                            method_used = "RPC2 magicBox.reboot"
+            except Exception as e:
+                logger.warning(f"[Reboot] Tentativa RPC2 magicBox.reboot falhou: {e}")
+            finally:
+                self._rpc_logout(s, sid)
+
+        if rebooted:
+            with self._lock:
+                self._flash_active = False
+                self._flash_until = 0.0
+                self.status = "CONNECTING"
+            logger.warning(f"[Reboot] Câmera {self.ip} reiniciada remotamente via {method_used}!")
+            return {
+                "status": "rebooting",
+                "method": method_used,
+                "message": "Comando de reinicialização enviado! A câmera voltará online em ~35 segundos com WDR e áudio calibrados.",
+            }
+
+        return {
+            "status": "error",
+            "message": "Não foi possível enviar o comando de reboot à câmera. Verifique se ela está acessível na rede.",
+        }
 
     def take_snapshot(self, prefix: str = "snapshot") -> str:
         """

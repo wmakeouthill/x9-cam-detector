@@ -122,7 +122,8 @@ class DetectorService:
         self.last_detection_time = 0.0
         self.last_cleanup_time = 0.0
         self.cooldown_seconds = 20.0
-        self.tracker = SimpleTracker(max_age_seconds=1.0, iou_threshold=0.20, min_hits=1)
+        self.tracker = SimpleTracker(max_age_seconds=2.2, iou_threshold=0.20, min_hits=1)
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         self._cached_cfg = None
         self._last_cfg_fetch = 0.0
         
@@ -175,13 +176,25 @@ class DetectorService:
             logger.warning(f"Erro ao avaliar janela de horário ({start_time_str} - {end_time_str}): {e}")
             return False
 
+    def _enhance_frame_for_yolo(self, frame):
+        """
+        Normaliza o contraste local (CLAHE no canal L) na cópia enviada ao YOLO
+        para destacar contornos humanos no fundo do portão (tanto em IR P&B + WDR quanto à contraluz),
+        sem alterar a imagem exibida ao usuário.
+        """
+        try:
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l_ch, a_ch, b_ch = cv2.split(lab)
+            l_ch = self._clahe.apply(l_ch)
+            return cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+        except Exception:
+            return frame
+
     def _detection_loop(self):
         while self._running:
             try:
-                # 1. Ciclo de inferência a cada 350ms (~3 FPS leve para CPU, liberando recursos para RTSP)
-                time.sleep(0.35)
-
-                now_sec = time.time()
+                loop_t0 = time.time()
+                now_sec = loop_t0
                 if self._cached_cfg is None or (now_sec - self._last_cfg_fetch) > 2.0:
                     self._cached_cfg = get_night_watch_config() or {}
                     self._last_cfg_fetch = now_sec
@@ -198,21 +211,28 @@ class DetectorService:
                     cleanup_retention(retention_days)
                     self.last_cleanup_time = now_sec
 
-                # 2. Pega último frame da câmera (Substream) para análise contínua 24/7
+                # 2. Pega último frame da câmera para análise contínua 24/7
                 frame = None
                 with camera_service._lock:
                     if camera_service.latest_frame_raw is not None:
                         frame = camera_service.latest_frame_raw.copy()
 
                 if frame is None or camera_service.status != "ONLINE":
+                    time.sleep(0.2)
                     continue
 
-                conf_thresh = cfg.get("confidence_threshold", 0.45)
+                conf_thresh = float(cfg.get("confidence_threshold", 0.45))
+                # Histerese de rastreamento: se já há pessoa rastreada na cena, mantém o bbox vivo
+                # com limiar ligeiramente menor para não piscar quando a pessoa passa atrás da grade/estante
+                has_active_track = len(self.tracker.tracks) > 0
+                query_conf = max(0.28, conf_thresh - 0.12) if has_active_track else max(0.32, conf_thresh - 0.05)
+
+                yolo_input = self._enhance_frame_for_yolo(frame)
                 # Classe 0 = Person: roda SEMPRE para desenhar bounding box no monitor ao vivo 24/7
                 results = self.model.predict(
-                    source=frame,
+                    source=yolo_input,
                     classes=[0],
-                    conf=conf_thresh,
+                    conf=query_conf,
                     verbose=False,
                     imgsz=640, # Padrão nativo do YOLOv8 (640x640)
                 )
@@ -222,10 +242,13 @@ class DetectorService:
                     for b in results[0].boxes:
                         coords = b.xyxy.cpu().numpy()[0]
                         conf = float(b.conf.cpu().numpy()[0])
-                        detections.append({
-                            "box": [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])],
-                            "conf": conf,
-                        })
+                        # Para iniciar o primeiro track na cena exige conf_thresh (ou >= 0.35 no fundo do portão);
+                        # para manter um track já existente aceita query_conf (histerese anti-pisca)
+                        if has_active_track or conf >= min(conf_thresh, 0.38):
+                            detections.append({
+                                "box": [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])],
+                                "conf": conf,
+                            })
 
                 # Atualiza rastreador e propaga caixas ativas para o streaming da câmera (24/7)
                 active_tracks = self.tracker.update(detections)
@@ -326,6 +349,10 @@ class DetectorService:
                         description=f"Detecção Noturna X9 [Flash Colorido]: Pessoa detectada ({max_conf:.1%})",
                         file_type="snapshot"
                     )
+
+                elapsed = time.time() - loop_t0
+                if elapsed < 0.20:
+                    time.sleep(0.20 - elapsed)
 
             except Exception as e:
                 logger.error(f"Erro no loop do detector YOLO: {e}")

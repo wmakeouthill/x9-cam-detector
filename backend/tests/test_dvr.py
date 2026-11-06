@@ -422,5 +422,16 @@ def test_camera_image_wdr_day_night_and_flash_restore_rpc(monkeypatch):
     assert off_configs["VideoInOptions"][0]["WideDynamicRange"] == 38
     assert off_configs["VideoColor"][0][0]["Contrast"] == 62
     assert off_configs["VideoColor"][0][0]["Gamma"] == 40
+    assert any(c[1].get("method") == "global.logout" for c in calls)
+
+    # Testa reboot remoto da câmera (CGI fallback para RPC2 magicBox.reboot + logout)
+    calls.clear()
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: (_ for _ in ()).throw( RuntimeError("CGI indisponível") ))
+    res_reboot = camera_service.reboot_camera()
+    assert res_reboot["status"] == "rebooting"
+    assert res_reboot["method"] == "RPC2 magicBox.reboot"
+    assert any(c[1].get("method") == "magicBox.reboot" for c in calls)
+    assert any(c[1].get("method") == "global.logout" for c in calls)
+
 
 

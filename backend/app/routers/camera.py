@@ -92,6 +92,13 @@ def toggle_test_mode(req: TestModeRequest, user: str = Depends(get_current_user)
 def trigger_flash(req: FlashRequest, user: str = Depends(get_current_user)):
     return camera_service.trigger_flash(seconds=req.seconds)
 
+@router.post("/reboot")
+def reboot_camera(user: str = Depends(get_current_user)):
+    res = camera_service.reboot_camera()
+    if res.get("status") == "error":
+        raise HTTPException(status_code=502, detail=res.get("message", "Falha ao reiniciar câmera."))
+    return res
+
 @router.post("/snapshot")
 def take_snapshot(req: SnapshotRequest = SnapshotRequest(), user: str = Depends(get_current_user)):
     try:

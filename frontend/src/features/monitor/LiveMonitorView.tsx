@@ -18,6 +18,7 @@ import {
   FastForward,
   Radio,
   History,
+  Power,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -56,6 +57,8 @@ export function LiveMonitorView({
   const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [recordLoading, setRecordLoading] = useState(false);
   const [subtypeLoading, setSubtypeLoading] = useState(false);
+  const [rebootLoading, setRebootLoading] = useState(false);
+  const [rebootConfirm, setRebootConfirm] = useState(false);
   const [lastSnapshotUrl, setLastSnapshotUrl] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
 
@@ -260,6 +263,46 @@ export function LiveMonitorView({
       onRefreshStatus();
     } catch {
       // erro
+    }
+  };
+
+  const handleRebootCamera = async () => {
+    if (!rebootConfirm) {
+      setRebootConfirm(true);
+      setTimeout(() => setRebootConfirm(false), 4500);
+      return;
+    }
+    setRebootConfirm(false);
+    setRebootLoading(true);
+    setActionMessage(null);
+    try {
+      const res = await fetch('/api/camera/reboot', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const data = await safeParseJson(res);
+      if (res.ok) {
+        setActionMessage({
+          text:
+            data.message ||
+            'Câmera reiniciando! Ela voltará online automaticamente em ~35 segundos com WDR e áudio calibrados.',
+          type: 'success',
+        });
+        onRefreshStatus();
+        setTimeout(() => {
+          setStreamKey(Date.now());
+          onRefreshStatus();
+          setRebootLoading(false);
+        }, 36000);
+      } else {
+        throw new Error(data.detail || 'Falha ao enviar comando de reinicialização.');
+      }
+    } catch (err: any) {
+      setActionMessage({ text: err.message || 'Erro ao reiniciar câmera.', type: 'error' });
+      setRebootLoading(false);
     }
   };
 
@@ -1049,7 +1092,7 @@ export function LiveMonitorView({
       </div>
 
       {/* Barra de Ações Rápidas da Câmera */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2 sm:gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-9 gap-2 sm:gap-3">
         {/* Alternar Resolução 480p / 1080p */}
         <button
           onClick={() => handleChangeSubtype(currentSubtype === 0 ? 1 : 0)}
@@ -1125,6 +1168,23 @@ export function LiveMonitorView({
         >
           <RefreshCw className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-400 shrink-0" />
           <span className="truncate">Recarregar</span>
+        </button>
+
+        {/* Reiniciar Câmera (Hardware Reboot) */}
+        <button
+          onClick={handleRebootCamera}
+          disabled={rebootLoading}
+          className={`flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-2.5 sm:px-4 sm:py-3 rounded-lg border font-semibold text-[11px] sm:text-xs uppercase tracking-wider transition-all cursor-pointer min-h-[44px] disabled:opacity-40 ${
+            rebootConfirm
+              ? 'bg-red-600/30 border-red-400 text-red-200 animate-pulse shadow-[0_0_15px_rgba(239,68,68,0.3)]'
+              : 'bg-[#141A26] border-red-500/35 hover:border-red-400 hover:bg-red-950/40 text-red-300'
+          }`}
+          title="Reinicia o hardware da câmera remotamente sem precisar desligar da tomada (~35s para voltar)"
+        >
+          <Power className={`w-3.5 h-3.5 sm:w-4 sm:h-4 text-red-400 shrink-0 ${rebootLoading ? 'animate-spin' : ''}`} />
+          <span className="truncate">
+            {rebootLoading ? 'Reiniciando...' : rebootConfirm ? 'Confirmar?' : 'Reiniciar Cam'}
+          </span>
         </button>
 
         {/* Tela Cheia */}
