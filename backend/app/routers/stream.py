@@ -12,15 +12,20 @@ logger = logging.getLogger("x9.stream")
 
 router = APIRouter(prefix="/api/stream", tags=["stream"])
 
-# Cadeia de tratamento de áudio CFTV:
+# Cadeia de tratamento de áudio CFTV de longo alcance e alta clareza vocal:
 # - aresample=async=1000: corrige jitter de pacotes RTSP sem cortes
-# - highpass=f=150: remove ronco grave (vento, vibração, rede 60Hz)
-# - lowpass=f=3500: remove chiado agudo metálico de alta frequência, mantendo voz nítida
-# - afftdn=nf=-25: denoiser FFT em tempo real contra ruído estático de fundo (hiss)
-# - volume=0.85,alimiter=limit=0.80: ganho confortável sem estourar (clipping)
+# - highpass=f=180,lowpass=f=3800: isola a faixa da fala humana, removendo vento/grave (<180Hz) e chiado agudo (>3800Hz)
+# - afftdn=nr=18:nf=-30:tn=1: denoiser FFT com rastreamento contínuo de ruído (tn=1) para apagar o chiado de fundo sem abafar a voz
+# - equalizer=f=2400:t=q:w=1.2:g=5: realça consoantes da fala humana (+5dB em 2.4kHz) para inteligibilidade à distância
+# - acompressor=threshold=-28dB:ratio=3.5:attack=15:release=250:makeup=4: amplifica vozes distantes em até ~3.5x sem subir o ruído de fundo
+# - alimiter=limit=0.88: protege contra estalos/clipping quando alguém fala próximo à câmera
 CLEAN_AUDIO_FILTER = (
     "aresample=async=1000:min_hard_comp=0.100000:first_pts=0,"
-    "highpass=f=150,lowpass=f=3500,afftdn=nf=-25,volume=0.85,alimiter=limit=0.80"
+    "highpass=f=180,lowpass=f=3800,"
+    "afftdn=nr=18:nf=-30:tn=1,"
+    "equalizer=f=2400:t=q:w=1.2:g=5,"
+    "acompressor=threshold=-28dB:ratio=3.5:attack=15:release=250:makeup=4,"
+    "alimiter=limit=0.88"
 )
 
 async def frame_generator():

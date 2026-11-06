@@ -243,3 +243,66 @@ def test_yolo_annotations_drawn_on_1080p_frame_and_range_streaming(tmp_path):
     assert resp.status_code == 206
     assert resp.headers["Content-Range"] == "bytes 10-25/1600"
     assert len(resp.body) == 16
+
+
+def test_clean_audio_filter_and_camera_aac_16khz_rpc(monkeypatch):
+    from app.routers.stream import CLEAN_AUDIO_FILTER
+    from app.services.camera_service import camera_service
+
+    assert "highpass=f=180" in CLEAN_AUDIO_FILTER
+    assert "lowpass=f=3800" in CLEAN_AUDIO_FILTER
+    assert "afftdn=nr=18:nf=-30:tn=1" in CLEAN_AUDIO_FILTER
+    assert "equalizer=f=2400:t=q:w=1.2:g=5" in CLEAN_AUDIO_FILTER
+    assert "acompressor=threshold=-28dB:ratio=3.5:attack=15:release=250:makeup=4" in CLEAN_AUDIO_FILTER
+    assert "alimiter=limit=0.88" in CLEAN_AUDIO_FILTER
+
+    calls = []
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeSession:
+        def post(self, url, json=None, timeout=5.0):
+            calls.append((url, json))
+            method = (json or {}).get("method")
+            params = (json or {}).get("params") or {}
+            if method == "global.login" and not params.get("password"):
+                return FakeResp({"session": "sid123", "params": {"realm": "Login", "random": "999"}})
+            if method == "global.login" and params.get("password"):
+                return FakeResp({"result": True, "session": "sid123"})
+            if method == "configManager.getConfig" and params.get("name") == "AudioInputVolume":
+                return FakeResp({"result": True, "params": {"table": [80]}})
+            if method == "configManager.getConfig" and params.get("name") == "Encode":
+                return FakeResp({
+                    "result": True,
+                    "params": {
+                        "table": [
+                            {
+                                "MainFormat": [{"Audio": {"Compression": "G.711A", "Frequency": 8000}, "AudioEnable": True}],
+                                "ExtraFormat": [{"Audio": {"Compression": "G.711A", "Frequency": 8000}, "AudioEnable": True}],
+                            }
+                        ]
+                    },
+                })
+            return FakeResp({"result": True})
+
+    import requests
+    monkeypatch.setattr(requests, "Session", FakeSession)
+    ok = camera_service._ensure_optimal_camera_audio_rpc()
+    assert ok is True
+
+    set_encode_calls = [
+        c[1] for c in calls
+        if c[1].get("method") == "configManager.setConfig" and c[1].get("params", {}).get("name") == "Encode"
+    ]
+    assert len(set_encode_calls) == 1
+    updated_table = set_encode_calls[0]["params"]["table"]
+    assert updated_table[0]["MainFormat"][0]["Audio"]["Compression"] == "AAC"
+    assert updated_table[0]["MainFormat"][0]["Audio"]["Frequency"] == 16000
+    assert updated_table[0]["ExtraFormat"][0]["Audio"]["Compression"] == "AAC"
+    assert updated_table[0]["ExtraFormat"][0]["Audio"]["Frequency"] == 16000
+

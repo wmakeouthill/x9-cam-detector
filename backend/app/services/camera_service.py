@@ -204,6 +204,7 @@ class CameraService:
 
             self.status = "ONLINE"
             logger.info(f"[+] Conexão RTSP estabelecida com sucesso: {self.ip}")
+            threading.Thread(target=self._ensure_optimal_camera_audio_rpc, daemon=True).start()
 
             while self._running:
                 # Se a URL mudar em tempo de execução, reconecta
@@ -258,6 +259,92 @@ class CameraService:
             if self.latest_frame_jpeg is not None and (time.time() - self.last_frame_time) < 3.0:
                 return self.latest_frame_jpeg
             return self._placeholder_jpeg
+
+    def _ensure_optimal_camera_audio_rpc(self, timeout: float = 5.0) -> bool:
+        """
+        Garante que o hardware da câmera Intelbras capture áudio em AAC 16000Hz (16-bit)
+        com volume de microfone em 100%, substituindo o padrão telefônico G.711A 8000Hz (8-bit).
+        """
+        try:
+            s = requests.Session()
+            r1 = s.post(
+                f"http://{self.ip}:{self.http_port}/RPC2_Login",
+                json={
+                    "method": "global.login",
+                    "params": {"userName": self.user, "password": "", "clientType": "Web3.0", "loginType": "Direct"},
+                    "id": 1,
+                    "session": 0,
+                },
+                timeout=timeout,
+            )
+            d1 = r1.json()
+            sid = d1.get("session")
+            params = d1.get("params", {})
+            realm = params.get("realm")
+            random_nonce = params.get("random")
+            if not realm or not random_nonce:
+                return False
+
+            inner = hashlib.md5(f"{self.user}:{realm}:{self.password}".encode("utf-8")).hexdigest().upper()
+            final_pwd = hashlib.md5(f"{self.user}:{random_nonce}:{inner}".encode("utf-8")).hexdigest().upper()
+
+            r2 = s.post(
+                f"http://{self.ip}:{self.http_port}/RPC2_Login",
+                json={
+                    "method": "global.login",
+                    "params": {
+                        "userName": self.user,
+                        "password": final_pwd,
+                        "realm": realm,
+                        "random": random_nonce,
+                        "clientType": "Web3.0",
+                        "loginType": "Direct",
+                    },
+                    "id": 2,
+                    "session": sid,
+                },
+                timeout=timeout,
+            )
+            if not r2.json().get("result"):
+                return False
+
+            def _rpc(method, rpc_params=None):
+                return s.post(
+                    f"http://{self.ip}:{self.http_port}/RPC2",
+                    json={"method": method, "params": rpc_params or {}, "id": 10, "session": sid},
+                    timeout=timeout,
+                ).json()
+
+            # 1. Garante ganho do microfone em 100%
+            vol_cfg = _rpc("configManager.getConfig", {"name": "AudioInputVolume"})
+            if vol_cfg.get("result") and vol_cfg.get("params", {}).get("table") != [100]:
+                _rpc("configManager.setConfig", {"name": "AudioInputVolume", "table": [100]})
+
+            # 2. Garante codec AAC 16000Hz (16-bit) no MainFormat e ExtraFormat
+            enc_cfg = _rpc("configManager.getConfig", {"name": "Encode"})
+            if enc_cfg.get("result"):
+                table = enc_cfg["params"]["table"]
+                changed = False
+                for stream_group in ("MainFormat", "ExtraFormat"):
+                    formats = table[0].get(stream_group, [])
+                    if formats and isinstance(formats[0].get("Audio"), dict):
+                        audio = formats[0]["Audio"]
+                        if (
+                            audio.get("Compression") != "AAC"
+                            or audio.get("Frequency") != 16000
+                            or not formats[0].get("AudioEnable")
+                        ):
+                            audio["Compression"] = "AAC"
+                            audio["Frequency"] = 16000
+                            formats[0]["AudioEnable"] = True
+                            changed = True
+                if changed:
+                    _rpc("configManager.setConfig", {"name": "Encode", "table": table})
+                    logger.info("[Áudio Hardware] Câmera Intelbras configurada para AAC 16000Hz (16-bit) + Mic 100%.")
+            return True
+        except Exception as e:
+            logger.debug(f"[Áudio Hardware] Não foi possível verificar/ajustar AAC 16kHz via RPC2: {e}")
+            return False
 
     def _set_camera_lighting_rpc(self, on: bool = True, intensity: int = 100, timeout: float = 5.0) -> bool:
         """
