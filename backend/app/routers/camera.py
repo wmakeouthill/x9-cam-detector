@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -424,7 +425,6 @@ class DvrToggleRequest(BaseModel):
 
 @router.get("/dvr/status")
 def get_dvr_status(user: str = Depends(get_current_user)):
-    dvr_service.scan_local_segments()
     return dvr_service.get_status()
 
 @router.post("/dvr/toggle")
@@ -444,9 +444,8 @@ def get_dvr_segments(
     offset: int = 0,
     user: str = Depends(get_current_user),
 ):
-    dvr_service.scan_local_segments()
     if gdrive_service.is_configured:
-        gdrive_service.reconcile_dvr_from_drive()
+        threading.Thread(target=gdrive_service.reconcile_dvr_from_drive, daemon=True).start()
 
     items = list_dvr_segments(date_str=date, hour_str=hour, limit=limit, offset=offset)
     total = count_dvr_segments(date_str=date, hour_str=hour)
@@ -463,7 +462,6 @@ def seek_dvr_recording(
     target_time: str | None = Query(None),
     user: str = Depends(get_current_user),
 ):
-    dvr_service.scan_local_segments()
     res = find_dvr_segment_for_seek(seconds_ago=seconds_ago, target_time_str=target_time)
     if not res:
         return {
@@ -563,21 +561,32 @@ def _serve_video_with_range(request: Request, filepath: str | None = None, raw_b
 @router.get("/dvr/video/{filename}")
 def get_dvr_video(filename: str, request: Request, user: str = Depends(get_current_user)):
     safe_name = os.path.basename(filename)
-    for folder in ["recordings_24h", os.path.join("backend", "recordings_24h"), os.path.join("..", "recordings_24h")]:
+    search_dirs = [
+        dvr_service.recordings_dir,
+        "/tmp/x9_dvr_buffer",
+        "recordings_24h",
+        os.path.join("backend", "recordings_24h"),
+        os.path.join("..", "recordings_24h"),
+    ]
+    for folder in search_dirs:
+        if not folder:
+            continue
         candidate = os.path.join(folder, safe_name)
-        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+        if os.path.exists(candidate) and os.path.getsize(candidate) >= 16384:
             return _serve_video_with_range(request, filepath=candidate)
 
     if gdrive_service.is_configured:
         data = gdrive_service.get_dvr_file_bytes(safe_name)
         if data:
-            # Salva em cache no disco local para que todas as requisições Range subsequentes do player sejam instantâneas
+            # Salva em cache no buffer em RAM (dvr_service.recordings_dir) para que
+            # as requisições Range subsequentes sejam instantâneas sem tocar no disco D:
             cache_dir = dvr_service.recordings_dir
             os.makedirs(cache_dir, exist_ok=True)
             cache_path = os.path.join(cache_dir, safe_name)
             try:
                 with open(cache_path, "wb") as f:
                     f.write(data)
+                dvr_service._prune_ram_buffer()
                 return _serve_video_with_range(request, filepath=cache_path)
             except Exception:
                 return _serve_video_with_range(request, raw_bytes=data)

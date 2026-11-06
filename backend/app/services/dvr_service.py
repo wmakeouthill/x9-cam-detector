@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import tempfile
 import threading
 import subprocess
 import logging
@@ -22,19 +23,41 @@ from app.routers.stream import resolve_ffmpeg_bin, CLEAN_AUDIO_FILTER
 
 logger = logging.getLogger("x9.dvr")
 
+# Tamanho mínimo para considerar um MP4 DVR fechado como válido (evita stubs corrompidos de 28 bytes ftyp)
+MIN_VALID_SEGMENT_BYTES = 16 * 1024
+# Janela máxima de segmentos recentes mantidos em buffer RAM (/tmp/x9_dvr_buffer) após upload para o Drive
+RAM_CUSHION_MAX_SEGMENTS = 6
+
+
+def _resolve_dvr_buffer_dir() -> str:
+    """
+    Usa buffer efêmero em RAM (/tmp/x9_dvr_buffer no container Linux) para que
+    as gravações 24h NUNCA ocupem nem desgastem o Disco D: do host.
+    """
+    env_dir = os.getenv("DVR_BUFFER_DIR", "").strip()
+    if env_dir:
+        os.makedirs(env_dir, exist_ok=True)
+        return env_dir
+    if os.name != "nt":
+        ram_dir = "/tmp/x9_dvr_buffer"
+        os.makedirs(ram_dir, exist_ok=True)
+        return ram_dir
+    fallback = os.path.join(tempfile.gettempdir(), "x9_dvr_buffer")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
 
 class DvrService:
     """
-    Serviço de Gravação Contínua 24h (DVR em nuvem com retenção de 15 dias).
-    - Grava em blocos de 5 minutos (300s) em 1080p com áudio e marcações YOLO (PESSOA #ID).
-    - Usa MP4 fragmentado (frag_keyframe+empty_moov+default_base_moof) para permitir
-      seek instantâneo ("Voltar 30s / 1m / 5m") mesmo no arquivo que ainda está sendo gravado.
-    - Sincroniza cada bloco fechado para a subpasta exclusiva 'Gravacoes_24h' no Google Drive,
-      mantendo total isolamento da galeria de fotos e clipes de 10s.
+    Serviço de Gravação Contínua 24h (100% no Google Drive com retenção de 15 dias).
+    - Grava em blocos de 1 minuto (60s) em 1080p com áudio limpo e marcações YOLO (PESSOA #ID).
+    - Utiliza buffer efêmero em RAM (/tmp/x9_dvr_buffer) para nunca encher o disco local (D:).
+    - Assim que cada bloco fecha, aplica +faststart, envia para a subpasta 'Gravacoes_24h' no Google Drive
+      e remove os arquivos antigos do buffer temporário.
     """
 
     def __init__(self):
-        self.recordings_dir = "backend/recordings_24h" if os.path.exists("backend") else "recordings_24h"
+        self.recordings_dir = _resolve_dvr_buffer_dir()
         os.makedirs(self.recordings_dir, exist_ok=True)
 
         self._running = False
@@ -165,9 +188,11 @@ class DvrService:
             "-map", "0:v:0",
             "-map", "1:a:0?",
             "-c:v", "libx264",
-            "-preset", "ultrafast",
+            "-preset", "veryfast",
             "-tune", "zerolatency",
-            "-crf", "23",
+            "-crf", "27",
+            "-maxrate", "1800k",
+            "-bufsize", "3600k",
             "-pix_fmt", "yuv420p",
             "-g", str(fps * 2),
             "-keyint_min", str(fps),
@@ -281,7 +306,7 @@ class DvrService:
             time.sleep(1)
 
     def scan_local_segments(self):
-        """Varre o diretório recordings_24h e atualiza a tabela dvr_segments."""
+        """Varre o buffer temporário do DVR e atualiza a tabela dvr_segments."""
         if not os.path.exists(self.recordings_dir):
             return
 
@@ -310,15 +335,14 @@ class DvrService:
             except OSError:
                 continue
 
-            if size_bytes == 0:
-                continue
-
             start_dt = self._parse_filename_start(fname) or mtime_dt
             start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
             is_newest = (idx == total - 1)
             recently_modified = (now_dt - mtime_dt).total_seconds() < 15.0
 
             if is_newest and (self._is_recording or recently_modified):
+                if size_bytes == 0:
+                    continue
                 self.current_segment = fname
                 elapsed = max(1, int((now_dt - start_dt).total_seconds()))
                 upsert_dvr_segment(
@@ -330,6 +354,14 @@ class DvrService:
                     status="recording",
                 )
             else:
+                # Se um segmento fechado ficou com menos de 16 KB (ex: stub ftyp de 28 bytes), remove imediatamente
+                if size_bytes < MIN_VALID_SEGMENT_BYTES:
+                    try:
+                        os.remove(fpath)
+                    except OSError:
+                        pass
+                    continue
+
                 # Segmento já fechado: garante índice +faststart no cabeçalho para seek/play instantâneo no mobile
                 self._remux_faststart_if_needed(fpath, fname)
                 try:
@@ -397,17 +429,93 @@ class DvrService:
                 except Exception:
                     pass
 
-    def _sync_closed_segments_to_drive(self):
-        if not gdrive_service.is_configured:
+    def _prune_ram_buffer(self):
+        """
+        Mantém apenas os últimos RAM_CUSHION_MAX_SEGMENTS blocos já sincronizados no buffer RAM
+        para permitir o 'Voltar 15s / 30s / 1m / 5m' instantâneo sem consumir armazenamento local.
+        """
+        if not os.path.exists(self.recordings_dir):
+            return
+        try:
+            files = sorted([
+                f for f in os.listdir(self.recordings_dir)
+                if f.startswith("dvr_") and f.lower().endswith(".mp4")
+            ])
+        except Exception:
             return
 
-        segments = list_dvr_segments(limit=50)
+        if len(files) <= RAM_CUSHION_MAX_SEGMENTS:
+            return
+
+        # Consulta status no SQLite para só apagar do buffer o que já subiu para o Google Drive (ou se Drive não estiver ativo)
+        seg_map = {s["filename"]: s.get("status") for s in list_dvr_segments(limit=200)}
+        candidates_to_prune = files[:-RAM_CUSHION_MAX_SEGMENTS]
+        for fname in candidates_to_prune:
+            if fname == self.current_segment:
+                continue
+            status = seg_map.get(fname)
+            if status == "synced" or not gdrive_service.is_configured:
+                fpath = os.path.join(self.recordings_dir, fname)
+                try:
+                    os.remove(fpath)
+                    self._faststart_done.discard(fname)
+                except OSError:
+                    pass
+
+    def _migrate_legacy_disk_segments(self):
+        """
+        Se houver arquivos antigos na pasta legada recordings_24h do disco D:,
+        faz upload imediato para a subpasta Gravacoes_24h do Google Drive e apaga do disco local!
+        """
+        legacy_dirs = ["recordings_24h", os.path.join("backend", "recordings_24h"), os.path.join("..", "recordings_24h")]
+        for ldir in legacy_dirs:
+            if not os.path.exists(ldir):
+                continue
+            try:
+                if os.path.abspath(ldir) == os.path.abspath(self.recordings_dir):
+                    continue
+                entries = sorted([
+                    f for f in os.listdir(ldir)
+                    if f.startswith("dvr_") and f.lower().endswith(".mp4")
+                ])
+            except Exception:
+                continue
+
+            for fname in entries:
+                fpath = os.path.join(ldir, fname)
+                try:
+                    sz = os.path.getsize(fpath)
+                except OSError:
+                    continue
+                if sz < MIN_VALID_SEGMENT_BYTES:
+                    try:
+                        os.remove(fpath)
+                    except OSError:
+                        pass
+                    continue
+                if gdrive_service.is_configured:
+                    try:
+                        res = gdrive_service.upload_dvr_segment(fpath)
+                        if res and res.get("status") == "success":
+                            mark_dvr_segment_synced(fname, drive_file_id=res.get("file_id"))
+                            os.remove(fpath)
+                            logger.info(f"[DVR 24h] Bloco legado '{fname}' migrado para o Drive e removido do disco D:.")
+                    except Exception as e:
+                        logger.warning(f"[DVR 24h] Erro ao migrar bloco legado '{fname}': {e}")
+                        break
+
+    def _sync_closed_segments_to_drive(self):
+        if not gdrive_service.is_configured:
+            self._prune_ram_buffer()
+            return
+
+        segments = list_dvr_segments(limit=60)
         for seg in segments:
             if seg.get("status") != "local":
                 continue
             fname = seg["filename"]
             fpath = os.path.join(self.recordings_dir, fname)
-            if not os.path.exists(fpath) or os.path.getsize(fpath) == 0:
+            if not os.path.exists(fpath) or os.path.getsize(fpath) < MIN_VALID_SEGMENT_BYTES:
                 continue
             try:
                 res = gdrive_service.upload_dvr_segment(fpath)
@@ -417,12 +525,20 @@ class DvrService:
                 logger.warning(f"[DVR 24h] Falha ao sincronizar '{fname}' com Google Drive: {e}")
                 break
 
+        self._prune_ram_buffer()
+
     def _watcher_loop(self):
         time.sleep(2)
+        if gdrive_service.is_configured:
+            try:
+                gdrive_service.reconcile_dvr_from_drive(force=True)
+            except Exception:
+                pass
         while self._running:
             try:
                 self.scan_local_segments()
                 self._sync_closed_segments_to_drive()
+                self._migrate_legacy_disk_segments()
 
                 now_sec = time.time()
                 if now_sec - self._last_cleanup_time > 3600:

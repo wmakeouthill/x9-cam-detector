@@ -109,6 +109,16 @@ export function DvrRecordingsView() {
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
+  const safeParseJson = async (res: Response) => {
+    const text = await res.text();
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      return {};
+    }
+  };
+
   const fetchDvrStatus = useCallback(async () => {
     if (!token) return;
     try {
@@ -116,7 +126,7 @@ export function DvrRecordingsView() {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
-        const data = await res.json();
+        const data = await safeParseJson(res);
         setDvrStatus({
           enabled: data.enabled ?? true,
           recording: Boolean(data.recording),
@@ -133,9 +143,9 @@ export function DvrRecordingsView() {
   }, [token]);
 
   const fetchSegments = useCallback(
-    async (customOffset: number = offset) => {
+    async (customOffset: number = offset, silent: boolean = false) => {
       if (!token) return;
-      setLoading(true);
+      if (!silent) setLoading(true);
       try {
         const params = new URLSearchParams();
         if (selectedDate) params.set('date', selectedDate);
@@ -147,7 +157,7 @@ export function DvrRecordingsView() {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (res.ok) {
-          const data = await res.json();
+          const data = await safeParseJson(res);
           const items: DvrSegment[] = Array.isArray(data) ? data : data.items || [];
           const totalCount: number = typeof data.total === 'number' ? data.total : items.length;
           setSegments(items);
@@ -166,9 +176,11 @@ export function DvrRecordingsView() {
           });
         }
       } catch {
-        setFeedback({ text: 'Falha ao carregar blocos de gravação 24h.', type: 'error' });
+        if (!silent) {
+          setFeedback({ text: 'Falha ao carregar blocos de gravação 24h.', type: 'error' });
+        }
       } finally {
-        setLoading(false);
+        if (!silent) setLoading(false);
       }
     },
     [token, selectedDate, selectedHour, offset]
@@ -179,6 +191,7 @@ export function DvrRecordingsView() {
     fetchSegments(offset);
     const interval = setInterval(() => {
       fetchDvrStatus();
+      fetchSegments(offset, true);
     }, 10000);
     return () => clearInterval(interval);
   }, [fetchDvrStatus, fetchSegments, offset]);
@@ -197,7 +210,7 @@ export function DvrRecordingsView() {
         },
         body: JSON.stringify({ enabled: nextEnabled }),
       });
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (res.ok) {
         setDvrStatus((prev) => ({
           ...prev,
@@ -207,7 +220,7 @@ export function DvrRecordingsView() {
         setFeedback({
           text:
             (data.enabled ?? nextEnabled)
-              ? 'Gravador 24h ativado! Blocos de 5 min serão salvos e enviados para Gravacoes_24h.'
+              ? 'Gravador 24h ativado! Blocos de 1 min serão enviados para Gravacoes_24h no Google Drive.'
               : 'Gravador 24h pausado.',
           type: 'success',
         });
@@ -232,7 +245,7 @@ export function DvrRecordingsView() {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (res.ok && data.ok) {
         setFeedback({
           text: data.message || 'Sincronização com Google Drive (pasta Gravacoes_24h) iniciada!',
@@ -263,7 +276,7 @@ export function DvrRecordingsView() {
       });
       if (res.ok) {
         setFeedback({
-          text: `Bloco ${seg.filename} removido do disco e da nuvem.`,
+          text: `Bloco ${seg.filename} removido da nuvem.`,
           type: 'success',
         });
         if (activeSegment?.id === seg.id) {
@@ -272,7 +285,7 @@ export function DvrRecordingsView() {
         fetchSegments(offset);
         fetchDvrStatus();
       } else {
-        const data = await res.json().catch(() => ({}));
+        const data = await safeParseJson(res);
         throw new Error(data.detail || 'Não foi possível excluir este bloco.');
       }
     } catch (err: any) {

@@ -81,6 +81,16 @@ export function SnapshotsView() {
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
+  const safeParseJson = async (res: Response) => {
+    const text = await res.text();
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      return {};
+    }
+  };
+
   const fetchEvents = useCallback(
     async (pageToFetch: number = page) => {
       if (!token) return;
@@ -91,7 +101,7 @@ export function SnapshotsView() {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (res.ok) {
-          const data = await res.json();
+          const data = await safeParseJson(res);
           const items: DetectionEvent[] = Array.isArray(data) ? data : data.items || [];
           const totalCount: number = typeof data.total === 'number' ? data.total : items.length;
           setEvents(items);
@@ -154,7 +164,7 @@ export function SnapshotsView() {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (res.ok && data.ok) {
         setFeedback({
           text: data.message || 'Sincronização manual com o Google Drive iniciada!',
@@ -210,7 +220,7 @@ export function SnapshotsView() {
         });
         if (!res.ok) throw new Error('Falha ao excluir fotos em lote.');
 
-        const data = await res.json();
+        const data = await safeParseJson(res);
         setSelectedIds(new Set());
         setFeedback({
           text: `${data.deleted_count || idsToDelete.length} foto(s) excluída(s) com sucesso!`,

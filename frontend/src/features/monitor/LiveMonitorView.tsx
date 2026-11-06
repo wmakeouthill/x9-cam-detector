@@ -121,6 +121,16 @@ export function LiveMonitorView({
     onRefreshStatus();
   };
 
+  const safeParseJson = async (res: Response) => {
+    const text = await res.text();
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      return {};
+    }
+  };
+
   const handleChangeSubtype = async (newSubtype: number) => {
     if (subtypeLoading || currentSubtype === newSubtype) return;
     setSubtypeLoading(true);
@@ -134,7 +144,7 @@ export function LiveMonitorView({
         },
         body: JSON.stringify({ subtype: newSubtype }),
       });
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (res.ok) {
         setActionMessage({
           text: `Resolução alterada para ${data.name || (newSubtype === 0 ? '1080p FHD' : '480p Substream')}! Reconectando stream...`,
@@ -190,7 +200,7 @@ export function LiveMonitorView({
         },
         body: JSON.stringify({ with_flash: withFlash }),
       });
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (res.ok && data.url) {
         setLastSnapshotUrl(`${data.url}?token=${token}`);
         if (withFlash) {
@@ -221,7 +231,7 @@ export function LiveMonitorView({
         },
         body: JSON.stringify({ seconds: 10 }),
       });
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (res.ok) {
         setActionMessage({ text: 'Gravação iniciada! Vídeo de 10s será salvo e enviado ao Google Drive.', type: 'success' });
         setTimeout(() => {
@@ -404,7 +414,7 @@ export function LiveMonitorView({
           headers: { Authorization: `Bearer ${token}` },
         });
         if (!res.ok || !active) return;
-        const data = await res.json();
+        const data = await safeParseJson(res);
         if (data.found && data.url && data.segment) {
           const cleanUrl = `${data.url}?token=${token}`;
           cushionSegmentRef.current = {
@@ -469,7 +479,7 @@ export function LiveMonitorView({
       const res = await fetch(`/api/camera/dvr/seek?seconds_ago=${clampedSeconds}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (res.ok && data.found && data.url) {
         const targetOffset = typeof data.seek_offset === 'number' ? data.seek_offset : 0;
         const cleanUrl = `${data.url}?token=${token}`;
@@ -551,7 +561,7 @@ export function LiveMonitorView({
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
-        const data = await res.json();
+        const data = await safeParseJson(res);
         const items: any[] = Array.isArray(data) ? data : data.items || [];
         // Lista vem do mais recente para o mais antigo; o próximo cronológico está no índice anterior
         const currentIdx = items.findIndex((s) => s.filename === dvrSegmentInfo.filename);

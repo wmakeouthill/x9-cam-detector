@@ -16,6 +16,12 @@ def get_connection():
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+    except Exception:
+        pass
     return conn
 
 def init_db():
@@ -796,7 +802,12 @@ def find_dvr_segment_for_seek(seconds_ago: int = 30, target_time_str: str | None
 def _remove_local_dvr_file(filename: str):
     if not filename:
         return
-    for folder in ["recordings_24h", os.path.join("backend", "recordings_24h"), os.path.join("..", "recordings_24h")]:
+    for folder in [
+        "/tmp/x9_dvr_buffer",
+        "recordings_24h",
+        os.path.join("backend", "recordings_24h"),
+        os.path.join("..", "recordings_24h"),
+    ]:
         target = os.path.join(folder, filename)
         if os.path.exists(target):
             try:

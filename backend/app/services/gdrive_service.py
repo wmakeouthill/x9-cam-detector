@@ -61,8 +61,9 @@ class GoogleDriveService:
         # 1. Resgata qualquer arquivo órfão no banco ou disco
         self._reconcile_orphaned_files()
 
-        # 2. Reconcilia galeria diretamente com o Google Drive como fonte de verdade
+        # 2. Reconcilia galeria e DVR 24h diretamente com o Google Drive como fonte de verdade
         self.reconcile_events_from_drive(force=True)
+        self.reconcile_dvr_from_drive(force=True)
 
         # 3. Enfileira pendentes em memória
         self._enqueue_existing_pending()
@@ -827,18 +828,20 @@ class GoogleDriveService:
                 fname = finfo.get("name", "")
                 if not fname.lower().endswith(".mp4"):
                     continue
+                size_bytes = int(finfo.get("size") or 0)
+                if 0 < size_bytes < 16384:
+                    continue
                 start_ts = self._extract_timestamp(fname, finfo.get("createdTime"))
                 try:
                     start_dt = datetime.strptime(start_ts, "%Y-%m-%d %H:%M:%S")
-                    end_ts = (start_dt + timedelta(seconds=300)).strftime("%Y-%m-%d %H:%M:%S")
+                    end_ts = (start_dt + timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     end_ts = None
-                size_bytes = int(finfo.get("size") or 0)
                 upsert_dvr_segment(
                     filename=fname,
                     start_time=start_ts,
                     end_time=end_ts,
-                    duration_seconds=300,
+                    duration_seconds=60,
                     size_bytes=size_bytes,
                     status="synced",
                     drive_file_id=finfo.get("id"),
