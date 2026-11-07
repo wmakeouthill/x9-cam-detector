@@ -16,6 +16,8 @@ import {
   Sliders,
   Rewind,
   FastForward,
+  SkipBack,
+  SkipForward,
   Radio,
   History,
   Power,
@@ -94,7 +96,6 @@ export function LiveMonitorView({
   } | null>(null);
   const [dvrSeekOffset, setDvrSeekOffset] = useState<number>(0);
   const [dvrLoading, setDvrLoading] = useState<boolean>(false);
-  const [dvrSecondsAgo, setDvrSecondsAgo] = useState<number>(0);
   const dvrVideoRef = useRef<HTMLVideoElement | null>(null);
 
   // Controles de Tela Cheia e Hover / Overlay
@@ -491,6 +492,7 @@ export function LiveMonitorView({
   };
 
   // Busca ponto no passado no DVR 24h (Timeshift) com suporte a colchão pré-carregado
+  const [dvrJumpTime, setDvrJumpTime] = useState('');
   const cushionSegmentRef = useRef<{
     filename: string;
     url: string;
@@ -563,7 +565,6 @@ export function LiveMonitorView({
         videoEl.play().catch(() => {});
         setDvrSegmentInfo(cushionSegmentRef.current);
         setDvrSeekOffset(instantOffset);
-        setDvrSecondsAgo(clampedSeconds);
         setDvrMode(true);
         return;
       }
@@ -581,7 +582,6 @@ export function LiveMonitorView({
         const cleanUrl = `${data.url}?token=${token}`;
         setDvrSegmentInfo(data.segment || null);
         setDvrSeekOffset(targetOffset);
-        setDvrSecondsAgo(clampedSeconds);
         setDvrMode(true);
 
         if (dvrVideoUrl === cleanUrl && dvrVideoRef.current) {
@@ -609,6 +609,122 @@ export function LiveMonitorView({
     }
   };
 
+  const handleDvrJumpToTime = async (timeStr?: string) => {
+    const target = timeStr || dvrJumpTime;
+    if (!target || !token) return;
+    const today = new Date().toISOString().split('T')[0];
+    const fullTs = `${today} ${target}:00`;
+    setDvrLoading(true);
+    setActionMessage(null);
+    try {
+      const res = await fetch(`/api/camera/dvr/seek?target_time=${encodeURIComponent(fullTs)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await safeParseJson(res);
+      if (res.ok && data.found && data.url) {
+        const targetOffset = typeof data.seek_offset === 'number' ? data.seek_offset : 0;
+        const cleanUrl = `${data.url}?token=${token}`;
+        setDvrSegmentInfo(data.segment || null);
+        setDvrSeekOffset(targetOffset);
+        setDvrMode(true);
+        if (dvrVideoUrl === cleanUrl && dvrVideoRef.current) {
+          dvrVideoRef.current.currentTime = targetOffset;
+          dvrVideoRef.current.muted = false;
+          dvrVideoRef.current.play().catch(() => {});
+        } else {
+          setDvrVideoUrl(cleanUrl);
+        }
+        setActionMessage({
+          text: `Carregado gravação às ${target}`,
+          type: 'success',
+        });
+      } else {
+        setActionMessage({
+          text: data.message || `Nenhum vídeo gravado próximo das ${target}.`,
+          type: 'error',
+        });
+      }
+    } catch {
+      setActionMessage({
+        text: 'Erro ao buscar gravação pelo horário.',
+        type: 'error',
+      });
+    } finally {
+      setDvrLoading(false);
+    }
+  };
+
+  const handlePlayPreviousBlock = async () => {
+    if (!token || !dvrSegmentInfo) return;
+    setDvrLoading(true);
+    try {
+      const res = await fetch('/api/camera/dvr/segments?limit=50', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await safeParseJson(res);
+        const items: any[] = Array.isArray(data) ? data : data.items || [];
+        const currentIdx = items.findIndex((s) => s.filename === dvrSegmentInfo.filename);
+        if (currentIdx >= 0 && currentIdx + 1 < items.length) {
+          const prevSeg = items[currentIdx + 1];
+          const cleanUrl = `/api/camera/dvr/video/${prevSeg.filename}?token=${token}`;
+          setDvrSegmentInfo(prevSeg);
+          setDvrSeekOffset(0);
+          setDvrVideoUrl(cleanUrl);
+          setActionMessage({
+            text: `Bloco anterior carregado: ${prevSeg.start_time}`,
+            type: 'success',
+          });
+          return;
+        }
+      }
+    } catch {
+      // fallback
+    } finally {
+      setDvrLoading(false);
+    }
+    setActionMessage({
+      text: 'Nenhum bloco anterior disponível.',
+      type: 'error',
+    });
+  };
+
+  const handlePlayNextBlock = async () => {
+    if (!token || !dvrSegmentInfo) return;
+    setDvrLoading(true);
+    try {
+      const res = await fetch('/api/camera/dvr/segments?limit=50', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await safeParseJson(res);
+        const items: any[] = Array.isArray(data) ? data : data.items || [];
+        const currentIdx = items.findIndex((s) => s.filename === dvrSegmentInfo.filename);
+        if (currentIdx > 0) {
+          const nextSeg = items[currentIdx - 1];
+          const cleanUrl = `/api/camera/dvr/video/${nextSeg.filename}?token=${token}`;
+          setDvrSegmentInfo(nextSeg);
+          setDvrSeekOffset(0);
+          setDvrVideoUrl(cleanUrl);
+          setActionMessage({
+            text: `Próximo bloco carregado: ${nextSeg.start_time}`,
+            type: 'success',
+          });
+          return;
+        }
+      }
+    } catch {
+      // fallback
+    } finally {
+      setDvrLoading(false);
+    }
+    setActionMessage({
+      text: 'Replay alcançou o momento atual!',
+      type: 'success',
+    });
+    handleReturnToLive();
+  };
+
   // Avança ou retrocede dentro do modo DVR / Timeshift
   const handleSkipInDvr = (deltaSeconds: number) => {
     if (dvrMode && dvrVideoRef.current) {
@@ -616,19 +732,19 @@ export function LiveMonitorView({
       const targetTime = video.currentTime + deltaSeconds;
       const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Infinity;
 
-      if (targetTime >= 0 && targetTime <= duration) {
-        video.currentTime = targetTime;
-        setDvrSecondsAgo((prev) => Math.max(0, prev - deltaSeconds));
+      if (targetTime < 0) {
+        // Se tentou recuar além do início deste bloco, pula para o bloco anterior
+        handlePlayPreviousBlock();
         return;
       }
 
-      // Se tentou avançar além do fim do bloco atual e já está próximo do tempo real, volta ao Ao Vivo
-      const nextSecondsAgo = Math.max(0, (dvrSecondsAgo || 30) - deltaSeconds);
-      if (deltaSeconds > 0 && nextSecondsAgo <= 5) {
-        handleReturnToLive();
+      if (targetTime <= duration) {
+        video.currentTime = targetTime;
         return;
       }
-      handleSeekBack(Math.max(10, nextSecondsAgo));
+
+      // Se tentou avançar além do fim do bloco atual, avança para o próximo
+      handlePlayNextBlock();
     } else {
       handleSeekBack(Math.abs(deltaSeconds));
     }
@@ -643,40 +759,11 @@ export function LiveMonitorView({
     setDvrMode(false);
     setDvrSegmentInfo(null);
     setDvrSeekOffset(0);
-    setDvrSecondsAgo(0);
   };
 
   // Quando um segmento termina no modo Replay, avança para o próximo ou retorna ao Ao Vivo
   const handleDvrVideoEnded = async () => {
-    if (!token || !dvrSegmentInfo) {
-      handleReturnToLive();
-      return;
-    }
-    try {
-      const res = await fetch('/api/camera/dvr/segments?limit=30', {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (res.ok) {
-        const data = await safeParseJson(res);
-        const items: any[] = Array.isArray(data) ? data : data.items || [];
-        // Lista vem do mais recente para o mais antigo; o próximo cronológico está no índice anterior
-        const currentIdx = items.findIndex((s) => s.filename === dvrSegmentInfo.filename);
-        if (currentIdx > 0) {
-          const nextSeg = items[currentIdx - 1];
-          setDvrSegmentInfo(nextSeg);
-          setDvrSeekOffset(0);
-          setDvrVideoUrl(`/api/camera/dvr/video/${nextSeg.filename}?token=${token}`);
-          return;
-        }
-      }
-    } catch {
-      // fallback para ao vivo
-    }
-    setActionMessage({
-      text: 'Replay alcançou o tempo real — de volta à transmissão Ao Vivo!',
-      type: 'success',
-    });
-    handleReturnToLive();
+    await handlePlayNextBlock();
   };
 
   // Alterna ativação e mudo do áudio ao vivo
@@ -773,9 +860,18 @@ export function LiveMonitorView({
             muted={!dvrMode}
             playsInline
             preload="auto"
+            onError={() => {
+              setActionMessage({
+                text: 'Vídeo indisponível neste segundo. Carregando bloco anterior...',
+                type: 'error',
+              });
+              handlePlayPreviousBlock();
+            }}
             onLoadedMetadata={(e) => {
-              if (dvrMode && dvrSeekOffset > 0) {
-                e.currentTarget.currentTime = dvrSeekOffset;
+              if (dvrMode) {
+                if (dvrSeekOffset > 0) {
+                  e.currentTarget.currentTime = dvrSeekOffset;
+                }
                 e.currentTarget.muted = false;
                 e.currentTarget.play().catch(() => {});
               }
@@ -958,6 +1054,18 @@ export function LiveMonitorView({
 
           {/* Centro / Direita: Controles Rápidos de DVR Timeshift + Tela Cheia */}
           <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+            {dvrMode && (
+              <button
+                onClick={handlePlayPreviousBlock}
+                disabled={dvrLoading}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-black/85 hover:bg-cyan-950/80 border border-cyan-500/40 hover:border-cyan-400 text-cyan-300 text-[11px] font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+                title="Pular para o bloco anterior"
+              >
+                <SkipBack className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Bloco Anterior</span>
+              </button>
+            )}
+
             <button
               onClick={() => (dvrMode ? handleSkipInDvr(-15) : handleSeekBack(15))}
               disabled={dvrLoading}
@@ -990,6 +1098,14 @@ export function LiveMonitorView({
             >
               ⏪ -5m
             </button>
+            <button
+              onClick={() => (dvrMode ? handleSkipInDvr(-900) : handleSeekBack(900))}
+              disabled={dvrLoading}
+              className="px-2.5 py-1.5 rounded-lg bg-black/85 hover:bg-cyan-950/80 border border-cyan-500/40 hover:border-cyan-400 text-cyan-300 text-[11px] font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+              title="Voltar 15 minutos"
+            >
+              ⏪ -15m
+            </button>
 
             {dvrMode && (
               <>
@@ -1010,11 +1126,20 @@ export function LiveMonitorView({
                   ⏩ +30s
                 </button>
                 <button
+                  onClick={handlePlayNextBlock}
+                  disabled={dvrLoading}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-black/85 hover:bg-emerald-950/80 border border-emerald-500/40 hover:border-emerald-400 text-emerald-300 text-[11px] font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+                  title="Pular para o próximo bloco"
+                >
+                  <span>Próximo Bloco</span>
+                  <SkipForward className="w-3.5 h-3.5 text-emerald-400" />
+                </button>
+                <button
                   onClick={handleReturnToLive}
                   className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white border border-red-400 text-[11px] font-mono font-bold transition-all cursor-pointer shadow-[0_0_12px_rgba(239,68,68,0.5)]"
                   title="Voltar ao Ao Vivo"
                 >
-                  🔴 Voltar ao Ao Vivo
+                  🔴 Ao Vivo
                 </button>
               </>
             )}
@@ -1076,6 +1201,18 @@ export function LiveMonitorView({
         </div>
 
         <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+          {dvrMode && (
+            <button
+              onClick={handlePlayPreviousBlock}
+              disabled={dvrLoading}
+              className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/40 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+              title="Pular para o bloco anterior"
+            >
+              <SkipBack className="w-3.5 h-3.5 text-cyan-400" />
+              <span>Bloco Anterior</span>
+            </button>
+          )}
+
           <button
             onClick={() => (dvrMode ? handleSkipInDvr(-15) : handleSeekBack(15))}
             disabled={dvrLoading}
@@ -1112,6 +1249,51 @@ export function LiveMonitorView({
             <span>-5 min</span>
           </button>
 
+          <button
+            onClick={() => (dvrMode ? handleSkipInDvr(-900) : handleSeekBack(900))}
+            disabled={dvrLoading}
+            className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+          >
+            <Rewind className="w-3.5 h-3.5 text-cyan-400" />
+            <span>-15 min</span>
+          </button>
+
+          <button
+            onClick={() => (dvrMode ? handleSkipInDvr(-1800) : handleSeekBack(1800))}
+            disabled={dvrLoading}
+            className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+          >
+            <Rewind className="w-3.5 h-3.5 text-cyan-400" />
+            <span>-30 min</span>
+          </button>
+
+          <button
+            onClick={() => (dvrMode ? handleSkipInDvr(-3600) : handleSeekBack(3600))}
+            disabled={dvrLoading}
+            className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+          >
+            <Rewind className="w-3.5 h-3.5 text-cyan-400" />
+            <span>-1 hora</span>
+          </button>
+
+          {/* Campo de Pulo Direto por Horário */}
+          <div className="flex items-center gap-1.5 pl-2 border-l border-zinc-700/80">
+            <span className="text-[10px] font-mono text-zinc-400">Ir para:</span>
+            <input
+              type="time"
+              value={dvrJumpTime}
+              onChange={(e) => setDvrJumpTime(e.target.value)}
+              className="bg-[#0E131C] border border-zinc-700 rounded px-1.5 py-1 text-xs text-zinc-100 font-mono focus:border-cyan-500 focus:outline-none"
+            />
+            <button
+              onClick={() => handleDvrJumpToTime()}
+              disabled={!dvrJumpTime || dvrLoading}
+              className="px-2.5 py-1 rounded text-xs font-mono bg-cyan-500 hover:bg-cyan-400 text-black font-bold disabled:opacity-40 cursor-pointer"
+            >
+              Pular
+            </button>
+          </div>
+
           {dvrMode && (
             <>
               <button
@@ -1130,6 +1312,16 @@ export function LiveMonitorView({
               >
                 <FastForward className="w-3.5 h-3.5 text-emerald-400" />
                 <span>+30s</span>
+              </button>
+
+              <button
+                onClick={handlePlayNextBlock}
+                disabled={dvrLoading}
+                className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/40 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer disabled:opacity-40"
+                title="Pular para o próximo bloco"
+              >
+                <span>Próximo Bloco</span>
+                <SkipForward className="w-3.5 h-3.5 text-emerald-400" />
               </button>
 
               <button

@@ -25,6 +25,7 @@ from app.db import (
     list_dvr_segments,
     count_dvr_segments,
     list_dvr_available_dates,
+    list_dvr_hours_summary,
     find_dvr_segment_for_seek,
     delete_dvr_segment,
 )
@@ -509,6 +510,22 @@ def get_dvr_segments(
         "available_dates": available_dates,
     }
 
+@router.get("/dvr/hours")
+def get_dvr_hours(
+    date: str | None = Query(None, description="Filtro de data YYYY-MM-DD"),
+    user: str = Depends(get_current_user),
+):
+    """
+    Retorna a lista das 24 horas do dia selecionado de forma agrupada e consolidada.
+    Permite à interface exibir cada hora como uma unidade ('HORA TODA') com régua de minutos.
+    """
+    target_date = date or get_now().strftime("%Y-%m-%d")
+    hours = list_dvr_hours_summary(date_str=target_date)
+    return {
+        "date": target_date,
+        "hours": hours,
+    }
+
 @router.get("/dvr/seek")
 def seek_dvr_recording(
     seconds_ago: int = Query(30, ge=1),
@@ -529,12 +546,19 @@ def seek_dvr_recording(
         "url": f"/api/camera/dvr/video/{seg['filename']}",
     }
 
-def _serve_video_with_range(request: Request, filepath: str | None = None, raw_bytes: bytes | None = None) -> Response:
+def _serve_video_with_range(
+    request: Request,
+    filepath: str | None = None,
+    raw_bytes: bytes | None = None,
+    is_recording: bool = False,
+) -> Response:
     """
     Serve vídeo MP4 com suporte a HTTP Range (206 Partial Content) otimizado para mobile:
     - Limita respostas de Range aberto (ex: 'bytes=0-') a chunks de 1 MB para início imediato do play.
     - Evita carregar dezenas de MB na RAM de uma só vez.
+    - Segmentos ativos em gravação recebem no-cache para evitar freeze no player do celular.
     """
+    cache_control = "no-cache, no-store, must-revalidate" if is_recording else "private, max-age=3600"
     MAX_RANGE_CHUNK = 1024 * 1024  # 1 MB por janela para streaming mobile instantâneo
     range_header = request.headers.get("range")
     if filepath and os.path.exists(filepath):
@@ -545,7 +569,7 @@ def _serve_video_with_range(request: Request, filepath: str | None = None, raw_b
                 media_type="video/mp4",
                 headers={
                     "Accept-Ranges": "bytes",
-                    "Cache-Control": "private, max-age=3600",
+                    "Cache-Control": cache_control,
                 },
             )
         try:
@@ -570,7 +594,7 @@ def _serve_video_with_range(request: Request, filepath: str | None = None, raw_b
                     "Content-Range": f"bytes {start}-{end}/{file_size}",
                     "Accept-Ranges": "bytes",
                     "Content-Length": str(len(data)),
-                    "Cache-Control": "private, max-age=3600",
+                    "Cache-Control": cache_control,
                 },
             )
         except Exception:
@@ -598,7 +622,7 @@ def _serve_video_with_range(request: Request, filepath: str | None = None, raw_b
                         "Content-Range": f"bytes {start}-{end}/{total_size}",
                         "Accept-Ranges": "bytes",
                         "Content-Length": str(len(chunk)),
-                        "Cache-Control": "private, max-age=3600",
+                        "Cache-Control": cache_control,
                     },
                 )
             except Exception:
@@ -606,7 +630,7 @@ def _serve_video_with_range(request: Request, filepath: str | None = None, raw_b
         return Response(
             content=raw_bytes,
             media_type="video/mp4",
-            headers={"Accept-Ranges": "bytes"},
+            headers={"Accept-Ranges": "bytes", "Cache-Control": cache_control},
         )
 
     raise HTTPException(status_code=404, detail="Segmento DVR não encontrado")
@@ -614,6 +638,7 @@ def _serve_video_with_range(request: Request, filepath: str | None = None, raw_b
 @router.get("/dvr/video/{filename}")
 def get_dvr_video(filename: str, request: Request, user: str = Depends(get_current_user)):
     safe_name = os.path.basename(filename)
+    is_active = (safe_name == dvr_service.current_segment)
     search_dirs = [
         dvr_service.recordings_dir,
         "/tmp/x9_dvr_buffer",
@@ -626,7 +651,7 @@ def get_dvr_video(filename: str, request: Request, user: str = Depends(get_curre
             continue
         candidate = os.path.join(folder, safe_name)
         if os.path.exists(candidate) and os.path.getsize(candidate) >= 16384:
-            return _serve_video_with_range(request, filepath=candidate)
+            return _serve_video_with_range(request, filepath=candidate, is_recording=is_active)
 
     if gdrive_service.is_configured:
         data = gdrive_service.get_dvr_file_bytes(safe_name)
@@ -640,9 +665,9 @@ def get_dvr_video(filename: str, request: Request, user: str = Depends(get_curre
                 with open(cache_path, "wb") as f:
                     f.write(data)
                 dvr_service._prune_ram_buffer()
-                return _serve_video_with_range(request, filepath=cache_path)
+                return _serve_video_with_range(request, filepath=cache_path, is_recording=False)
             except Exception:
-                return _serve_video_with_range(request, raw_bytes=data)
+                return _serve_video_with_range(request, raw_bytes=data, is_recording=False)
 
     raise HTTPException(status_code=404, detail="Gravação 24h não encontrada")
 

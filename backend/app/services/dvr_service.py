@@ -91,6 +91,21 @@ class DvrService:
         os.makedirs(self.recordings_dir, exist_ok=True)
         self._load_config()
 
+        # Limpa eventuais segmentos órfãos que ficaram com status 'recording' após reinício
+        try:
+            from app.db import get_connection
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE dvr_segments 
+                SET status = 'failed' 
+                WHERE status = 'recording' AND drive_file_id IS NULL
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"[DVR 24h] Aviso ao limpar status 'recording' órfãos na inicialização: {e}")
+
         # Garante captura em 1080p (subtype 0) quando DVR 24h está ativo
         if self.enabled and self.subtype == 0 and camera_service.subtype != 0:
             camera_service.subtype = 0

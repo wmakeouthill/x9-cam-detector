@@ -30,6 +30,7 @@ from app.db.db import (
     list_dvr_segments,
     count_dvr_segments,
     list_dvr_available_dates,
+    list_dvr_hours_summary,
     find_dvr_segment_for_seek,
     delete_dvr_segment,
     cleanup_dvr_retention,

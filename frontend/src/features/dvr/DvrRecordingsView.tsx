@@ -19,8 +19,22 @@ import {
   ShieldCheck,
   AlertTriangle,
   FolderArchive,
+  ChevronDown,
+  ChevronUp,
+  Layers,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
+
+export interface DvrHourSummary {
+  hour: string;
+  total_blocks: number;
+  total_duration: number;
+  total_bytes: number;
+  first_block_start: string;
+  last_block_start: string;
+  has_drive: number;
+  is_recording: number;
+}
 
 export interface DvrSegment {
   id: number;
@@ -93,6 +107,8 @@ export function DvrRecordingsView() {
   });
 
   const [segments, setSegments] = useState<DvrSegment[]>([]);
+  const [hoursSummary, setHoursSummary] = useState<DvrHourSummary[]>([]);
+  const [showDetailedBlocks, setShowDetailedBlocks] = useState<boolean>(false);
   const [total, setTotal] = useState<number>(0);
   const [availableDates, setAvailableDates] = useState<string[]>([]);
   const [selectedDate, setSelectedDate] = useState<string>('');
@@ -139,10 +155,14 @@ export function DvrRecordingsView() {
     }
   };
 
-  const handleJumpToTime = async () => {
-    if (!jumpTime || !token) return;
-    const targetDate = selectedDate || new Date().toISOString().split('T')[0];
-    const targetTimestamp = `${targetDate} ${jumpTime}:00`;
+  const handleJumpToTime = async (customTs?: string) => {
+    if (!token) return;
+    const targetDate = selectedDate || (availableDates[0] || new Date().toISOString().split('T')[0]);
+    let targetTimestamp = customTs;
+    if (!targetTimestamp) {
+      if (!jumpTime) return;
+      targetTimestamp = `${targetDate} ${jumpTime}:00`;
+    }
     try {
       const res = await fetch(`/api/camera/dvr/seek?target_time=${encodeURIComponent(targetTimestamp)}`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -157,14 +177,46 @@ export function DvrRecordingsView() {
             videoRef.current.play().catch(() => {});
           }
         }, 200);
-        setFeedback({ text: `Carregado: bloco de ${data.segment.start_time} no horário ${jumpTime}.`, type: 'success' });
+        const display = targetTimestamp.length >= 16 ? targetTimestamp.substring(11, 16) : targetTimestamp;
+        setFeedback({ text: `Carregado: bloco gravado das ${display} (${data.segment.filename}).`, type: 'success' });
       } else {
-        setFeedback({ text: data.message || `Nenhum bloco encontrado próximo das ${jumpTime}.`, type: 'error' });
+        setFeedback({ text: data.message || `Nenhum vídeo gravado encontrado próximo das ${targetTimestamp}.`, type: 'error' });
       }
     } catch {
       setFeedback({ text: 'Erro ao buscar gravação pelo horário informado.', type: 'error' });
     }
   };
+
+  const handleRulerMinuteClick = (minute: number) => {
+    const minStr = String(minute).padStart(2, '0');
+    const hrStr = selectedHour || (activeSegment?.start_time ? activeSegment.start_time.substring(11, 13) : '00');
+    const targetDate = selectedDate || (activeSegment?.start_time ? activeSegment.start_time.substring(0, 10) : new Date().toISOString().split('T')[0]);
+    const targetTs = `${targetDate} ${hrStr}:${minStr}:00`;
+    handleJumpToTime(targetTs);
+  };
+
+  const handleSelectHour = (hr: string) => {
+    setSelectedHour(hr);
+    setOffset(0);
+    const targetDate = selectedDate || (availableDates[0] || new Date().toISOString().split('T')[0]);
+    handleJumpToTime(`${targetDate} ${hr}:00:00`);
+  };
+
+  const fetchHoursSummary = useCallback(async () => {
+    if (!token) return;
+    try {
+      const targetDate = selectedDate || (availableDates[0] || new Date().toISOString().split('T')[0]);
+      const res = await fetch(`/api/camera/dvr/hours?date=${encodeURIComponent(targetDate)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await safeParseJson(res);
+        setHoursSummary(data.hours || []);
+      }
+    } catch {
+      // ignora
+    }
+  }, [token, selectedDate, availableDates]);
 
   const fetchDvrStatus = useCallback(async () => {
     if (!token) return;
@@ -236,12 +288,14 @@ export function DvrRecordingsView() {
   useEffect(() => {
     fetchDvrStatus();
     fetchSegments(offset);
+    fetchHoursSummary();
     const interval = setInterval(() => {
       fetchDvrStatus();
       fetchSegments(offset, true);
+      fetchHoursSummary();
     }, 10000);
     return () => clearInterval(interval);
-  }, [fetchDvrStatus, fetchSegments, offset]);
+  }, [fetchDvrStatus, fetchSegments, fetchHoursSummary, offset]);
 
   const handleToggleDvr = async () => {
     if (!token || toggling) return;
@@ -676,7 +730,7 @@ export function DvrRecordingsView() {
                     className="bg-[#0E131C] border border-zinc-700 rounded px-1.5 py-0.5 text-xs text-zinc-100 font-mono focus:border-cyan-500 focus:outline-none"
                   />
                   <button
-                    onClick={handleJumpToTime}
+                    onClick={() => handleJumpToTime()}
                     disabled={!jumpTime}
                     className="px-2.5 py-0.5 rounded text-xs font-mono bg-cyan-500 hover:bg-cyan-400 text-black font-bold disabled:opacity-40 cursor-pointer"
                   >
@@ -685,12 +739,37 @@ export function DvrRecordingsView() {
                 </div>
               </div>
             </div>
+
+            {/* Régua da Hora Completa (00 a 59 min) */}
+            <div className="p-3 rounded-xl bg-[#101622] border border-cyan-500/30 space-y-2">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-xs font-mono">
+                <span className="text-cyan-300 font-bold flex items-center gap-1.5">
+                  <Clock className="w-3.5 h-3.5 text-cyan-400" />
+                  RÉGUA DA HORA COMPLETA ({selectedHour ? `${selectedHour}h` : (activeSegment?.start_time ? activeSegment.start_time.substring(11, 13) + 'h' : 'Hora Selecionada')} — 00 a 59 min):
+                </span>
+                <span className="text-[11px] text-slate-400">
+                  Clique no minuto para pular diretamente naquele ponto da hora
+                </span>
+              </div>
+              <div className="grid grid-cols-6 sm:grid-cols-12 gap-1.5">
+                {[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55].map((min) => (
+                  <button
+                    key={min}
+                    onClick={() => handleRulerMinuteClick(min)}
+                    className="px-2 py-1.5 rounded bg-[#161D2B] hover:bg-cyan-500/25 border border-slate-700 hover:border-cyan-400 text-slate-300 hover:text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer text-center"
+                    title={`Pular para ${String(min).padStart(2, '0')} min`}
+                  >
+                    :{String(min).padStart(2, '0')}
+                  </button>
+                ))}
+              </div>
+            </div>
           </>
         ) : (
           <div className="p-8 text-center border border-dashed border-slate-800 rounded-xl bg-[#090C12]">
             <Film className="w-10 h-10 text-slate-600 mx-auto mb-2" />
             <p className="text-xs font-mono text-slate-400">
-              Nenhum bloco selecionado ou o primeiro segmento de 5 minutos ainda está sendo gravado.
+              Nenhum bloco selecionado ou o primeiro segmento ainda está sendo gravado.
             </p>
           </div>
         )}
@@ -708,6 +787,7 @@ export function DvrRecordingsView() {
             <button
               onClick={() => {
                 setSelectedDate('');
+                setSelectedHour('');
                 setOffset(0);
               }}
               className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold transition-all cursor-pointer border ${
@@ -716,7 +796,7 @@ export function DvrRecordingsView() {
                   : 'bg-[#141A26] border-slate-700 text-slate-400 hover:text-slate-200'
               }`}
             >
-              Todas as Datas
+              Hoje (Mais Recente)
             </button>
 
             {availableDates.map((d) => (
@@ -724,6 +804,7 @@ export function DvrRecordingsView() {
                 key={d}
                 onClick={() => {
                   setSelectedDate(d);
+                  setSelectedHour('');
                   setOffset(0);
                 }}
                 className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold transition-all cursor-pointer border ${
@@ -763,8 +844,7 @@ export function DvrRecordingsView() {
               <button
                 key={hr}
                 onClick={() => {
-                  setSelectedHour(hr);
-                  setOffset(0);
+                  handleSelectHour(hr);
                 }}
                 className={`px-2 py-1 rounded-lg text-[11px] font-mono font-bold transition-all cursor-pointer border ${
                   selectedHour === hr
@@ -779,99 +859,189 @@ export function DvrRecordingsView() {
         </div>
       </div>
 
-      {/* Grid de Blocos de Gravação 24h */}
-      {segments.length === 0 ? (
-        <div className="p-10 text-center border border-dashed border-slate-800 rounded-2xl bg-[#0B0E15]">
-          <Film className="w-12 h-12 text-slate-600 mx-auto mb-3" />
-          <p className="text-sm font-semibold text-slate-300 font-mono">
-            Nenhum bloco de gravação 24h encontrado para este filtro
-          </p>
-          <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto font-mono">
-            O gravador contínuo salva segmentos de 5 minutos com vídeo 1080p, áudio e detecções YOLO, mantendo os últimos{' '}
-            {dvrStatus.retention_days} dias sincronizados na pasta {dvrStatus.gdrive_folder_name}.
-          </p>
+      {/* SEÇÃO PRINCIPAL: Visão Consolidada por Hora Cheia (A HORA TODA) */}
+      <div className="space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Clock className="w-4 h-4 text-cyan-400" />
+            <h3 className="text-sm font-bold font-['Chakra_Petch'] uppercase tracking-wider text-slate-200">
+              Gravações por Hora Cheia (Dia {formatBRDateOnly(selectedDate || availableDates[0] || 'Hoje')})
+            </h3>
+          </div>
+          <span className="text-[11px] font-mono text-slate-400">
+            {hoursSummary.length > 0 ? `${hoursSummary.length} horas gravadas neste dia` : 'Carregando horas...'}
+          </span>
         </div>
-      ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
-          {segments.map((seg) => {
-            const isSelected = activeSegment?.id === seg.id;
-            const sizeMb = seg.size_bytes ? (seg.size_bytes / (1024 * 1024)).toFixed(1) : '0.0';
-            const isRecordingNow = seg.status === 'recording';
-            const isSynced = seg.status === 'synced' || Boolean(seg.drive_file_id || seg.gdrive_file_id);
 
-            return (
-              <div
-                key={seg.id}
-                onClick={() => setActiveSegment(seg)}
-                className={`bg-[#0D111A] border rounded-xl p-3.5 transition-all cursor-pointer flex flex-col justify-between gap-3 relative ${
-                  isSelected
-                    ? 'border-emerald-500/90 ring-1 ring-emerald-500/40 shadow-[0_0_20px_rgba(16,185,129,0.2)] bg-[#101824]'
-                    : 'border-slate-800/90 hover:border-cyan-500/50 hover:bg-[#111724]'
-                }`}
-              >
-                {/* Topo do Card: Status Badge + Botão Excluir */}
-                <div className="flex items-center justify-between gap-2">
-                  {isRecordingNow ? (
-                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-red-500/20 border border-red-500/50 text-red-300 text-[10px] font-mono font-bold animate-pulse">
-                      <Radio className="w-3 h-3 text-red-400" />
-                      GRAVANDO AGORA
-                    </span>
-                  ) : isSynced ? (
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-[10px] font-mono font-bold">
-                      <Cloud className="w-3 h-3 text-emerald-400" />
-                      NUVEM DRIVE (Gravacoes_24h)
-                    </span>
-                  ) : (
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300 text-[10px] font-mono font-bold">
-                      <HardDrive className="w-3 h-3 text-cyan-400" />
-                      DISCO LOCAL
-                    </span>
-                  )}
+        {hoursSummary.length === 0 ? (
+          <div className="p-8 text-center border border-dashed border-slate-800 rounded-2xl bg-[#0B0E15]">
+            <Film className="w-10 h-10 text-slate-600 mx-auto mb-2" />
+            <p className="text-xs font-mono text-slate-400">
+              Nenhuma gravação encontrada para a data selecionada.
+            </p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+            {hoursSummary.map((h) => {
+              const isSelected = selectedHour === h.hour;
+              const nextHourStr = h.hour === '23' ? '00' : String(Number(h.hour) + 1).padStart(2, '0');
+              const durationMin = Math.round(h.total_duration / 60);
+              const sizeMb = (h.total_bytes / (1024 * 1024)).toFixed(1);
 
-                  {!isRecordingNow && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDeleteSegment(seg);
-                      }}
-                      disabled={deletingId === seg.id}
-                      title="Excluir este bloco de gravação"
-                      className="p-1.5 rounded-lg bg-black/60 hover:bg-red-500/20 text-zinc-400 hover:text-red-400 border border-zinc-800 hover:border-red-500/40 transition-colors cursor-pointer"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                </div>
-
-                {/* Horários de Início e Fim */}
-                <div className="space-y-1 font-mono">
-                  <div className="text-xs font-bold text-slate-100 flex items-center gap-1.5">
-                    <Play className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-emerald-400' : 'text-cyan-400'}`} />
-                    <span>{formatBRDateTime(seg.start_time)}</span>
-                  </div>
-                  <div className="text-[11px] text-slate-400 pl-5">
-                    Até: {seg.end_time ? formatBRDateTime(seg.end_time) : 'Gravando em tempo real...'}
-                  </div>
-                </div>
-
-                {/* Rodapé com Duração, Tamanho em MB e Ação */}
-                <div className="pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-[11px] font-mono text-slate-400">
-                  <div className="flex items-center gap-2">
-                    <span className="px-1.5 py-0.5 rounded bg-[#141A26] border border-slate-800 text-cyan-300">
-                      {formatDurationLabel(seg.duration_seconds, seg.status)}
+              return (
+                <div
+                  key={h.hour}
+                  onClick={() => handleSelectHour(h.hour)}
+                  className={`bg-[#0D111A] border rounded-xl p-3.5 transition-all cursor-pointer flex flex-col justify-between gap-3 relative ${
+                    isSelected
+                      ? 'border-cyan-400 ring-1 ring-cyan-400/50 shadow-[0_0_20px_rgba(6,182,212,0.25)] bg-[#101824]'
+                      : 'border-slate-800/90 hover:border-cyan-500/60 hover:bg-[#111724]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-mono font-bold text-slate-100 flex items-center gap-1.5">
+                      <Play className={`w-3.5 h-3.5 ${isSelected ? 'text-cyan-400' : 'text-slate-400'}`} />
+                      <span>{h.hour}:00 às {nextHourStr}:00</span>
                     </span>
-                    <span>{sizeMb} MB</span>
+
+                    {h.is_recording ? (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-red-500/20 text-red-300 border border-red-500/40 text-[10px] font-mono font-bold animate-pulse">
+                        <Radio className="w-2.5 h-2.5 text-red-400" />
+                        AO VIVO
+                      </span>
+                    ) : h.has_drive ? (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[10px] font-mono font-semibold">
+                        <Cloud className="w-2.5 h-2.5 text-emerald-400" />
+                        Nuvem Drive
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 text-[10px] font-mono">
+                        <HardDrive className="w-2.5 h-2.5 text-cyan-400" />
+                        Local
+                      </span>
+                    )}
                   </div>
 
-                  <span className={`font-bold ${isSelected ? 'text-emerald-400' : 'text-cyan-400'}`}>
-                    {isSelected ? '▶ Tocando' : 'Assistir'}
-                  </span>
+                  <div className="space-y-1 font-mono text-[11px] text-slate-400">
+                    <div className="flex items-center justify-between">
+                      <span>Duração Gravada:</span>
+                      <b className="text-cyan-300 font-bold">{durationMin} min ({Math.min(100, Math.round((durationMin / 60) * 100))}%)</b>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span>Blocos de Vídeo:</span>
+                      <span className="text-slate-200">{h.total_blocks} blocos ({sizeMb} MB)</span>
+                    </div>
+                  </div>
+
+                  <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs font-mono">
+                    <span className="text-[10px] text-slate-500">
+                      Início: {h.first_block_start ? h.first_block_start.substring(11, 16) : ''}
+                    </span>
+                    <span className={`font-bold ${isSelected ? 'text-cyan-300' : 'text-slate-300 hover:text-cyan-300'}`}>
+                      {isSelected ? '▶ Em Reprodução' : 'Assistir Hora'}
+                    </span>
+                  </div>
                 </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Seção Opcional: Detalhes dos Blocos Individuais Minuto a Minuto */}
+      <div className="pt-4 border-t border-slate-800/80 space-y-3">
+        <button
+          onClick={() => setShowDetailedBlocks(!showDetailedBlocks)}
+          className="flex items-center gap-2 text-xs font-mono text-cyan-400 hover:text-cyan-300 cursor-pointer bg-[#0D111A] px-3 py-2 rounded-lg border border-slate-800 hover:border-cyan-500/40 transition-all"
+        >
+          <Layers className="w-4 h-4 text-cyan-400" />
+          <span>
+            {showDetailedBlocks
+              ? 'Ocultar blocos individuais minuto a minuto'
+              : `Ver blocos individuais deste horário (${segments.length} blocos disponíveis para download/exclusão)`}
+          </span>
+          {showDetailedBlocks ? <ChevronUp className="w-4 h-4 ml-1" /> : <ChevronDown className="w-4 h-4 ml-1" />}
+        </button>
+
+        {showDetailedBlocks && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4 pt-2">
+            {segments.map((seg) => {
+              const isSelected = activeSegment?.id === seg.id;
+              const sizeMb = seg.size_bytes ? (seg.size_bytes / (1024 * 1024)).toFixed(1) : '0.0';
+              const isRecordingNow = seg.status === 'recording';
+              const isSynced = seg.status === 'synced' || Boolean(seg.drive_file_id || seg.gdrive_file_id);
+
+              return (
+                <div
+                  key={seg.id}
+                  onClick={() => setActiveSegment(seg)}
+                  className={`bg-[#0D111A] border rounded-xl p-3.5 transition-all cursor-pointer flex flex-col justify-between gap-3 relative ${
+                    isSelected
+                      ? 'border-emerald-500/90 ring-1 ring-emerald-500/40 shadow-[0_0_20px_rgba(16,185,129,0.2)] bg-[#101824]'
+                      : 'border-slate-800/90 hover:border-cyan-500/50 hover:bg-[#111724]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    {isRecordingNow ? (
+                      <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-red-500/20 border border-red-500/50 text-red-300 text-[10px] font-mono font-bold animate-pulse">
+                        <Radio className="w-3 h-3 text-red-400" />
+                        GRAVANDO AGORA
+                      </span>
+                    ) : isSynced ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-[10px] font-mono font-bold">
+                        <Cloud className="w-3 h-3 text-emerald-400" />
+                        NUVEM DRIVE
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300 text-[10px] font-mono font-bold">
+                        <HardDrive className="w-3 h-3 text-cyan-400" />
+                        LOCAL
+                      </span>
+                    )}
+
+                    {!isRecordingNow && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteSegment(seg);
+                        }}
+                        disabled={deletingId === seg.id}
+                        title="Excluir este bloco de gravação"
+                        className="p-1.5 rounded-lg bg-black/60 hover:bg-red-500/20 text-zinc-400 hover:text-red-400 border border-zinc-800 hover:border-red-500/40 transition-colors cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="space-y-1 font-mono">
+                    <div className="text-xs font-bold text-slate-100 flex items-center gap-1.5">
+                      <Play className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-emerald-400' : 'text-cyan-400'}`} />
+                      <span>{formatBRDateTime(seg.start_time)}</span>
+                    </div>
+                    <div className="text-[11px] text-slate-400 pl-5">
+                      Até: {seg.end_time ? formatBRDateTime(seg.end_time) : 'Gravando em tempo real...'}
+                    </div>
+                  </div>
+
+                  <div className="pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-[11px] font-mono text-slate-400">
+                    <div className="flex items-center gap-2">
+                      <span className="px-1.5 py-0.5 rounded bg-[#141A26] border border-slate-800 text-cyan-300">
+                        {formatDurationLabel(seg.duration_seconds, seg.status)}
+                      </span>
+                      <span>{sizeMb} MB</span>
+                    </div>
+
+                    <span className={`font-bold ${isSelected ? 'text-emerald-400' : 'text-cyan-400'}`}>
+                      {isSelected ? '▶ Tocando' : 'Assistir'}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -854,13 +854,61 @@ def list_dvr_available_dates() -> list[str]:
     cursor.execute("""
         SELECT DISTINCT substr(start_time, 1, 10) AS dt
         FROM dvr_segments
-        WHERE start_time IS NOT NULL AND length(start_time) >= 10
+        WHERE start_time IS NOT NULL AND length(start_time) >= 10 AND status != 'failed'
         ORDER BY dt DESC
         LIMIT 15
     """)
     dates = [row["dt"] for row in cursor.fetchall() if row["dt"]]
     conn.close()
     return dates
+
+def list_dvr_hours_summary(date_str: str | None = None) -> list[dict]:
+    """
+    Retorna resumo agrupado por hora cheia (00h a 23h) para o dia selecionado:
+    total de blocos, duração somada, tamanho e se está em gravação ou na nuvem.
+    Permite à interface exibir a 'HORA TODA' consolidada ao invés de minutos soltos.
+    """
+    if not date_str:
+        date_str = get_now().strftime("%Y-%m-%d")
+    clean_date = date_str.strip()[:10]
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            substr(start_time, 12, 2) AS hour,
+            COUNT(*) as total_blocks,
+            SUM(COALESCE(duration_seconds, 60)) as total_duration,
+            SUM(COALESCE(size_bytes, 0)) as total_bytes,
+            MIN(start_time) as first_block_start,
+            MAX(start_time) as last_block_start,
+            MAX(CASE WHEN drive_file_id IS NOT NULL THEN 1 ELSE 0 END) as has_drive,
+            MAX(CASE WHEN status = 'recording' THEN 1 ELSE 0 END) as is_recording
+        FROM dvr_segments
+        WHERE start_time LIKE ? AND status != 'failed'
+        GROUP BY hour
+        ORDER BY hour DESC
+    """, (f"{clean_date}%",))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def _is_dvr_file_available(filename: str, drive_file_id: str | None = None) -> bool:
+    """Verifica se o arquivo do segmento realmente existe no disco local ou no Google Drive."""
+    if drive_file_id:
+        return True
+    if not filename:
+        return False
+    search_dirs = [
+        "/tmp/x9_dvr_buffer",
+        "recordings_24h",
+        os.path.join("backend", "recordings_24h"),
+        os.path.join("..", "recordings_24h"),
+    ]
+    for folder in search_dirs:
+        target = os.path.join(folder, filename)
+        if os.path.exists(target) and os.path.getsize(target) >= 16384:
+            return True
+    return False
 
 def find_dvr_segment_for_seek(seconds_ago: int = 30, target_time_str: str | None = None) -> dict | None:
     if target_time_str:
@@ -877,21 +925,31 @@ def find_dvr_segment_for_seek(seconds_ago: int = 30, target_time_str: str | None
     conn = get_connection()
     cursor = conn.cursor()
 
-    # 1. Busca segmento cujo intervalo contenha target_str
+    # 1. Busca até 20 segmentos próximos anteriores ou iguais a target_str
     cursor.execute("""
         SELECT * FROM dvr_segments
-        WHERE start_time <= ?
+        WHERE start_time <= ? AND status != 'failed'
         ORDER BY start_time DESC
-        LIMIT 10
+        LIMIT 20
     """, (target_str,))
     candidates = [dict(r) for r in cursor.fetchall()]
 
     chosen = None
+    to_mark_failed = []
+
     for seg in candidates:
+        fname = seg.get("filename") or ""
+        drive_id = seg.get("drive_file_id")
+        if not _is_dvr_file_available(fname, drive_id):
+            if not drive_id and seg.get("status") != "recording":
+                to_mark_failed.append(seg.get("id"))
+            continue
+
         try:
             seg_start = datetime.strptime(seg["start_time"], "%Y-%m-%d %H:%M:%S")
         except ValueError:
             continue
+
         seg_dur = max(1, int(seg.get("duration_seconds") or 300))
         if seg.get("end_time"):
             try:
@@ -901,19 +959,36 @@ def find_dvr_segment_for_seek(seconds_ago: int = 30, target_time_str: str | None
         else:
             seg_end = seg_start + timedelta(seconds=max(seg_dur, 300))
 
-        if seg_start <= target_dt <= seg_end or seg.get("status") == "recording":
+        # Se o segmento está gravando, só pode ser escolhido se target_dt >= seg_start
+        if seg.get("status") == "recording":
+            if seg_start <= target_dt:
+                chosen = seg
+                break
+        elif seg_start <= target_dt <= seg_end:
             chosen = seg
             break
 
-    # 2. Fallback: segmento anterior mais próximo ou o mais recente disponível
+    # 2. Fallback: se target_dt caiu num intervalo intermediário, pega o segmento válido mais próximo
     if not chosen:
-        if candidates:
-            chosen = candidates[0]
-        else:
-            cursor.execute("SELECT * FROM dvr_segments ORDER BY start_time DESC LIMIT 1")
-            row = cursor.fetchone()
-            if row:
-                chosen = dict(row)
+        for seg in candidates:
+            if _is_dvr_file_available(seg.get("filename") or "", seg.get("drive_file_id")):
+                chosen = seg
+                break
+
+    # 3. Fallback absoluto: o mais recente segmento válido do sistema
+    if not chosen:
+        cursor.execute("SELECT * FROM dvr_segments WHERE status != 'failed' ORDER BY start_time DESC LIMIT 10")
+        for r in cursor.fetchall():
+            row_dict = dict(r)
+            if _is_dvr_file_available(row_dict.get("filename") or "", row_dict.get("drive_file_id")):
+                chosen = row_dict
+                break
+
+    # Marca no banco arquivos orfãos detectados
+    if to_mark_failed:
+        placeholders = ",".join("?" for _ in to_mark_failed)
+        cursor.execute(f"UPDATE dvr_segments SET status = 'failed' WHERE id IN ({placeholders})", to_mark_failed)
+        conn.commit()
 
     conn.close()
     if not chosen:
