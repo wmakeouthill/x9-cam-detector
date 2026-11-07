@@ -3,6 +3,7 @@ from app.db.db import (
     init_db,
     get_camera_config,
     save_camera_config,
+    save_image_profile_mode,
     get_night_watch_config,
     save_night_watch_config,
     log_detection_event,

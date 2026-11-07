@@ -39,9 +39,22 @@ def init_db():
             user TEXT NOT NULL DEFAULT 'admin',
             password_encrypted TEXT NOT NULL,
             subtype INTEGER NOT NULL DEFAULT 1,
+            image_profile_mode TEXT NOT NULL DEFAULT 'auto',
+            night_start_time TEXT NOT NULL DEFAULT '22:00',
+            night_end_time TEXT NOT NULL DEFAULT '05:00',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Migração idempotente para bases já existentes
+    cursor.execute("PRAGMA table_info(camera_config)")
+    existing_cols = [c["name"] for c in cursor.fetchall()]
+    if "image_profile_mode" not in existing_cols:
+        cursor.execute("ALTER TABLE camera_config ADD COLUMN image_profile_mode TEXT NOT NULL DEFAULT 'auto'")
+    if "night_start_time" not in existing_cols:
+        cursor.execute("ALTER TABLE camera_config ADD COLUMN night_start_time TEXT NOT NULL DEFAULT '22:00'")
+    if "night_end_time" not in existing_cols:
+        cursor.execute("ALTER TABLE camera_config ADD COLUMN night_end_time TEXT NOT NULL DEFAULT '05:00'")
 
     # Tabela 2: Regras do Vigia Noturno
     cursor.execute("""
@@ -185,14 +198,30 @@ def get_camera_config() -> dict:
         return {}
     data = dict(row)
     data["password"] = decrypt_credential(data.pop("password_encrypted"))
+    data.setdefault("image_profile_mode", "auto")
+    data.setdefault("night_start_time", "22:00")
+    data.setdefault("night_end_time", "05:00")
     return data
 
-def save_camera_config(ip: str, port: int, http_port: int, user: str, password: str, subtype: int):
+def save_camera_config(
+    ip: str,
+    port: int,
+    http_port: int,
+    user: str,
+    password: str,
+    subtype: int,
+    image_profile_mode: str = "auto",
+    night_start_time: str = "22:00",
+    night_end_time: str = "05:00",
+):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO camera_config (id, ip, port, http_port, user, password_encrypted, subtype, updated_at)
-        VALUES (1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO camera_config (
+            id, ip, port, http_port, user, password_encrypted, subtype,
+            image_profile_mode, night_start_time, night_end_time, updated_at
+        )
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             ip = excluded.ip,
             port = excluded.port,
@@ -200,8 +229,39 @@ def save_camera_config(ip: str, port: int, http_port: int, user: str, password: 
             user = excluded.user,
             password_encrypted = excluded.password_encrypted,
             subtype = excluded.subtype,
+            image_profile_mode = excluded.image_profile_mode,
+            night_start_time = excluded.night_start_time,
+            night_end_time = excluded.night_end_time,
             updated_at = CURRENT_TIMESTAMP
-    """, (ip, port, http_port, user, encrypt_credential(password), subtype))
+    """, (
+        ip,
+        port,
+        http_port,
+        user,
+        encrypt_credential(password),
+        subtype,
+        image_profile_mode,
+        night_start_time,
+        night_end_time,
+    ))
+    conn.commit()
+    conn.close()
+
+def save_image_profile_mode(mode: str, start_time: str | None = None, end_time: str | None = None):
+    conn = get_connection()
+    cursor = conn.cursor()
+    if start_time and end_time:
+        cursor.execute("""
+            UPDATE camera_config
+            SET image_profile_mode = ?, night_start_time = ?, night_end_time = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+        """, (mode, start_time, end_time))
+    else:
+        cursor.execute("""
+            UPDATE camera_config
+            SET image_profile_mode = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+        """, (mode,))
     conn.commit()
     conn.close()
 

@@ -19,6 +19,9 @@ import {
   Radio,
   History,
   Power,
+  Sun,
+  Moon,
+  Clock,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -34,6 +37,10 @@ interface LiveMonitorViewProps {
   lastConfidence?: number;
   detectionsCount?: number;
   testMode?: boolean;
+  imageProfileMode?: 'auto' | 'day' | 'night';
+  nightStartTime?: string;
+  nightEndTime?: string;
+  isNightActive?: boolean;
   onRefreshStatus: () => void;
 }
 
@@ -49,6 +56,10 @@ export function LiveMonitorView({
   lastConfidence,
   detectionsCount,
   testMode,
+  imageProfileMode = 'auto',
+  nightStartTime = '22:00',
+  nightEndTime = '05:00',
+  isNightActive = false,
   onRefreshStatus,
 }: LiveMonitorViewProps) {
   const { token } = useAuthStore();
@@ -57,6 +68,7 @@ export function LiveMonitorView({
   const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [recordLoading, setRecordLoading] = useState(false);
   const [subtypeLoading, setSubtypeLoading] = useState(false);
+  const [imageProfileLoading, setImageProfileLoading] = useState(false);
   const [rebootLoading, setRebootLoading] = useState(false);
   const [rebootConfirm, setRebootConfirm] = useState(false);
   const [lastSnapshotUrl, setLastSnapshotUrl] = useState<string | null>(null);
@@ -303,6 +315,47 @@ export function LiveMonitorView({
     } catch (err: any) {
       setActionMessage({ text: err.message || 'Erro ao reiniciar câmera.', type: 'error' });
       setRebootLoading(false);
+    }
+  };
+
+  const handleCycleImageProfile = async () => {
+    if (imageProfileLoading) return;
+    const currentMode = imageProfileMode || 'auto';
+    const nextMode: 'auto' | 'day' | 'night' =
+      currentMode === 'auto' ? 'day' : currentMode === 'day' ? 'night' : 'auto';
+    setImageProfileLoading(true);
+    setActionMessage(null);
+    try {
+      const res = await fetch('/api/camera/image-profile', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ mode: nextMode }),
+      });
+      const data = await safeParseJson(res);
+      if (res.ok) {
+        const labels: Record<string, string> = {
+          day: 'Forçar Dia (Colorido + WDR 60)',
+          night: 'Forçar Noite (Smart IR + WDR 38)',
+          auto: `Automático por Horário (${nightStartTime || '22:00'} às ${nightEndTime || '05:00'})`,
+        };
+        setActionMessage({
+          text: `Perfil de imagem alterado para: ${labels[nextMode]}!`,
+          type: 'success',
+        });
+        setTimeout(() => {
+          setStreamKey(Date.now());
+          onRefreshStatus();
+        }, 1200);
+      } else {
+        throw new Error(data.detail || 'Falha ao alterar perfil de imagem.');
+      }
+    } catch (err: any) {
+      setActionMessage({ text: err.message || 'Erro ao alterar perfil de imagem.', type: 'error' });
+    } finally {
+      setImageProfileLoading(false);
     }
   };
 
@@ -1092,7 +1145,7 @@ export function LiveMonitorView({
       </div>
 
       {/* Barra de Ações Rápidas da Câmera */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-9 gap-2 sm:gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-10 gap-2 sm:gap-3">
         {/* Alternar Resolução 480p / 1080p */}
         <button
           onClick={() => handleChangeSubtype(currentSubtype === 0 ? 1 : 0)}
@@ -1102,6 +1155,49 @@ export function LiveMonitorView({
         >
           <Sliders className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-cyan-400 shrink-0" />
           <span className="truncate">{subtypeLoading ? 'Trocando...' : currentSubtype === 0 ? 'Modo: 1080p' : 'Modo: 480p'}</span>
+        </button>
+
+        {/* Alternar Perfil de Imagem (Auto / Forçar Dia / Forçar Noite) */}
+        <button
+          onClick={handleCycleImageProfile}
+          disabled={imageProfileLoading || !isOnline}
+          className={`flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-2.5 sm:px-4 sm:py-3 rounded-lg border font-semibold text-[11px] sm:text-xs uppercase tracking-wider transition-all disabled:opacity-40 cursor-pointer min-h-[44px] ${
+            imageProfileMode === 'day'
+              ? 'bg-amber-950/50 border-amber-500/70 text-amber-300 hover:bg-amber-900/50 shadow-[0_0_12px_rgba(245,158,11,0.2)]'
+              : imageProfileMode === 'night'
+              ? 'bg-indigo-950/60 border-indigo-500/70 text-indigo-300 hover:bg-indigo-900/50 shadow-[0_0_12px_rgba(99,102,241,0.2)]'
+              : isNightActive
+              ? 'bg-[#141A26] border-indigo-500/40 hover:border-indigo-400 text-indigo-300'
+              : 'bg-[#141A26] border-amber-500/40 hover:border-amber-400 text-amber-300'
+          }`}
+          title={
+            imageProfileMode === 'day'
+              ? 'Modo Dia Fixo (Colorido + WDR 60). Clique para Forçar Noite.'
+              : imageProfileMode === 'night'
+              ? 'Modo Noite Fixo (Smart IR + WDR 38). Clique para Automático por Horário.'
+              : `Automático por Horário (${nightStartTime || '22:00'} às ${nightEndTime || '05:00'}) — Atualmente: ${
+                  isNightActive ? 'Noite (IR)' : 'Dia (Cor)'
+                }. Clique para Forçar Dia.`
+          }
+        >
+          {imageProfileLoading ? (
+            <RefreshCw className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-400 animate-spin shrink-0" />
+          ) : imageProfileMode === 'day' ? (
+            <Sun className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-400 shrink-0" />
+          ) : imageProfileMode === 'night' ? (
+            <Moon className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-indigo-400 shrink-0" />
+          ) : (
+            <Clock className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-400 shrink-0" />
+          )}
+          <span className="truncate">
+            {imageProfileLoading
+              ? 'Calibrando...'
+              : imageProfileMode === 'day'
+              ? 'Dia (Fixo)'
+              : imageProfileMode === 'night'
+              ? 'Noite (Fixo)'
+              : `Auto (${isNightActive ? 'Noite' : 'Dia'})`}
+          </span>
         </button>
 
         {/* Disparar Flash */}

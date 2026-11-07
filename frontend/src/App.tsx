@@ -25,6 +25,10 @@ interface CameraStatus {
   detections_count?: number;
   test_mode?: boolean;
   model_type?: string;
+  image_profile_mode?: 'auto' | 'day' | 'night';
+  night_start_time?: string;
+  night_end_time?: string;
+  is_night_active?: boolean;
 }
 
 export function App() {
@@ -100,6 +104,10 @@ export function App() {
               lastConfidence={camStatus.last_confidence}
               detectionsCount={camStatus.detections_count}
               testMode={camStatus.test_mode}
+              imageProfileMode={camStatus.image_profile_mode}
+              nightStartTime={camStatus.night_start_time}
+              nightEndTime={camStatus.night_end_time}
+              isNightActive={camStatus.is_night_active}
               onRefreshStatus={fetchStatus}
             />
           )}
@@ -117,6 +125,9 @@ export function App() {
               currentHttpPort={camStatus.http_port}
               currentUser={camStatus.user}
               currentSubtype={camStatus.subtype}
+              currentImageProfileMode={camStatus.image_profile_mode}
+              currentNightStartTime={camStatus.night_start_time}
+              currentNightEndTime={camStatus.night_end_time}
               onConfigSaved={fetchStatus}
             />
           )}

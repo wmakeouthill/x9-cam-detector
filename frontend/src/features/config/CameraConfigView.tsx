@@ -14,6 +14,9 @@ import {
   Network,
   ArrowUpRight,
   HelpCircle,
+  Sun,
+  Moon,
+  Clock,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -23,6 +26,9 @@ interface CameraConfigViewProps {
   currentHttpPort: number;
   currentUser: string;
   currentSubtype: number;
+  currentImageProfileMode?: 'auto' | 'day' | 'night';
+  currentNightStartTime?: string;
+  currentNightEndTime?: string;
   onConfigSaved: () => void;
 }
 
@@ -40,6 +46,9 @@ export function CameraConfigView({
   currentHttpPort,
   currentUser,
   currentSubtype,
+  currentImageProfileMode,
+  currentNightStartTime,
+  currentNightEndTime,
   onConfigSaved,
 }: CameraConfigViewProps) {
   const { token } = useAuthStore();
@@ -49,6 +58,9 @@ export function CameraConfigView({
   const [user, setUser] = useState(currentUser || 'admin');
   const [password, setPassword] = useState('');
   const [subtype, setSubtype] = useState(currentSubtype || 0);
+  const [imageProfileMode, setImageProfileMode] = useState<'auto' | 'day' | 'night'>(currentImageProfileMode || 'auto');
+  const [nightStartTime, setNightStartTime] = useState(currentNightStartTime || '22:00');
+  const [nightEndTime, setNightEndTime] = useState(currentNightEndTime || '05:00');
 
   const [hasLoaded, setHasLoaded] = useState(false);
 
@@ -63,9 +75,22 @@ export function CameraConfigView({
       setHttpPort(currentHttpPort || 80);
       setUser(currentUser || 'admin');
       if (currentSubtype !== undefined) setSubtype(currentSubtype);
+      if (currentImageProfileMode) setImageProfileMode(currentImageProfileMode);
+      if (currentNightStartTime) setNightStartTime(currentNightStartTime);
+      if (currentNightEndTime) setNightEndTime(currentNightEndTime);
       setHasLoaded(true);
     }
-  }, [currentIp, currentPort, currentHttpPort, currentUser, currentSubtype, hasLoaded]);
+  }, [
+    currentIp,
+    currentPort,
+    currentHttpPort,
+    currentUser,
+    currentSubtype,
+    currentImageProfileMode,
+    currentNightStartTime,
+    currentNightEndTime,
+    hasLoaded,
+  ]);
 
   const [saving, setSaving] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -187,6 +212,9 @@ export function CameraConfigView({
           user,
           password: password || '',
           subtype: Number(subtype),
+          image_profile_mode: imageProfileMode,
+          night_start_time: nightStartTime,
+          night_end_time: nightEndTime,
         }),
       });
 
@@ -267,14 +295,11 @@ export function CameraConfigView({
                     type="button"
                     onClick={() => {
                       detectorRef.current?.scrollIntoView({ behavior: 'smooth' });
-                      if (!scanPerformed && !scanning) {
-                        handleScan();
-                      }
                     }}
-                    className="self-start sm:self-auto flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-[11px] font-mono transition-all cursor-pointer"
+                    className="text-[11px] font-mono text-emerald-400 hover:text-emerald-300 flex items-center gap-1 cursor-pointer"
                   >
-                    <Radar className="w-3 h-3 text-emerald-400 animate-pulse" />
-                    <span>Abrir Detector de Redes</span>
+                    <Radar className="w-3 h-3" />
+                    <span>Detectar na rede</span>
                   </button>
                 </div>
                 <input
@@ -285,13 +310,12 @@ export function CameraConfigView({
                   required
                   className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 sm:p-3 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none min-h-[42px]"
                 />
-                <p className="text-[10px] text-zinc-500 font-mono mt-1">IP Padrão de fábrica Intelbras: 192.168.1.108</p>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
                 <div>
                   <label className="block text-xs font-semibold text-zinc-300 mb-1.5 font-mono">
-                    Porta RTSP (Vídeo)
+                    Porta RTSP (Vídeo H.264)
                   </label>
                   <input
                     type="number"
@@ -301,12 +325,12 @@ export function CameraConfigView({
                     required
                     className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 sm:p-3 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none min-h-[42px]"
                   />
-                  <p className="text-[10px] text-zinc-500 font-mono mt-1">Padrão RTSP: 554</p>
+                  <p className="text-[10px] text-zinc-500 font-mono mt-1">Padrão Intelbras: 554</p>
                 </div>
 
                 <div>
                   <label className="block text-xs font-semibold text-zinc-300 mb-1.5 font-mono">
-                    Porta HTTP (CGI / Flash)
+                    Porta HTTP / Web / Snapshot
                   </label>
                   <input
                     type="number"
@@ -416,6 +440,159 @@ export function CameraConfigView({
                     </div>
                   </label>
                 </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Card 3: Perfil de Imagem & Calibração de Luz (WDR / Noite / Dia) */}
+        <div className="bg-[#080B10] border border-zinc-800/90 rounded-xl p-4 sm:p-6 space-y-4 sm:space-y-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-zinc-800/80 pb-3 gap-2">
+            <div>
+              <span className="text-xs font-bold uppercase tracking-wider text-emerald-400 font-mono flex items-center gap-2">
+                <Sun className="w-4 h-4 text-amber-400" /> 3. Perfil de Imagem & Horário Noturno (WDR / IR)
+              </span>
+              <p className="text-[11px] text-zinc-400 font-mono mt-0.5">
+                Defina como a câmera comuta entre o modo colorido diurno e o infravermelho P&B com WDR
+              </p>
+            </div>
+            <span className="text-[10px] font-mono text-zinc-500">ISP::DAY_NIGHT</span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {/* Opção Auto */}
+            <label
+              className={`p-3.5 rounded-xl border flex flex-col justify-between cursor-pointer transition-all ${
+                imageProfileMode === 'auto'
+                  ? 'bg-emerald-950/40 border-emerald-500/60 text-emerald-200 shadow-[0_0_12px_rgba(16,185,129,0.15)]'
+                  : 'bg-[#0E131C] border-zinc-800 text-zinc-400 hover:border-zinc-700'
+              }`}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-bold font-mono flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-cyan-400" /> Automático (Horário)
+                </span>
+                <input
+                  type="radio"
+                  name="imageProfileMode"
+                  checked={imageProfileMode === 'auto'}
+                  onChange={() => setImageProfileMode('auto')}
+                  className="accent-emerald-500"
+                />
+              </div>
+              <p className="text-[11px] text-zinc-400 font-mono">
+                Segue a janela noturna programada abaixo. Durante o dia fica colorido, de noite ativa Smart IR + WDR.
+              </p>
+            </label>
+
+            {/* Opção Forçar Dia */}
+            <label
+              className={`p-3.5 rounded-xl border flex flex-col justify-between cursor-pointer transition-all ${
+                imageProfileMode === 'day'
+                  ? 'bg-amber-950/40 border-amber-500/60 text-amber-200 shadow-[0_0_12px_rgba(245,158,11,0.15)]'
+                  : 'bg-[#0E131C] border-zinc-800 text-zinc-400 hover:border-zinc-700'
+              }`}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-bold font-mono flex items-center gap-2">
+                  <Sun className="w-4 h-4 text-amber-400" /> Forçar Modo Dia
+                </span>
+                <input
+                  type="radio"
+                  name="imageProfileMode"
+                  checked={imageProfileMode === 'day'}
+                  onChange={() => setImageProfileMode('day')}
+                  className="accent-amber-500"
+                />
+              </div>
+              <p className="text-[11px] text-zinc-400 font-mono">
+                Mantém cores naturais e WDR 60 contínuos. Ideal se você deixa as luzes do local acesas à noite.
+              </p>
+            </label>
+
+            {/* Opção Forçar Noite */}
+            <label
+              className={`p-3.5 rounded-xl border flex flex-col justify-between cursor-pointer transition-all ${
+                imageProfileMode === 'night'
+                  ? 'bg-indigo-950/40 border-indigo-500/60 text-indigo-200 shadow-[0_0_12px_rgba(99,102,241,0.15)]'
+                  : 'bg-[#0E131C] border-zinc-800 text-zinc-400 hover:border-zinc-700'
+              }`}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-bold font-mono flex items-center gap-2">
+                  <Moon className="w-4 h-4 text-indigo-400" /> Forçar Modo Noite
+                </span>
+                <input
+                  type="radio"
+                  name="imageProfileMode"
+                  checked={imageProfileMode === 'night'}
+                  onChange={() => setImageProfileMode('night')}
+                  className="accent-indigo-500"
+                />
+              </div>
+              <p className="text-[11px] text-zinc-400 font-mono">
+                Força Smart IR P&B e WDR 38 24h. Ideal para máxima visão noturna mesmo com luzes fracas.
+              </p>
+            </label>
+          </div>
+
+          {/* Configuração de Janela Noturna */}
+          <div className="pt-2 border-t border-zinc-800/80 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <label className="text-xs font-semibold text-zinc-300 font-mono flex items-center gap-2">
+                <Clock className="w-3.5 h-3.5 text-emerald-400" />
+                Janela do Horário Noturno (quando o perfil estiver em Automático)
+              </label>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[10px] text-zinc-500 font-mono">Presets:</span>
+                {[
+                  { label: '22h às 05h', start: '22:00', end: '05:00' },
+                  { label: '23h às 06h', start: '23:00', end: '06:00' },
+                  { label: '00h às 06h', start: '00:00', end: '06:00' },
+                  { label: '19h às 05h', start: '19:00', end: '05:00' },
+                ].map((p) => (
+                  <button
+                    key={p.label}
+                    type="button"
+                    onClick={() => {
+                      setNightStartTime(p.start);
+                      setNightEndTime(p.end);
+                    }}
+                    className={`px-2 py-0.5 rounded text-[10px] font-mono border transition-all cursor-pointer ${
+                      nightStartTime === p.start && nightEndTime === p.end
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50'
+                        : 'bg-zinc-800/70 text-zinc-400 border-zinc-700/60 hover:text-zinc-200'
+                    }`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
+              <div>
+                <label className="block text-xs font-medium text-zinc-400 mb-1 font-mono">
+                  Início da Noite (Ativa IR + WDR 38)
+                </label>
+                <input
+                  type="time"
+                  value={nightStartTime}
+                  onChange={(e) => setNightStartTime(e.target.value)}
+                  className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-zinc-400 mb-1 font-mono">
+                  Fim da Noite (Restaura Colorido + WDR 60)
+                </label>
+                <input
+                  type="time"
+                  value={nightEndTime}
+                  onChange={(e) => setNightEndTime(e.target.value)}
+                  className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none"
+                />
               </div>
             </div>
           </div>

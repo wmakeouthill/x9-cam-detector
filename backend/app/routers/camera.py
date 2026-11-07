@@ -50,6 +50,14 @@ class CameraConfigRequest(BaseModel):
     user: str = "admin"
     password: str = "" # Vazio para manter a senha já salva
     subtype: int = 1 # 1 = Substream (leve), 0 = Principal
+    image_profile_mode: str = "auto"
+    night_start_time: str = "22:00"
+    night_end_time: str = "05:00"
+
+class ImageProfileRequest(BaseModel):
+    mode: str # 'auto', 'day', 'night'
+    start_time: str | None = None
+    end_time: str | None = None
 
 class NightWatchRequest(BaseModel):
     enabled: bool = True
@@ -78,7 +86,22 @@ def get_camera_status(user: str = Depends(get_current_user)):
         "detections_count": detector_service.detections_count,
         "test_mode": detector_service.test_mode,
         "model_type": detector_service.current_model_type,
+        "image_profile_mode": camera_service.image_profile_mode,
+        "night_start_time": camera_service.night_start_time,
+        "night_end_time": camera_service.night_end_time,
+        "is_night_active": camera_service.is_night_active,
     }
+
+@router.post("/image-profile")
+def set_image_profile(req: ImageProfileRequest, user: str = Depends(get_current_user)):
+    try:
+        return camera_service.set_image_profile(
+            mode=req.mode,
+            start_time=req.start_time,
+            end_time=req.end_time,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 class TestModeRequest(BaseModel):
     enabled: bool
@@ -281,6 +304,9 @@ def update_config(req: CameraConfigRequest, user: str = Depends(get_current_user
         port=req.port,
         http_port=req.http_port,
         subtype=req.subtype,
+        image_profile_mode=req.image_profile_mode,
+        night_start_time=req.night_start_time,
+        night_end_time=req.night_end_time,
     )
     res_data = req.dict()
     res_data["password"] = "******"

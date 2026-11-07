@@ -13,7 +13,7 @@ import socket
 import concurrent.futures
 from app.core.config import settings
 from app.core.time import get_now, get_now_str
-from app.db import get_camera_config, save_camera_config
+from app.db import get_camera_config, save_camera_config, save_image_profile_mode
 
 # Força transporte TCP para evitar corrupção de imagem e pacotes perdidos
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
@@ -31,6 +31,9 @@ class CameraService:
         self.user = db_cfg.get("user") or settings.CAMERA_USER
         self.password = db_cfg.get("password") or settings.CAMERA_PASSWORD
         self.subtype = db_cfg.get("subtype", settings.CAMERA_SUBTYPE) # 0 = 1080p FHD por padrão
+        self.image_profile_mode = db_cfg.get("image_profile_mode", "auto") # auto, day, night
+        self.night_start_time = db_cfg.get("night_start_time", "22:00")
+        self.night_end_time = db_cfg.get("night_end_time", "05:00")
 
         self._running = False
         self._thread = None
@@ -65,7 +68,18 @@ class CameraService:
         pass_enc = quote(self.password, safe="")
         return f"rtsp://{user_enc}:{pass_enc}@{self.ip}:{self.port}/cam/realmonitor?channel=1&subtype=0"
 
-    def update_config(self, ip: str, user: str, password: str, port: int = 554, http_port: int = 80, subtype: int = 1):
+    def update_config(
+        self,
+        ip: str,
+        user: str,
+        password: str,
+        port: int = 554,
+        http_port: int = 80,
+        subtype: int = 1,
+        image_profile_mode: str = "auto",
+        night_start_time: str = "22:00",
+        night_end_time: str = "05:00",
+    ):
         with self._lock:
             self.ip = ip
             self.user = user
@@ -73,10 +87,19 @@ class CameraService:
             self.port = port
             self.http_port = http_port
             self.subtype = subtype
+            self.image_profile_mode = image_profile_mode
+            self.night_start_time = night_start_time
+            self.night_end_time = night_end_time
             self.status = "CONNECTING"
         # Persiste no banco com senha criptografada em AES-256
-        save_camera_config(ip, port, http_port, user, password, subtype)
-        logger.info(f"Configuração da câmera salva e atualizada: {ip}:{port} (Subtype {subtype})")
+        save_camera_config(
+            ip, port, http_port, user, password, subtype,
+            image_profile_mode, night_start_time, night_end_time
+        )
+        logger.info(
+            f"Configuração da câmera salva e atualizada: {ip}:{port} (Subtype {subtype}, Perfil {image_profile_mode}, Janela Noturna {night_start_time}-{night_end_time})"
+        )
+        threading.Thread(target=self._ensure_optimal_camera_image_rpc, daemon=True).start()
 
     def update_active_tracks(self, tracks: list):
         """Atualiza a lista de tracks/caixas rastreadas para sobreposição no streaming."""
@@ -254,7 +277,7 @@ class CameraService:
                         if current_is_night != last_is_night:
                             last_is_night = current_is_night
                             logger.info(
-                                f"[Imagem Hardware] Virada de horário detectada ({'NOITE 19h-05h' if current_is_night else 'DIA 05h-19h'}): recalibrando perfil..."
+                                f"[Imagem Hardware] Virada de perfil detectada ({'NOITE IR+WDR38' if current_is_night else 'DIA Color+WDR60'}): recalibrando perfil..."
                             )
                             threading.Thread(target=self._ensure_optimal_camera_image_rpc, daemon=True).start()
                 except Exception as err:
@@ -271,11 +294,65 @@ class CameraService:
                 return self.latest_frame_jpeg
             return self._placeholder_jpeg
 
-    @staticmethod
-    def _is_night_window() -> bool:
-        """Retorna True no período noturno (19:00 às 05:00 BRT) e False no diurno (05:00 às 19:00 BRT)."""
-        hour = get_now().hour
-        return hour >= 19 or hour < 5
+    def is_in_schedule(self, start_time_str: str, end_time_str: str) -> bool:
+        """Verifica se o horário atual de Brasília está dentro da janela configurada."""
+        try:
+            now = get_now().time()
+            start = datetime.strptime(start_time_str, "%H:%M").time()
+            end = datetime.strptime(end_time_str, "%H:%M").time()
+            if start <= end:
+                return start <= now <= end
+            else: # Cruza a meia-noite (ex: 22:00 às 05:00)
+                return now >= start or now <= end
+        except Exception:
+            return False
+
+    @property
+    def is_night_active(self) -> bool:
+        """
+        Retorna True se o modo noturno (IR + WDR 38) deve estar ativo:
+        - Se image_profile_mode == 'night': Sempre True (Forçar Noite IR).
+        - Se image_profile_mode == 'day': Sempre False (Forçar Dia / Colorido).
+        - Se image_profile_mode == 'auto': Segue a janela configurada (padrão 22:00 às 05:00).
+        """
+        if self.image_profile_mode == "night":
+            return True
+        if self.image_profile_mode == "day":
+            return False
+        return self.is_in_schedule(self.night_start_time, self.night_end_time)
+
+    def _is_night_window(self) -> bool:
+        """Avalia se o perfil de hardware deve ser o noturno (IR+WDR38) ou diurno (Color+WDR60)."""
+        return self.is_night_active
+
+    def set_image_profile(self, mode: str, start_time: str | None = None, end_time: str | None = None) -> dict:
+        """
+        Atualiza o perfil de imagem da câmera (auto, day, night) e opcionalmente os horários.
+        Executa a calibração RPC2 imediatamente para troca instantânea de modo na câmera.
+        """
+        if mode not in ("auto", "day", "night"):
+            raise ValueError(f"Modo inválido: {mode}. Opções aceitas: 'auto', 'day', 'night'.")
+
+        with self._lock:
+            self.image_profile_mode = mode
+            if start_time:
+                self.night_start_time = start_time
+            if end_time:
+                self.night_end_time = end_time
+
+        save_image_profile_mode(mode, self.night_start_time, self.night_end_time)
+        logger.info(
+            f"[Perfil de Imagem] Modo atualizado para '{mode}' (Janela Noturna: {self.night_start_time} - {self.night_end_time}, Ativo: {'NOITE' if self.is_night_active else 'DIA'})."
+        )
+        threading.Thread(target=self._ensure_optimal_camera_image_rpc, daemon=True).start()
+
+        return {
+            "status": "updated",
+            "image_profile_mode": self.image_profile_mode,
+            "night_start_time": self.night_start_time,
+            "night_end_time": self.night_end_time,
+            "is_night_active": self.is_night_active,
+        }
 
     def _rpc_login(self, timeout: float = 5.0):
         """Autentica na API JSON-RPC 2.0 (/RPC2_Login) da Intelbras com desafio duplo-MD5."""
