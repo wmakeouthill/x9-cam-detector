@@ -34,13 +34,14 @@ def isolated_db(monkeypatch, tmp_path):
 def test_dvr_config_defaults_and_update():
     cfg = get_dvr_config()
     assert cfg["enabled"] is True
-    assert cfg["segment_seconds"] == 60
+    assert cfg["segment_seconds"] == 900
     assert cfg["retention_days"] == 15
     assert cfg["subtype"] == 0
 
-    save_dvr_config(enabled=False, segment_seconds=60, retention_days=15, subtype=0)
+    save_dvr_config(enabled=False, segment_seconds=900, retention_days=15, subtype=0)
     updated = get_dvr_config()
     assert updated["enabled"] is False
+    assert updated["segment_seconds"] == 900
     assert updated["subtype"] == 0
 
 
@@ -432,6 +433,20 @@ def test_camera_image_wdr_day_night_and_flash_restore_rpc(monkeypatch):
     assert res_reboot["method"] == "RPC2 magicBox.reboot"
     assert any(c[1].get("method") == "magicBox.reboot" for c in calls)
     assert any(c[1].get("method") == "global.logout" for c in calls)
+
+def test_dynamic_clip_and_dvr_config_extension():
+    from app.services.camera_service import camera_service
+    from app.services.dvr_service import dvr_service
+
+    # Verifica status inicial de clip
+    assert camera_service.is_recording_clip is False
+    assert camera_service.extend_clip(10) is False
+
+    # Testa atualização de dvr config
+    st = dvr_service.update_config(segment_seconds=900, retention_days=20, subtype=0)
+    assert st["segment_duration"] == 900
+    assert st["retention_days"] == 20
+
 
 
 

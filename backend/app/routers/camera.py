@@ -53,6 +53,13 @@ class CameraConfigRequest(BaseModel):
     image_profile_mode: str = "auto"
     night_start_time: str = "22:00"
     night_end_time: str = "05:00"
+    clip_min_duration: int = 20
+    clip_max_duration: int = 120
+
+class DvrConfigRequest(BaseModel):
+    segment_seconds: int | None = None
+    retention_days: int | None = None
+    subtype: int | None = None
 
 class ImageProfileRequest(BaseModel):
     mode: str # 'auto', 'day', 'night'
@@ -90,6 +97,9 @@ def get_camera_status(user: str = Depends(get_current_user)):
         "night_start_time": camera_service.night_start_time,
         "night_end_time": camera_service.night_end_time,
         "is_night_active": camera_service.is_night_active,
+        "clip_min_duration": camera_service.clip_min_duration,
+        "clip_max_duration": camera_service.clip_max_duration,
+        "is_recording_clip": camera_service.is_recording_clip,
     }
 
 @router.post("/image-profile")
@@ -307,6 +317,8 @@ def update_config(req: CameraConfigRequest, user: str = Depends(get_current_user
         image_profile_mode=req.image_profile_mode,
         night_start_time=req.night_start_time,
         night_end_time=req.night_end_time,
+        clip_min_duration=req.clip_min_duration,
+        clip_max_duration=req.clip_max_duration,
     )
     res_data = req.dict()
     res_data["password"] = "******"
@@ -468,6 +480,14 @@ def toggle_dvr_recording(req: DvrToggleRequest, user: str = Depends(get_current_
         "enabled": st["enabled"],
         "recording": st["recording"],
     }
+
+@router.post("/dvr/config")
+def update_dvr_config_endpoint(req: DvrConfigRequest, user: str = Depends(get_current_user)):
+    return dvr_service.update_config(
+        segment_seconds=req.segment_seconds,
+        retention_days=req.retention_days,
+        subtype=req.subtype,
+    )
 
 @router.get("/dvr/segments")
 def get_dvr_segments(

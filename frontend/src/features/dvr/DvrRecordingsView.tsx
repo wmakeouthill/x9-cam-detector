@@ -106,6 +106,8 @@ export function DvrRecordingsView() {
   const [syncing, setSyncing] = useState<boolean>(false);
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [feedback, setFeedback] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
+  const [jumpTime, setJumpTime] = useState<string>('');
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -116,6 +118,51 @@ export function DvrRecordingsView() {
       return JSON.parse(text);
     } catch {
       return {};
+    }
+  };
+
+  const handleSetSegmentDuration = async (seconds: number) => {
+    if (!token) return;
+    try {
+      const res = await fetch('/api/camera/dvr/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ segment_seconds: seconds }),
+      });
+      if (res.ok) {
+        const data = await safeParseJson(res);
+        setDvrStatus((prev) => ({ ...prev, segment_seconds: data.segment_duration || seconds }));
+        setFeedback({ text: `Tamanho dos blocos do DVR alterado para ${Math.round(seconds / 60)} min.`, type: 'success' });
+      }
+    } catch {
+      setFeedback({ text: 'Erro ao alterar tamanho de bloco.', type: 'error' });
+    }
+  };
+
+  const handleJumpToTime = async () => {
+    if (!jumpTime || !token) return;
+    const targetDate = selectedDate || new Date().toISOString().split('T')[0];
+    const targetTimestamp = `${targetDate} ${jumpTime}:00`;
+    try {
+      const res = await fetch(`/api/camera/dvr/seek?target_time=${encodeURIComponent(targetTimestamp)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await safeParseJson(res);
+      if (res.ok && data.found && data.segment) {
+        setActiveSegment(data.segment);
+        const offset = data.seek_offset || 0;
+        setTimeout(() => {
+          if (videoRef.current) {
+            videoRef.current.currentTime = offset;
+            videoRef.current.play().catch(() => {});
+          }
+        }, 200);
+        setFeedback({ text: `Carregado: bloco de ${data.segment.start_time} no horário ${jumpTime}.`, type: 'success' });
+      } else {
+        setFeedback({ text: data.message || `Nenhum bloco encontrado próximo das ${jumpTime}.`, type: 'error' });
+      }
+    } catch {
+      setFeedback({ text: 'Erro ao buscar gravação pelo horário informado.', type: 'error' });
     }
   };
 
@@ -370,10 +417,35 @@ export function DvrRecordingsView() {
               </span>
             </div>
             <p className="text-[11px] sm:text-xs text-slate-400 font-mono mt-0.5">
-              Gravação contínua 24h em blocos ágeis de 1 min com áudio limpo e marcações IA • Retenção automática de{' '}
+              Gravação contínua 24h em blocos de {Math.round((dvrStatus.segment_seconds || 900) / 60)} min com áudio limpo e marcações IA • Retenção automática de{' '}
               {dvrStatus.retention_days} dias na pasta <b className="text-cyan-300">{dvrStatus.gdrive_folder_name}</b>
             </p>
           </div>
+        </div>
+
+        {/* Seletor de Tamanho de Bloco do DVR 24h */}
+        <div className="flex items-center gap-2 pt-2 border-t border-slate-800/80 flex-wrap">
+          <span className="text-[11px] font-mono text-slate-400 flex items-center gap-1.5">
+            <Clock className="w-3.5 h-3.5 text-cyan-400" /> Tamanho do Bloco 24h:
+          </span>
+          {[
+            { label: '15 min (Padrão)', val: 900 },
+            { label: '10 min', val: 600 },
+            { label: '5 min', val: 300 },
+            { label: '1 min', val: 60 },
+          ].map((b) => (
+            <button
+              key={b.val}
+              onClick={() => handleSetSegmentDuration(b.val)}
+              className={`px-2.5 py-1 rounded text-xs font-mono font-semibold border transition-all cursor-pointer ${
+                (dvrStatus.segment_seconds || 900) === b.val
+                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/60 shadow-[0_0_10px_rgba(6,182,212,0.2)]'
+                  : 'bg-[#141A26] border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200'
+              }`}
+            >
+              {b.label}
+            </button>
+          ))}
         </div>
 
         {/* Botões de Controle do Gravador 24h */}
@@ -502,69 +574,115 @@ export function DvrRecordingsView() {
             </div>
 
             {/* Barra de Controles Rápidos do Player DVR */}
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pt-2 border-t border-zinc-800/80">
               <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
                 <button
                   onClick={handlePlayPreviousSegment}
                   disabled={!previousChronoSegment}
-                  className="flex items-center gap-1 px-3 py-2 rounded-lg bg-[#141A26] hover:bg-slate-800 border border-slate-700 hover:border-cyan-500/40 text-slate-200 text-xs font-mono font-semibold transition-all cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
-                  title="Ir para o bloco de 5 min anterior"
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#141A26] hover:bg-slate-800 border border-slate-700 hover:border-cyan-500/40 text-slate-200 text-xs font-mono font-semibold transition-all cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
+                  title="Ir para o bloco anterior"
                 >
                   <SkipBack className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Bloco Anterior</span>
+                  <span>Anterior</span>
+                </button>
+
+                <button
+                  onClick={() => handleSeekPlayer(-300)}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer"
+                  title="Voltar 5 minutos"
+                >
+                  <Rewind className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>-5m</span>
                 </button>
 
                 <button
                   onClick={() => handleSeekPlayer(-60)}
-                  className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer"
+                  className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer"
+                  title="Voltar 1 minuto"
                 >
-                  <Rewind className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>⏪ -1m</span>
+                  <span>-1m</span>
                 </button>
 
                 <button
                   onClick={() => handleSeekPlayer(-15)}
-                  className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer"
+                  className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer"
+                  title="Voltar 15 segundos"
                 >
-                  <Rewind className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>⏪ -15s</span>
+                  <span>-15s</span>
                 </button>
 
                 <button
                   onClick={() => handleSeekPlayer(15)}
-                  className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/30 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer"
+                  className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/30 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer"
+                  title="Avançar 15 segundos"
                 >
-                  <FastForward className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>⏩ +15s</span>
+                  <span>+15s</span>
                 </button>
 
                 <button
                   onClick={() => handleSeekPlayer(60)}
-                  className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/30 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer"
+                  className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/30 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer"
+                  title="Avançar 1 minuto"
+                >
+                  <span>+1m</span>
+                </button>
+
+                <button
+                  onClick={() => handleSeekPlayer(300)}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/30 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer"
+                  title="Avançar 5 minutos"
                 >
                   <FastForward className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>⏩ +1m</span>
+                  <span>+5m</span>
                 </button>
 
                 <button
                   onClick={handlePlayNextSegment}
                   disabled={!nextChronoSegment}
-                  className="flex items-center gap-1 px-3 py-2 rounded-lg bg-[#141A26] hover:bg-slate-800 border border-slate-700 hover:border-emerald-500/40 text-slate-200 text-xs font-mono font-semibold transition-all cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#141A26] hover:bg-slate-800 border border-slate-700 hover:border-emerald-500/40 text-slate-200 text-xs font-mono font-semibold transition-all cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
                   title="Avançar para o próximo bloco cronológico"
                 >
-                  <span>Próximo Bloco</span>
+                  <span>Próximo</span>
                   <SkipForward className="w-3.5 h-3.5 text-emerald-400" />
                 </button>
               </div>
 
-              <div className="text-[11px] font-mono text-slate-400">
-                {nextChronoSegment ? (
-                  <span>
-                    A seguir: <b className="text-emerald-400">{formatBRDateTime(nextChronoSegment.start_time)}</b>
-                  </span>
-                ) : (
-                  <span>Último bloco cronológico selecionado</span>
-                )}
+              {/* Seletor de Velocidade & Pulo Rápido por Horário */}
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[10px] font-mono text-zinc-400">Velocidade:</span>
+                {[1, 1.5, 2, 4].map((spd) => (
+                  <button
+                    key={spd}
+                    onClick={() => {
+                      setPlaybackSpeed(spd);
+                      if (videoRef.current) videoRef.current.playbackRate = spd;
+                    }}
+                    className={`px-2 py-0.5 rounded text-xs font-mono font-bold border transition-all cursor-pointer ${
+                      playbackSpeed === spd
+                        ? 'bg-amber-500/20 text-amber-300 border-amber-500/60 shadow-[0_0_8px_rgba(245,158,11,0.2)]'
+                        : 'bg-zinc-800 border-zinc-700 text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    {spd}x
+                  </button>
+                ))}
+
+                <div className="flex items-center gap-1.5 pl-2 border-l border-zinc-700">
+                  <span className="text-[10px] font-mono text-zinc-400">Ir para:</span>
+                  <input
+                    type="time"
+                    value={jumpTime}
+                    onChange={(e) => setJumpTime(e.target.value)}
+                    className="bg-[#0E131C] border border-zinc-700 rounded px-1.5 py-0.5 text-xs text-zinc-100 font-mono focus:border-cyan-500 focus:outline-none"
+                  />
+                  <button
+                    onClick={handleJumpToTime}
+                    disabled={!jumpTime}
+                    className="px-2.5 py-0.5 rounded text-xs font-mono bg-cyan-500 hover:bg-cyan-400 text-black font-bold disabled:opacity-40 cursor-pointer"
+                  >
+                    Buscar
+                  </button>
+                </div>
               </div>
             </div>
           </>

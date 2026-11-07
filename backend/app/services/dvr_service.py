@@ -67,7 +67,7 @@ class DvrService:
         self._lock = threading.Lock()
 
         self.enabled = True
-        self.segment_seconds = 60
+        self.segment_seconds = 900
         self.retention_days = 15
         self.subtype = 0
         self.current_segment: str | None = None
@@ -79,7 +79,7 @@ class DvrService:
         try:
             cfg = get_dvr_config()
             self.enabled = bool(cfg.get("enabled", True))
-            self.segment_seconds = int(cfg.get("segment_seconds", 60))
+            self.segment_seconds = int(cfg.get("segment_seconds", 900))
             self.retention_days = int(cfg.get("retention_days", 15))
             self.subtype = int(cfg.get("subtype", 0))
         except Exception as e:
@@ -145,6 +145,32 @@ class DvrService:
         if not self.enabled:
             self._terminate_ffmpeg()
             self.current_segment = None
+        return self.get_status()
+
+    def update_config(
+        self,
+        segment_seconds: int | None = None,
+        retention_days: int | None = None,
+        subtype: int | None = None,
+    ) -> dict:
+        if segment_seconds is not None:
+            self.segment_seconds = max(60, int(segment_seconds))
+        if retention_days is not None:
+            self.retention_days = max(1, int(retention_days))
+        if subtype is not None:
+            self.subtype = int(subtype)
+        save_dvr_config(
+            enabled=self.enabled,
+            segment_seconds=self.segment_seconds,
+            retention_days=self.retention_days,
+            subtype=self.subtype,
+        )
+        logger.info(
+            f"[DVR 24h] Configuração atualizada: bloco={self.segment_seconds}s, retenção={self.retention_days}d, subtype={self.subtype}"
+        )
+        if self._is_recording:
+            # Reinicia suavemente o processo de gravação para adotar o novo tamanho de bloco
+            self._terminate_ffmpeg()
         return self.get_status()
 
     def get_status(self) -> dict:

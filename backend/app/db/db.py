@@ -42,6 +42,8 @@ def init_db():
             image_profile_mode TEXT NOT NULL DEFAULT 'auto',
             night_start_time TEXT NOT NULL DEFAULT '22:00',
             night_end_time TEXT NOT NULL DEFAULT '05:00',
+            clip_min_duration INTEGER NOT NULL DEFAULT 20,
+            clip_max_duration INTEGER NOT NULL DEFAULT 120,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -55,6 +57,10 @@ def init_db():
         cursor.execute("ALTER TABLE camera_config ADD COLUMN night_start_time TEXT NOT NULL DEFAULT '22:00'")
     if "night_end_time" not in existing_cols:
         cursor.execute("ALTER TABLE camera_config ADD COLUMN night_end_time TEXT NOT NULL DEFAULT '05:00'")
+    if "clip_min_duration" not in existing_cols:
+        cursor.execute("ALTER TABLE camera_config ADD COLUMN clip_min_duration INTEGER NOT NULL DEFAULT 20")
+    if "clip_max_duration" not in existing_cols:
+        cursor.execute("ALTER TABLE camera_config ADD COLUMN clip_max_duration INTEGER NOT NULL DEFAULT 120")
 
     # Tabela 2: Regras do Vigia Noturno
     cursor.execute("""
@@ -118,7 +124,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS dvr_config (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             enabled INTEGER NOT NULL DEFAULT 1,
-            segment_seconds INTEGER NOT NULL DEFAULT 60,
+            segment_seconds INTEGER NOT NULL DEFAULT 900,
             retention_days INTEGER NOT NULL DEFAULT 15,
             subtype INTEGER NOT NULL DEFAULT 0,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -132,7 +138,7 @@ def init_db():
             filename TEXT UNIQUE NOT NULL,
             start_time TIMESTAMP NOT NULL,
             end_time TIMESTAMP,
-            duration_seconds INTEGER NOT NULL DEFAULT 60,
+            duration_seconds INTEGER NOT NULL DEFAULT 900,
             size_bytes INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'recording',
             drive_file_id TEXT,
@@ -179,10 +185,10 @@ def init_db():
     if cursor.fetchone()["count"] == 0:
         cursor.execute("""
             INSERT INTO dvr_config (id, enabled, segment_seconds, retention_days, subtype)
-            VALUES (1, 1, 60, 15, 0)
+            VALUES (1, 1, 900, 15, 0)
         """)
     else:
-        cursor.execute("UPDATE dvr_config SET segment_seconds = 60 WHERE id = 1 AND segment_seconds = 300")
+        cursor.execute("UPDATE dvr_config SET segment_seconds = 900 WHERE id = 1 AND segment_seconds = 60")
 
     conn.commit()
     conn.close()
@@ -201,6 +207,8 @@ def get_camera_config() -> dict:
     data.setdefault("image_profile_mode", "auto")
     data.setdefault("night_start_time", "22:00")
     data.setdefault("night_end_time", "05:00")
+    data.setdefault("clip_min_duration", 20)
+    data.setdefault("clip_max_duration", 120)
     return data
 
 def save_camera_config(
@@ -213,15 +221,18 @@ def save_camera_config(
     image_profile_mode: str = "auto",
     night_start_time: str = "22:00",
     night_end_time: str = "05:00",
+    clip_min_duration: int = 20,
+    clip_max_duration: int = 120,
 ):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO camera_config (
             id, ip, port, http_port, user, password_encrypted, subtype,
-            image_profile_mode, night_start_time, night_end_time, updated_at
+            image_profile_mode, night_start_time, night_end_time,
+            clip_min_duration, clip_max_duration, updated_at
         )
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             ip = excluded.ip,
             port = excluded.port,
@@ -232,6 +243,8 @@ def save_camera_config(
             image_profile_mode = excluded.image_profile_mode,
             night_start_time = excluded.night_start_time,
             night_end_time = excluded.night_end_time,
+            clip_min_duration = excluded.clip_min_duration,
+            clip_max_duration = excluded.clip_max_duration,
             updated_at = CURRENT_TIMESTAMP
     """, (
         ip,
@@ -243,6 +256,8 @@ def save_camera_config(
         image_profile_mode,
         night_start_time,
         night_end_time,
+        int(clip_min_duration),
+        int(clip_max_duration),
     ))
     conn.commit()
     conn.close()
@@ -708,7 +723,7 @@ def get_dvr_config() -> dict:
     if not row:
         return {
             "enabled": True,
-            "segment_seconds": 60,
+            "segment_seconds": 900,
             "retention_days": 15,
             "subtype": 0,
         }
@@ -719,7 +734,7 @@ def get_dvr_config() -> dict:
         "subtype": int(row["subtype"]),
     }
 
-def save_dvr_config(enabled: bool, segment_seconds: int = 60, retention_days: int = 15, subtype: int = 0):
+def save_dvr_config(enabled: bool, segment_seconds: int = 900, retention_days: int = 15, subtype: int = 0):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""

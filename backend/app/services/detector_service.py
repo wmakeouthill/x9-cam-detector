@@ -273,82 +273,92 @@ class DetectorService:
                 # Apenas dispara alarme/flash se o Modo Vigia estiver armado no horário (ou em test_mode)
                 should_trigger_alarm = (vigia_enabled and in_schedule) or self.test_mode
 
-                if person_detected and should_trigger_alarm and (now_sec - self.last_detection_time > self.cooldown_seconds):
-                    self.last_detection_time = now_sec
-                    self.detections_count += 1
-                    video_duration = 10
-                    # Flash cobre a transição óptica (1.8s), o snapshot colorido e os 10s inteiros de vídeo no modo 6_flash_wdr_off
-                    configured_flash = cfg.get("flash_duration", 2.5)
-                    flash_duration = max(float(configured_flash), float(video_duration) + 3.5)
+                if person_detected and should_trigger_alarm:
+                    if camera_service.is_recording_clip:
+                        # Extensão Dinâmica: a pessoa continua na cena! Estende a gravação e o flash por mais 10s
+                        camera_service.extend_clip(additional_seconds=10.0)
+                        self.last_detection_time = now_sec
+                    elif (now_sec - self.last_detection_time > self.cooldown_seconds):
+                        self.last_detection_time = now_sec
+                        self.detections_count += 1
+                        min_duration = int(cfg.get("clip_min_duration", getattr(camera_service, "clip_min_duration", 20)))
+                        max_duration = int(cfg.get("clip_max_duration", getattr(camera_service, "clip_max_duration", 120)))
+                        # Flash cobre a transição óptica (1.8s), o snapshot colorido e a duração inicial de vídeo no modo 6_flash_wdr_off
+                        configured_flash = cfg.get("flash_duration", 2.5)
+                        flash_duration = max(float(configured_flash), float(min_duration) + 3.5)
 
-                    logger.warning(
-                        f"[!] MODO VIGIA: PESSOA DETECTADA ({max_conf:.1%})! Luz Branca ({flash_duration:.1f}s), Foto 1080p e Vídeo ({video_duration}s)..."
-                    )
+                        logger.warning(
+                            f"[!] MODO VIGIA: PESSOA DETECTADA ({max_conf:.1%})! Luz Branca ({flash_duration:.1f}s), Foto 1080p e Vídeo Dinâmico ({min_duration}s base, até {max_duration}s)..."
+                        )
 
-                    # 1. Foto 1: Flagrante Instantâneo (Preto e Branco / IR no milissegundo zero, antes do flash)
-                    snapshot_pb = camera_service.take_snapshot(prefix="snapshot_pb")
-                    log_detection_event(
-                        confidence=max_conf,
-                        flash_triggered=False,
-                        snapshot_path=snapshot_pb,
-                        video_path=None,
-                    )
-                    logger.info(f"[+] Foto 1 (Flagrante P&B) capturada: {snapshot_pb}")
+                        # 1. Foto 1: Flagrante Instantâneo (Preto e Branco / IR no milissegundo zero, antes do flash)
+                        snapshot_pb = camera_service.take_snapshot(prefix="snapshot_pb")
+                        log_detection_event(
+                            confidence=max_conf,
+                            flash_triggered=False,
+                            snapshot_path=snapshot_pb,
+                            video_path=None,
+                        )
+                        logger.info(f"[+] Foto 1 (Flagrante P&B) capturada: {snapshot_pb}")
 
-                    # 2. Aciona Flash de Luz Branca (WhiteMode + WDR Off que cobrirá foto colorida e gravação)
-                    camera_service.trigger_flash(seconds=flash_duration)
-                    
-                    # 3. Aguarda 1.8s para comutação mecânica do filtro IR-cut, desligamento do WDR e luz plena
-                    time.sleep(1.8)
-                    
-                    # 4. Foto 2: Foto com Flash (Full Color 1080p nítida com o ambiente 100% iluminado)
-                    snapshot_flash = camera_service.take_snapshot(prefix="snapshot_flash")
-                    # Envio imediato da foto de flagrante no WhatsApp (assíncrono)
-                    evolution_service.send_alert_photo_async(snapshot_flash, max_conf)
+                        # 2. Aciona Flash de Luz Branca (WhiteMode + WDR Off que cobrirá foto colorida e gravação)
+                        camera_service.trigger_flash(seconds=flash_duration)
+                        
+                        # 3. Aguarda 1.8s para comutação mecânica do filtro IR-cut, desligamento do WDR e luz plena
+                        time.sleep(1.8)
+                        
+                        # 4. Foto 2: Foto com Flash (Full Color 1080p nítida com o ambiente 100% iluminado)
+                        snapshot_flash = camera_service.take_snapshot(prefix="snapshot_flash")
+                        # Envio imediato da foto de flagrante no WhatsApp (assíncrono)
+                        evolution_service.send_alert_photo_async(snapshot_flash, max_conf)
 
-                    # 5. Grava clipe de vídeo MP4 em alta definição com áudio sincronizado (10 segundos)
-                    # O upload para o Google Drive e WhatsApp é agendado para quando o ffmpeg terminar de renderizar o arquivo completo
-                    video_desc = f"Gravação Noturna X9: Vídeo de Invasão ({max_conf:.1%})"
-                    def _upload_video_when_ready(fpath, fname):
-                        logger.info(f"[+] Gravação finalizada, enviando vídeo ao Google Drive: {fname}")
-                        gdrive_service.upload_file_async(
-                            fname,
+                        # 5. Grava clipe de vídeo MP4 em alta definição com áudio sincronizado e extensão dinâmica
+                        # O upload para o Google Drive e WhatsApp é agendado para quando o ffmpeg terminar de renderizar o arquivo completo
+                        video_desc = f"Gravação Noturna X9: Vídeo de Invasão ({max_conf:.1%})"
+                        def _upload_video_when_ready(fpath, fname):
+                            logger.info(f"[+] Gravação finalizada, enviando vídeo ao Google Drive: {fname}")
+                            gdrive_service.upload_file_async(
+                                fname,
+                                description=video_desc,
+                                file_type="recording"
+                            )
+                            # Envio do vídeo no WhatsApp (assíncrono)
+                            evolution_service.send_alert_video_async(fpath, max_conf)
+
+                        video_filename = camera_service.record_clip(
+                            seconds=min_duration,
+                            max_seconds=max_duration,
+                            on_complete=_upload_video_when_ready,
+                        )
+
+                        # Pré-registra preventivamente o vídeo no SQLite: se o backend cair ou reiniciar
+                        # durante a gravação do ffmpeg, o vídeo já está garantido na fila de sincronização
+                        gdrive_service.enqueue_file(
+                            video_filename,
                             description=video_desc,
                             file_type="recording"
                         )
-                        # Envio do vídeo de 10s no WhatsApp (assíncrono)
-                        evolution_service.send_alert_video_async(fpath, max_conf)
 
-                    video_filename = camera_service.record_clip(seconds=video_duration, on_complete=_upload_video_when_ready)
+                        # 6. Salva no SQLite o evento principal com a foto colorida com flash e o vídeo
+                        log_detection_event(
+                            confidence=max_conf,
+                            flash_triggered=True,
+                            snapshot_path=snapshot_flash,
+                            video_path=video_filename,
+                        )
+                        logger.info(f"[+] Evento gravado no banco com Foto Flash ({snapshot_flash}) e vídeo ({video_filename})")
 
-                    # Pré-registra preventivamente o vídeo no SQLite: se o backend cair ou reiniciar
-                    # durante os 10s de gravação do ffmpeg, o vídeo já está garantido na fila de sincronização
-                    gdrive_service.enqueue_file(
-                        video_filename,
-                        description=video_desc,
-                        file_type="recording"
-                    )
-
-                    # 6. Salva no SQLite o evento principal com a foto colorida com flash e o vídeo
-                    log_detection_event(
-                        confidence=max_conf,
-                        flash_triggered=True,
-                        snapshot_path=snapshot_flash,
-                        video_path=video_filename,
-                    )
-                    logger.info(f"[+] Evento gravado no banco com Foto Flash ({snapshot_flash}) e vídeo ({video_filename})")
-
-                    # 7. Backup automático para Google Drive (foto flagrante P&B e foto flash colorido)
-                    gdrive_service.upload_file_async(
-                        snapshot_pb,
-                        description=f"Detecção Noturna X9 [Flagrante P&B]: Pessoa detectada ({max_conf:.1%})",
-                        file_type="snapshot"
-                    )
-                    gdrive_service.upload_file_async(
-                        snapshot_flash,
-                        description=f"Detecção Noturna X9 [Flash Colorido]: Pessoa detectada ({max_conf:.1%})",
-                        file_type="snapshot"
-                    )
+                        # 7. Backup automático para Google Drive (foto flagrante P&B e foto flash colorido)
+                        gdrive_service.upload_file_async(
+                            snapshot_pb,
+                            description=f"Detecção Noturna X9 [Flagrante P&B]: Pessoa detectada ({max_conf:.1%})",
+                            file_type="snapshot"
+                        )
+                        gdrive_service.upload_file_async(
+                            snapshot_flash,
+                            description=f"Detecção Noturna X9 [Flash Colorido]: Pessoa detectada ({max_conf:.1%})",
+                            file_type="snapshot"
+                        )
 
                 elapsed = time.time() - loop_t0
                 if elapsed < 0.20:

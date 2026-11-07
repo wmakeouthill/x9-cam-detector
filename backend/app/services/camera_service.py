@@ -34,6 +34,8 @@ class CameraService:
         self.image_profile_mode = db_cfg.get("image_profile_mode", "auto") # auto, day, night
         self.night_start_time = db_cfg.get("night_start_time", "22:00")
         self.night_end_time = db_cfg.get("night_end_time", "05:00")
+        self.clip_min_duration = int(db_cfg.get("clip_min_duration", 20))
+        self.clip_max_duration = int(db_cfg.get("clip_max_duration", 120))
 
         self._running = False
         self._thread = None
@@ -41,6 +43,12 @@ class CameraService:
         self._rpc_lock = threading.Lock()
         self._flash_active = False
         self._flash_until = 0.0
+
+        self._clip_active = False
+        self._clip_lock = threading.Lock()
+        self._clip_deadline = 0.0
+        self._clip_start_time = 0.0
+        self._current_clip_filename: str | None = None
         
         self.latest_frame_raw = None
         self.latest_frame_jpeg = None
@@ -79,6 +87,8 @@ class CameraService:
         image_profile_mode: str = "auto",
         night_start_time: str = "22:00",
         night_end_time: str = "05:00",
+        clip_min_duration: int = 20,
+        clip_max_duration: int = 120,
     ):
         with self._lock:
             self.ip = ip
@@ -90,16 +100,40 @@ class CameraService:
             self.image_profile_mode = image_profile_mode
             self.night_start_time = night_start_time
             self.night_end_time = night_end_time
+            self.clip_min_duration = int(clip_min_duration)
+            self.clip_max_duration = int(clip_max_duration)
             self.status = "CONNECTING"
         # Persiste no banco com senha criptografada em AES-256
         save_camera_config(
             ip, port, http_port, user, password, subtype,
-            image_profile_mode, night_start_time, night_end_time
+            image_profile_mode, night_start_time, night_end_time,
+            self.clip_min_duration, self.clip_max_duration,
         )
         logger.info(
-            f"Configuração da câmera salva e atualizada: {ip}:{port} (Subtype {subtype}, Perfil {image_profile_mode}, Janela Noturna {night_start_time}-{night_end_time})"
+            f"Configuração da câmera salva e atualizada: {ip}:{port} (Subtype {subtype}, Perfil {image_profile_mode}, Janela Noturna {night_start_time}-{night_end_time}, Clips {self.clip_min_duration}-{self.clip_max_duration}s)"
         )
         threading.Thread(target=self._ensure_optimal_camera_image_rpc, daemon=True).start()
+
+    @property
+    def is_recording_clip(self) -> bool:
+        with self._clip_lock:
+            return self._clip_active
+
+    def extend_clip(self, additional_seconds: float = 10.0) -> bool:
+        """
+        Estende o tempo da gravação de alarme ativa enquanto houver movimento/pessoa detectada.
+        Também mantém o LED/Flash aceso pelo mesmo período.
+        """
+        with self._clip_lock:
+            if not self._clip_active:
+                return False
+            now = time.time()
+            max_deadline = self._clip_start_time + self.clip_max_duration
+            new_deadline = min(now + additional_seconds, max_deadline)
+            if new_deadline > self._clip_deadline:
+                self._clip_deadline = new_deadline
+        self.trigger_flash(seconds=additional_seconds + 3.0)
+        return True
 
     def update_active_tracks(self, tracks: list):
         """Atualiza a lista de tracks/caixas rastreadas para sobreposição no streaming."""
@@ -910,19 +944,36 @@ class CameraService:
 
         raise RuntimeError("Nenhum sinal de câmera disponível para snapshot.")
 
-    def record_clip(self, seconds: int = 10, on_complete=None) -> str:
+    def record_clip(self, seconds: int = 20, max_seconds: int = 120, on_complete=None) -> str:
         """
         Grava um clipe de vídeo MP4 com áudio sincronizado e marcações YOLO.
-        Prioriza os quadros anotados pelo YOLO em tempo real + áudio RTSP da câmera,
-        com fallback automático para cópia direta do Stream Principal (1080p nativo).
+        Lógica dinâmica (Post-Roll Buffer):
+        - Inicia com duração base de `seconds` (padrão 20s).
+        - Se o detector continuar detectando movimento/pessoa, `extend_clip()` estende a gravação.
+        - Quando o movimento cessa, a gravação grava o pós-movimento e encerra um único vídeo contínuo.
+        - Possui teto máximo de segurança `max_seconds` (padrão 120s / 2 min).
         """
-        import subprocess
-        from app.routers.stream import resolve_ffmpeg_bin, CLEAN_AUDIO_FILTER
-        timestamp = get_now_str("%Y%m%d_%H%M%S")
-        filename = f"video_{timestamp}.mp4"
-        rec_dir = "backend/recordings" if os.path.exists("backend/recordings") else "recordings"
-        os.makedirs(rec_dir, exist_ok=True)
-        filepath = os.path.join(rec_dir, filename)
+        with self._clip_lock:
+            if self._clip_active:
+                # Já está gravando: apenas estende a gravação atual
+                now = time.time()
+                max_deadline = self._clip_start_time + self.clip_max_duration
+                self._clip_deadline = min(now + 10.0, max_deadline)
+                return self._current_clip_filename or "active_clip.mp4"
+
+            import subprocess
+            from app.routers.stream import resolve_ffmpeg_bin, CLEAN_AUDIO_FILTER
+            timestamp = get_now_str("%Y%m%d_%H%M%S")
+            filename = f"video_{timestamp}.mp4"
+            rec_dir = "backend/recordings" if os.path.exists("backend/recordings") else "recordings"
+            os.makedirs(rec_dir, exist_ok=True)
+            filepath = os.path.join(rec_dir, filename)
+
+            self._clip_active = True
+            self._clip_start_time = time.time()
+            self._clip_deadline = self._clip_start_time + max(5, int(seconds))
+            self.clip_max_duration = max(seconds, int(max_seconds))
+            self._current_clip_filename = filename
 
         rtsp_target = self.mainstream_rtsp_url
         ffmpeg_bin = resolve_ffmpeg_bin()
@@ -932,7 +983,7 @@ class CameraService:
             "-loglevel", "error",
             "-rtsp_transport", "tcp",
             "-i", rtsp_target,
-            "-t", str(seconds),
+            "-t", str(self.clip_max_duration),
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "64k",
@@ -944,7 +995,7 @@ class CameraService:
 
         def _worker():
             try:
-                logger.info(f"Iniciando gravação de vídeo MP4 1080p sincronizado com YOLO ({seconds}s): {filename}")
+                logger.info(f"Iniciando gravação dinâmica de vídeo MP4 1080p ({seconds}s base, até {max_seconds}s): {filename}")
                 recorded_annotated = False
                 if self.status == "ONLINE" and self.latest_frame_jpeg is not None:
                     fps = 12
@@ -962,7 +1013,8 @@ class CameraService:
                         "-i", self.rtsp_url,
                         "-map", "0:v:0",
                         "-map", "1:a:0?",
-                        "-t", str(seconds),
+                        "-shortest",
+                        "-t", str(self.clip_max_duration),
                         "-c:v", "libx264",
                         "-preset", "ultrafast",
                         "-crf", "23",
@@ -981,9 +1033,12 @@ class CameraService:
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                         )
-                        total_frames = int(seconds * fps)
                         interval = 1.0 / fps
-                        for _ in range(total_frames):
+                        while True:
+                            with self._clip_lock:
+                                now = time.time()
+                                if now >= self._clip_deadline or (now - self._clip_start_time) >= self.clip_max_duration:
+                                    break
                             if proc.poll() is not None:
                                 break
                             jpg = self.get_latest_jpeg()
@@ -994,6 +1049,7 @@ class CameraService:
                                 except Exception:
                                     break
                             time.sleep(interval)
+
                         if proc.stdin:
                             try:
                                 proc.stdin.close()
@@ -1007,14 +1063,14 @@ class CameraService:
 
                 if not recorded_annotated:
                     try:
-                        subprocess.run(direct_cmd, timeout=seconds + 10, check=True)
+                        subprocess.run(direct_cmd, timeout=self.clip_max_duration + 10, check=True)
                     except subprocess.CalledProcessError:
                         logger.warning("[!] Falha no stream 1080p para gravação, usando fallback para stream ativo...")
                         fallback_cmd = list(direct_cmd)
                         fallback_cmd[fallback_cmd.index(rtsp_target)] = self.rtsp_url
-                        subprocess.run(fallback_cmd, timeout=seconds + 10, check=True)
+                        subprocess.run(fallback_cmd, timeout=self.clip_max_duration + 10, check=True)
 
-                logger.info(f"[+] Vídeo MP4 gravado com áudio sincronizado: {filepath}")
+                logger.info(f"[+] Vídeo MP4 dinâmico gravado com áudio sincronizado: {filepath}")
                 if on_complete:
                     try:
                         on_complete(filepath, filename)
@@ -1022,6 +1078,10 @@ class CameraService:
                         logger.error(f"Erro no callback pós-gravação de vídeo: {err}")
             except Exception as e:
                 logger.error(f"Erro ao gravar clipe de vídeo: {e}")
+            finally:
+                with self._clip_lock:
+                    self._clip_active = False
+                    self._current_clip_filename = None
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()

@@ -29,6 +29,8 @@ interface CameraStatus {
   night_start_time?: string;
   night_end_time?: string;
   is_night_active?: boolean;
+  clip_min_duration?: number;
+  clip_max_duration?: number;
 }
 
 export function App() {
@@ -128,6 +130,8 @@ export function App() {
               currentImageProfileMode={camStatus.image_profile_mode}
               currentNightStartTime={camStatus.night_start_time}
               currentNightEndTime={camStatus.night_end_time}
+              currentClipMinDuration={camStatus.clip_min_duration}
+              currentClipMaxDuration={camStatus.clip_max_duration}
               onConfigSaved={fetchStatus}
             />
           )}

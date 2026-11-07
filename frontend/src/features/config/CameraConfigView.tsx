@@ -17,6 +17,7 @@ import {
   Sun,
   Moon,
   Clock,
+  Film,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -29,6 +30,8 @@ interface CameraConfigViewProps {
   currentImageProfileMode?: 'auto' | 'day' | 'night';
   currentNightStartTime?: string;
   currentNightEndTime?: string;
+  currentClipMinDuration?: number;
+  currentClipMaxDuration?: number;
   onConfigSaved: () => void;
 }
 
@@ -49,6 +52,8 @@ export function CameraConfigView({
   currentImageProfileMode,
   currentNightStartTime,
   currentNightEndTime,
+  currentClipMinDuration,
+  currentClipMaxDuration,
   onConfigSaved,
 }: CameraConfigViewProps) {
   const { token } = useAuthStore();
@@ -61,6 +66,8 @@ export function CameraConfigView({
   const [imageProfileMode, setImageProfileMode] = useState<'auto' | 'day' | 'night'>(currentImageProfileMode || 'auto');
   const [nightStartTime, setNightStartTime] = useState(currentNightStartTime || '22:00');
   const [nightEndTime, setNightEndTime] = useState(currentNightEndTime || '05:00');
+  const [clipMinDuration, setClipMinDuration] = useState<number>(currentClipMinDuration || 20);
+  const [clipMaxDuration, setClipMaxDuration] = useState<number>(currentClipMaxDuration || 120);
 
   const [hasLoaded, setHasLoaded] = useState(false);
 
@@ -78,6 +85,8 @@ export function CameraConfigView({
       if (currentImageProfileMode) setImageProfileMode(currentImageProfileMode);
       if (currentNightStartTime) setNightStartTime(currentNightStartTime);
       if (currentNightEndTime) setNightEndTime(currentNightEndTime);
+      if (currentClipMinDuration !== undefined) setClipMinDuration(currentClipMinDuration);
+      if (currentClipMaxDuration !== undefined) setClipMaxDuration(currentClipMaxDuration);
       setHasLoaded(true);
     }
   }, [
@@ -89,6 +98,8 @@ export function CameraConfigView({
     currentImageProfileMode,
     currentNightStartTime,
     currentNightEndTime,
+    currentClipMinDuration,
+    currentClipMaxDuration,
     hasLoaded,
   ]);
 
@@ -215,6 +226,8 @@ export function CameraConfigView({
           image_profile_mode: imageProfileMode,
           night_start_time: nightStartTime,
           night_end_time: nightEndTime,
+          clip_min_duration: Number(clipMinDuration),
+          clip_max_duration: Number(clipMaxDuration),
         }),
       });
 
@@ -595,6 +608,64 @@ export function CameraConfigView({
                 />
               </div>
             </div>
+          </div>
+        </div>
+
+        {/* Card 4: Gravação Dinâmica de Alarme & Flagrante (Post-Roll Buffer) */}
+        <div className="bg-[#080B10] border border-zinc-800/90 rounded-xl p-4 sm:p-6 space-y-4 sm:space-y-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-zinc-800/80 pb-3 gap-2">
+            <div>
+              <span className="text-xs font-bold uppercase tracking-wider text-emerald-400 font-mono flex items-center gap-2">
+                <Film className="w-4 h-4 text-emerald-400" /> 4. Gravação Dinâmica de Alarme (Post-Roll / Extensão por Movimento)
+              </span>
+              <p className="text-[11px] text-zinc-400 font-mono mt-0.5">
+                Grava um único vídeo contínuo enquanto houver pessoa na cena, evitando vídeos picotados de 10 em 10 segundos
+              </p>
+            </div>
+            <span className="text-[10px] font-mono text-zinc-500">ALARM::DYNAMIC_CLIP</span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-semibold text-zinc-300 mb-1.5 font-mono">
+                Duração Base Inicial (Segundos)
+              </label>
+              <input
+                type="number"
+                min={10}
+                max={60}
+                value={clipMinDuration}
+                onChange={(e) => setClipMinDuration(Number(e.target.value))}
+                className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 sm:p-3 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none min-h-[42px]"
+              />
+              <p className="text-[10px] text-zinc-500 font-mono mt-1">
+                Padrão recomendado: 20s. Tempo mínimo garantido do início do flagrante.
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-zinc-300 mb-1.5 font-mono">
+                Teto Máximo de Segurança (Segundos)
+              </label>
+              <input
+                type="number"
+                min={30}
+                max={300}
+                value={clipMaxDuration}
+                onChange={(e) => setClipMaxDuration(Number(e.target.value))}
+                className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 sm:p-3 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none min-h-[42px]"
+              />
+              <p className="text-[10px] text-zinc-500 font-mono mt-1">
+                Padrão: 120s (2 min). Protege o upload do WhatsApp caso alguém fique parado no campo de visão.
+              </p>
+            </div>
+          </div>
+
+          <div className="p-3 rounded-lg bg-[#0C1017] border border-zinc-800/80 text-[11px] font-mono text-zinc-400 flex items-start gap-2.5">
+            <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+            <span>
+              <b className="text-zinc-200">Como funciona:</b> Ao detectar uma pessoa, a câmera aciona o flash e inicia a gravação de {clipMinDuration}s. A cada frame em que a pessoa continua visível, o sistema estende a gravação em +10s (e mantém a luz acesa) até o limite de {clipMaxDuration}s. Quando a pessoa sai, o vídeo é finalizado e enviado de uma só vez para o WhatsApp e Google Drive.
+            </span>
           </div>
         </div>
 
