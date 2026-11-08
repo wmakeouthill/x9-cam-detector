@@ -44,6 +44,7 @@ def init_db():
             night_end_time TEXT NOT NULL DEFAULT '05:00',
             clip_min_duration INTEGER NOT NULL DEFAULT 20,
             clip_max_duration INTEGER NOT NULL DEFAULT 120,
+            target_overlay INTEGER NOT NULL DEFAULT 1,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -61,6 +62,8 @@ def init_db():
         cursor.execute("ALTER TABLE camera_config ADD COLUMN clip_min_duration INTEGER NOT NULL DEFAULT 20")
     if "clip_max_duration" not in existing_cols:
         cursor.execute("ALTER TABLE camera_config ADD COLUMN clip_max_duration INTEGER NOT NULL DEFAULT 120")
+    if "target_overlay" not in existing_cols:
+        cursor.execute("ALTER TABLE camera_config ADD COLUMN target_overlay INTEGER NOT NULL DEFAULT 1")
 
     # Tabela 2: Regras do Vigia Noturno
     cursor.execute("""
@@ -73,9 +76,16 @@ def init_db():
             confidence_threshold REAL NOT NULL DEFAULT 0.45,
             model_type TEXT NOT NULL DEFAULT 'yolov8s',
             retention_days INTEGER NOT NULL DEFAULT 15,
+            detection_mode TEXT NOT NULL DEFAULT 'hybrid',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Migração idempotente para detection_mode
+    cursor.execute("PRAGMA table_info(night_watch_config)")
+    nw_cols = [c["name"] for c in cursor.fetchall()]
+    if "detection_mode" not in nw_cols:
+        cursor.execute("ALTER TABLE night_watch_config ADD COLUMN detection_mode TEXT NOT NULL DEFAULT 'hybrid'")
 
     # Tabela 3: Fila de Sincronização e Reconciliação Offline com Google Drive
     cursor.execute("""
@@ -164,8 +174,8 @@ def init_db():
     cursor.execute("SELECT COUNT(*) as count FROM night_watch_config WHERE id = 1")
     if cursor.fetchone()["count"] == 0:
         cursor.execute("""
-            INSERT INTO night_watch_config (id, enabled, start_time, end_time, flash_duration, confidence_threshold, model_type, retention_days)
-            VALUES (1, 1, '00:00', '06:00', 2.5, 0.45, 'yolov8s', 15)
+            INSERT INTO night_watch_config (id, enabled, start_time, end_time, flash_duration, confidence_threshold, model_type, retention_days, detection_mode)
+            VALUES (1, 1, '00:00', '06:00', 2.5, 0.45, 'yolov8s', 15, 'hybrid')
         """)
 
     cursor.execute("SELECT COUNT(*) as count FROM whatsapp_config WHERE id = 1")
@@ -185,10 +195,11 @@ def init_db():
     if cursor.fetchone()["count"] == 0:
         cursor.execute("""
             INSERT INTO dvr_config (id, enabled, segment_seconds, retention_days, subtype)
-            VALUES (1, 1, 900, 15, 0)
+            VALUES (1, 1, 60, 15, 0)
         """)
     else:
-        cursor.execute("UPDATE dvr_config SET segment_seconds = 900 WHERE id = 1 AND segment_seconds = 60")
+        # Blocos > 5 min (~3,7 Mbps => 140 MB+) não cabem no buffer tmpfs e travavam o gravador.
+        cursor.execute("UPDATE dvr_config SET segment_seconds = 60 WHERE id = 1 AND segment_seconds > 300")
 
     conn.commit()
     conn.close()
@@ -209,6 +220,7 @@ def get_camera_config() -> dict:
     data.setdefault("night_end_time", "05:00")
     data.setdefault("clip_min_duration", 20)
     data.setdefault("clip_max_duration", 120)
+    data.setdefault("target_overlay", 1)
     return data
 
 def save_camera_config(
@@ -223,6 +235,7 @@ def save_camera_config(
     night_end_time: str = "05:00",
     clip_min_duration: int = 20,
     clip_max_duration: int = 120,
+    target_overlay: bool = True,
 ):
     conn = get_connection()
     cursor = conn.cursor()
@@ -230,9 +243,9 @@ def save_camera_config(
         INSERT INTO camera_config (
             id, ip, port, http_port, user, password_encrypted, subtype,
             image_profile_mode, night_start_time, night_end_time,
-            clip_min_duration, clip_max_duration, updated_at
+            clip_min_duration, clip_max_duration, target_overlay, updated_at
         )
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             ip = excluded.ip,
             port = excluded.port,
@@ -245,6 +258,7 @@ def save_camera_config(
             night_end_time = excluded.night_end_time,
             clip_min_duration = excluded.clip_min_duration,
             clip_max_duration = excluded.clip_max_duration,
+            target_overlay = excluded.target_overlay,
             updated_at = CURRENT_TIMESTAMP
     """, (
         ip,
@@ -258,6 +272,7 @@ def save_camera_config(
         night_end_time,
         int(clip_min_duration),
         int(clip_max_duration),
+        1 if target_overlay else 0,
     ))
     conn.commit()
     conn.close()
@@ -288,12 +303,23 @@ def get_night_watch_config() -> dict:
     conn.close()
     return dict(row) if row else {}
 
-def save_night_watch_config(enabled: bool, start_time: str, end_time: str, flash_duration: float, confidence_threshold: float, model_type: str, retention_days: int = 15):
+def save_night_watch_config(
+    enabled: bool,
+    start_time: str,
+    end_time: str,
+    flash_duration: float,
+    confidence_threshold: float,
+    model_type: str,
+    retention_days: int = 15,
+    detection_mode: str = "hybrid",
+):
+    if detection_mode not in ("hybrid", "camera", "yolo"):
+        detection_mode = "hybrid"
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO night_watch_config (id, enabled, start_time, end_time, flash_duration, confidence_threshold, model_type, retention_days, updated_at)
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO night_watch_config (id, enabled, start_time, end_time, flash_duration, confidence_threshold, model_type, retention_days, detection_mode, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(id) DO UPDATE SET
             enabled = excluded.enabled,
             start_time = excluded.start_time,
@@ -302,19 +328,26 @@ def save_night_watch_config(enabled: bool, start_time: str, end_time: str, flash
             confidence_threshold = excluded.confidence_threshold,
             model_type = excluded.model_type,
             retention_days = excluded.retention_days,
+            detection_mode = excluded.detection_mode,
             updated_at = CURRENT_TIMESTAMP
-    """, (1 if enabled else 0, start_time, end_time, flash_duration, confidence_threshold, model_type, retention_days))
+    """, (1 if enabled else 0, start_time, end_time, flash_duration, confidence_threshold, model_type, retention_days, detection_mode))
     conn.commit()
     conn.close()
 
-def log_detection_event(confidence: float, flash_triggered: bool, snapshot_path: str, video_path: str | None = None) -> int:
+def log_detection_event(
+    confidence: float,
+    flash_triggered: bool,
+    snapshot_path: str,
+    video_path: str | None = None,
+    event_type: str = "PERSON_DETECTED",
+) -> int:
     conn = get_connection()
     cursor = conn.cursor()
     brt_ts = get_now_str()
     cursor.execute("""
-        INSERT INTO detection_events (timestamp, confidence, flash_triggered, snapshot_path, video_path)
-        VALUES (?, ?, ?, ?, ?)
-    """, (brt_ts, confidence, 1 if flash_triggered else 0, snapshot_path, video_path))
+        INSERT INTO detection_events (timestamp, event_type, confidence, flash_triggered, snapshot_path, video_path)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (brt_ts, event_type, confidence, 1 if flash_triggered else 0, snapshot_path, video_path))
     event_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -968,21 +1001,38 @@ def find_dvr_segment_for_seek(seconds_ago: int = 30, target_time_str: str | None
             chosen = seg
             break
 
-    # 2. Fallback: se target_dt caiu num intervalo intermediário, pega o segmento válido mais próximo
+    # 2. Buraco na gravação: escolhe o segmento disponível MAIS PRÓXIMO (antes ou depois do alvo),
+    #    em vez de sempre cair no anterior / no mais recente (= "ao vivo"). O chamador recebe gap=True.
+    gap = False
     if not chosen:
-        for seg in candidates:
-            if _is_dvr_file_available(seg.get("filename") or "", seg.get("drive_file_id")):
-                chosen = seg
-                break
-
-    # 3. Fallback absoluto: o mais recente segmento válido do sistema
-    if not chosen:
-        cursor.execute("SELECT * FROM dvr_segments WHERE status != 'failed' ORDER BY start_time DESC LIMIT 10")
-        for r in cursor.fetchall():
-            row_dict = dict(r)
-            if _is_dvr_file_available(row_dict.get("filename") or "", row_dict.get("drive_file_id")):
-                chosen = row_dict
-                break
+        gap = True
+        cursor.execute("""
+            SELECT * FROM dvr_segments
+            WHERE start_time > ? AND status != 'failed'
+            ORDER BY start_time ASC LIMIT 20
+        """, (target_str,))
+        after = [dict(r) for r in cursor.fetchall() if _is_dvr_file_available(r["filename"] or "", r["drive_file_id"])]
+        before = [s for s in candidates if _is_dvr_file_available(s.get("filename") or "", s.get("drive_file_id"))]
+        options = []
+        if after:
+            options.append((after[0], True))
+        if before:
+            options.append((before[0], False))
+        best = []
+        for seg, is_after in options:
+            try:
+                s_start = datetime.strptime(seg["start_time"], "%Y-%m-%d %H:%M:%S")
+                s_end = (
+                    datetime.strptime(seg["end_time"], "%Y-%m-%d %H:%M:%S")
+                    if seg.get("end_time")
+                    else s_start + timedelta(seconds=int(seg.get("duration_seconds") or 60))
+                )
+            except ValueError:
+                continue
+            dist = (s_start - target_dt) if is_after else (target_dt - s_end)
+            best.append((abs(dist.total_seconds()), seg))
+        if best:
+            chosen = min(best, key=lambda x: x[0])[1]
 
     # Marca no banco arquivos orfãos detectados
     if to_mark_failed:
@@ -1010,7 +1060,51 @@ def find_dvr_segment_for_seek(seconds_ago: int = 30, target_time_str: str | None
     return {
         "segment": chosen,
         "seek_offset": seek_offset,
+        "gap": gap,
     }
+
+def get_dvr_segment_by_filename(filename: str) -> dict | None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM dvr_segments WHERE filename = ?", (filename,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def list_dvr_timeline(date_str: str) -> list[dict]:
+    """Todos os blocos reproduzíveis do dia (ordem cronológica) para montar a linha do tempo contínua."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT filename, start_time, end_time, duration_seconds, status
+        FROM dvr_segments
+        WHERE start_time LIKE ? AND status != 'failed'
+        ORDER BY start_time ASC
+    """, (f"{date_str[:10]}%",))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def find_dvr_adjacent_segment(filename: str, direction: str = "next") -> dict | None:
+    """Bloco cronologicamente anterior/seguinte ao informado (cruza fronteira de dia/hora)."""
+    cur_seg = get_dvr_segment_by_filename(filename)
+    if not cur_seg:
+        return None
+    nxt = direction != "prev"
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT * FROM dvr_segments
+        WHERE start_time {'>' if nxt else '<'} ? AND status != 'failed'
+        ORDER BY start_time {'ASC' if nxt else 'DESC'}
+        LIMIT 10
+    """, (cur_seg["start_time"],))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    for r in rows:
+        if _is_dvr_file_available(r.get("filename") or "", r.get("drive_file_id")):
+            return r
+    return None
 
 def _remove_local_dvr_file(filename: str):
     if not filename:

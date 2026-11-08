@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+from collections import OrderedDict
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -27,6 +28,9 @@ from app.db import (
     list_dvr_available_dates,
     list_dvr_hours_summary,
     find_dvr_segment_for_seek,
+    get_dvr_segment_by_filename,
+    list_dvr_timeline,
+    find_dvr_adjacent_segment,
     delete_dvr_segment,
 )
 
@@ -56,6 +60,7 @@ class CameraConfigRequest(BaseModel):
     night_end_time: str = "05:00"
     clip_min_duration: int = 20
     clip_max_duration: int = 120
+    target_overlay: bool = True
 
 class DvrConfigRequest(BaseModel):
     segment_seconds: int | None = None
@@ -75,9 +80,15 @@ class NightWatchRequest(BaseModel):
     confidence_threshold: float = 0.45
     model_type: str = "yolov8s"
     retention_days: int = 15
+    detection_mode: str = "hybrid" # "hybrid", "camera", "yolo"
 
 @router.get("/status")
 def get_camera_status(user: str = Depends(get_current_user)):
+    now_ts = time.time()
+    cam_event_active = bool(
+        camera_service.camera_event_active
+        and (now_ts - camera_service.last_camera_event_time < 8.0)
+    )
     return {
         "status": camera_service.status,
         "fps": camera_service.fps,
@@ -88,6 +99,11 @@ def get_camera_status(user: str = Depends(get_current_user)):
         "subtype": camera_service.subtype,
         "user": camera_service.user,
         "detector_active": detector_service.is_active,
+        "detection_mode": detector_service.detection_mode,
+        "yolo_awake": detector_service.yolo_awake,
+        "camera_event_active": cam_event_active,
+        "last_camera_event_code": camera_service.last_camera_event_code,
+        "last_camera_event_time": camera_service.last_camera_event_time,
         "person_detected": detector_service.last_person_detected,
         "people_count": detector_service.people_count,
         "last_confidence": round(detector_service.last_confidence * 100, 1),
@@ -100,6 +116,7 @@ def get_camera_status(user: str = Depends(get_current_user)):
         "is_night_active": camera_service.is_night_active,
         "clip_min_duration": camera_service.clip_min_duration,
         "clip_max_duration": camera_service.clip_max_duration,
+        "target_overlay": camera_service.target_overlay,
         "is_recording_clip": camera_service.is_recording_clip,
     }
 
@@ -234,7 +251,10 @@ def update_nightwatch_settings(req: NightWatchRequest, user: str = Depends(get_c
         confidence_threshold=req.confidence_threshold,
         model_type=req.model_type,
         retention_days=req.retention_days,
+        detection_mode=req.detection_mode,
     )
+    detector_service.detection_mode = req.detection_mode
+    detector_service._cached_cfg = None
     return {"status": "updated", "config": req.dict()}
 
 @router.get("/events")
@@ -320,6 +340,7 @@ def update_config(req: CameraConfigRequest, user: str = Depends(get_current_user
         night_end_time=req.night_end_time,
         clip_min_duration=req.clip_min_duration,
         clip_max_duration=req.clip_max_duration,
+        target_overlay=req.target_overlay,
     )
     res_data = req.dict()
     res_data["password"] = "******"
@@ -543,8 +564,28 @@ def seek_dvr_recording(
         "found": True,
         "segment": seg,
         "seek_offset": res["seek_offset"],
+        "gap": res.get("gap", False),
         "url": f"/api/camera/dvr/video/{seg['filename']}",
     }
+
+@router.get("/dvr/timeline")
+def get_dvr_timeline(
+    date: str = Query(..., description="Data YYYY-MM-DD"),
+    user: str = Depends(get_current_user),
+):
+    """Blocos do dia em ordem cronológica: base da linha do tempo contínua (slots de 10 min) no frontend."""
+    return {"date": date[:10], "segments": list_dvr_timeline(date)}
+
+@router.get("/dvr/adjacent")
+def get_dvr_adjacent(
+    filename: str,
+    direction: str = Query("next", pattern="^(next|prev)$"),
+    user: str = Depends(get_current_user),
+):
+    seg = find_dvr_adjacent_segment(os.path.basename(filename), direction)
+    if not seg:
+        return {"found": False}
+    return {"found": True, "segment": seg, "url": f"/api/camera/dvr/video/{seg['filename']}"}
 
 def _serve_video_with_range(
     request: Request,
@@ -635,6 +676,58 @@ def _serve_video_with_range(
 
     raise HTTPException(status_code=404, detail="Segmento DVR não encontrado")
 
+class DvrRangeCache:
+    """Cache LRU em memória com teto em bytes para fatias de vídeo do Google Drive."""
+
+    def __init__(self, max_bytes: int = 64 * 1024 * 1024):
+        self._max_bytes = max_bytes
+        self._curr_bytes = 0
+        self._cache: OrderedDict[tuple[str, int, int], bytes] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, filename: str, start: int, end: int) -> bytes | None:
+        key = (filename, start, end)
+        with self._lock:
+            data = self._cache.get(key)
+            if data is not None:
+                self._cache.move_to_end(key)
+                return data
+        return None
+
+    def put(self, filename: str, start: int, end: int, data: bytes) -> None:
+        key = (filename, start, end)
+        data_len = len(data)
+        if data_len > self._max_bytes:
+            return
+        with self._lock:
+            if key in self._cache:
+                self._curr_bytes -= len(self._cache[key])
+                del self._cache[key]
+            while self._curr_bytes + data_len > self._max_bytes and self._cache:
+                _, old = self._cache.popitem(last=False)
+                self._curr_bytes -= len(old)
+            self._cache[key] = data
+            self._curr_bytes += data_len
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+            self._curr_bytes = 0
+
+    @property
+    def total_bytes(self) -> int:
+        with self._lock:
+            return self._curr_bytes
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+_dvr_range_cache = DvrRangeCache(max_bytes=64 * 1024 * 1024)
+_gdrive_download_semaphore = threading.BoundedSemaphore(3)
+_dvr_download_locks: dict[str, threading.Lock] = {}
+_dvr_download_locks_guard = threading.Lock()
+
 @router.get("/dvr/video/{filename}")
 def get_dvr_video(filename: str, request: Request, user: str = Depends(get_current_user)):
     safe_name = os.path.basename(filename)
@@ -654,20 +747,82 @@ def get_dvr_video(filename: str, request: Request, user: str = Depends(get_curre
             return _serve_video_with_range(request, filepath=candidate, is_recording=is_active)
 
     if gdrive_service.is_configured:
-        data = gdrive_service.get_dvr_file_bytes(safe_name)
-        if data:
-            # Salva em cache no buffer em RAM (dvr_service.recordings_dir) para que
-            # as requisições Range subsequentes sejam instantâneas sem tocar no disco D:
-            cache_dir = dvr_service.recordings_dir
-            os.makedirs(cache_dir, exist_ok=True)
-            cache_path = os.path.join(cache_dir, safe_name)
-            try:
-                with open(cache_path, "wb") as f:
-                    f.write(data)
-                dvr_service._prune_ram_buffer()
-                return _serve_video_with_range(request, filepath=cache_path, is_recording=False)
-            except Exception:
-                return _serve_video_with_range(request, raw_bytes=data, is_recording=False)
+        seg_row = get_dvr_segment_by_filename(safe_name) or {}
+        drive_file_id = seg_row.get("drive_file_id")
+        size_bytes = int(seg_row.get("size_bytes") or 0)
+
+        # Se tem drive_file_id e tamanho conhecido, serve fatias em fluxo por HTTP Range (206)
+        if drive_file_id and size_bytes > 0:
+            range_header = request.headers.get("range")
+            max_chunk = 2 * 1024 * 1024  # 2 MB para Range sem fim
+
+            start = 0
+            end = None
+            if range_header:
+                try:
+                    range_val = range_header.strip().lower().replace("bytes=", "")
+                    start_str, end_str = (range_val.split("-", 1) + [""])[:2]
+                    if start_str:
+                        start = int(start_str)
+                    if end_str:
+                        end = int(end_str)
+                except Exception:
+                    start = 0
+                    end = None
+
+            if end is None:
+                end = min(size_bytes - 1, start + max_chunk - 1)
+
+            start = max(0, min(start, size_bytes - 1))
+            end = max(start, min(end, size_bytes - 1))
+
+            chunk = _dvr_range_cache.get(safe_name, start, end)
+            if chunk is None:
+                with _gdrive_download_semaphore:
+                    chunk = _dvr_range_cache.get(safe_name, start, end)
+                    if chunk is None:
+                        chunk = gdrive_service.get_dvr_file_range(
+                            safe_name, drive_file_id=drive_file_id, start=start, end=end
+                        )
+                        if chunk:
+                            _dvr_range_cache.put(safe_name, start, end, chunk)
+
+            if chunk is not None:
+                actual_end = start + len(chunk) - 1
+                return Response(
+                    content=chunk,
+                    status_code=206,
+                    media_type="video/mp4",
+                    headers={
+                        "Content-Range": f"bytes {start}-{actual_end}/{size_bytes}",
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": str(len(chunk)),
+                        "Cache-Control": "private, max-age=3600",
+                    },
+                )
+
+        # Fallback (size_bytes ausente/0 ou sem drive_file_id): baixa arquivo inteiro como antes
+        with _dvr_download_locks_guard:
+            lock = _dvr_download_locks.setdefault(safe_name, threading.Lock())
+        with lock:
+            for folder in search_dirs:
+                candidate = os.path.join(folder or "", safe_name)
+                if folder and os.path.exists(candidate) and os.path.getsize(candidate) >= 16384:
+                    return _serve_video_with_range(request, filepath=candidate, is_recording=False)
+            with _gdrive_download_semaphore:
+                data = gdrive_service.get_dvr_file_bytes(safe_name, drive_file_id=drive_file_id)
+            if data:
+                # Cache no buffer RAM: Range seguintes saem instantâneos sem tocar no disco D:
+                cache_dir = dvr_service.recordings_dir
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_path = os.path.join(cache_dir, safe_name)
+                try:
+                    with open(cache_path, "wb") as f:
+                        f.write(data)
+                    dvr_service._prune_ram_buffer()
+                    return _serve_video_with_range(request, filepath=cache_path, is_recording=False)
+                except Exception:
+                    return _serve_video_with_range(request, raw_bytes=data, is_recording=False)
 
     raise HTTPException(status_code=404, detail="Gravação 24h não encontrada")
 

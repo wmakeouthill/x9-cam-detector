@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import time
 import tempfile
 import threading
@@ -27,6 +28,10 @@ logger = logging.getLogger("x9.dvr")
 MIN_VALID_SEGMENT_BYTES = 16 * 1024
 # Janela máxima de segmentos recentes mantidos em buffer RAM (/tmp/x9_dvr_buffer) após upload para o Drive
 RAM_CUSHION_MAX_SEGMENTS = 6
+# Bloco máximo: ~3,7 Mbps => 5 min ≈ 140 MB. Acima disso o tmpfs enche e o gravador entra em loop de ffmpeg vazio.
+MAX_SEGMENT_SECONDS = 300
+# Abaixo disso de espaço livre no buffer, libera blocos já sincronizados (mais antigos primeiro)
+MIN_FREE_BUFFER_BYTES = 200 * 1024 * 1024
 
 
 def _resolve_dvr_buffer_dir() -> str:
@@ -79,7 +84,7 @@ class DvrService:
         try:
             cfg = get_dvr_config()
             self.enabled = bool(cfg.get("enabled", True))
-            self.segment_seconds = int(cfg.get("segment_seconds", 900))
+            self.segment_seconds = min(MAX_SEGMENT_SECONDS, max(60, int(cfg.get("segment_seconds", 60))))
             self.retention_days = int(cfg.get("retention_days", 15))
             self.subtype = int(cfg.get("subtype", 0))
         except Exception as e:
@@ -169,7 +174,7 @@ class DvrService:
         subtype: int | None = None,
     ) -> dict:
         if segment_seconds is not None:
-            self.segment_seconds = max(60, int(segment_seconds))
+            self.segment_seconds = min(MAX_SEGMENT_SECONDS, max(60, int(segment_seconds)))
         if retention_days is not None:
             self.retention_days = max(1, int(retention_days))
         if subtype is not None:
@@ -442,6 +447,12 @@ class DvrService:
         if filename in self._faststart_done:
             return
         self._faststart_done.add(filename)
+        try:
+            # O remux grava uma cópia temporária: sem folga no tmpfs, é melhor pular que encher o buffer
+            if shutil.disk_usage(self.recordings_dir).free < os.path.getsize(filepath) * 2:
+                return
+        except OSError:
+            return
         tmp_path = filepath + ".faststart.mp4"
         try:
             ffmpeg_bin = resolve_ffmpeg_bin()
@@ -485,12 +496,18 @@ class DvrService:
         except Exception:
             return
 
-        if len(files) <= RAM_CUSHION_MAX_SEGMENTS:
+        try:
+            low_space = shutil.disk_usage(self.recordings_dir).free < MIN_FREE_BUFFER_BYTES
+        except OSError:
+            low_space = False
+
+        if len(files) <= RAM_CUSHION_MAX_SEGMENTS and not low_space:
             return
 
         # Consulta status no SQLite para só apagar do buffer o que já subiu para o Google Drive (ou se Drive não estiver ativo)
         seg_map = {s["filename"]: s.get("status") for s in list_dvr_segments(limit=200)}
-        candidates_to_prune = files[:-RAM_CUSHION_MAX_SEGMENTS]
+        # Com pouco espaço livre, qualquer bloco sincronizado (menos o atual) pode sair, do mais antigo ao mais novo
+        candidates_to_prune = files if low_space else files[:-RAM_CUSHION_MAX_SEGMENTS]
         for fname in candidates_to_prune:
             if fname == self.current_segment:
                 continue
@@ -502,6 +519,12 @@ class DvrService:
                     self._faststart_done.discard(fname)
                 except OSError:
                     pass
+                if low_space:
+                    try:
+                        if shutil.disk_usage(self.recordings_dir).free >= MIN_FREE_BUFFER_BYTES * 2:
+                            break
+                    except OSError:
+                        break
 
     def _migrate_legacy_disk_segments(self):
         """

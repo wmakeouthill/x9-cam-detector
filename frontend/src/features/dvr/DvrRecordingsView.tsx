@@ -24,6 +24,7 @@ import {
   Layers,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
+import { useDvrWindow } from './useDvrWindow';
 
 export interface DvrHourSummary {
   hour: string;
@@ -84,6 +85,24 @@ function formatBRDateOnly(rawDate: string): string {
   return rawDate;
 }
 
+// Data LOCAL (YYYY-MM-DD). toISOString() devolve UTC e, depois das 21h em BRT, já cai no dia seguinte.
+function localDateStr(d: Date = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+interface TimelineSeg {
+  filename: string;
+  start_time: string;
+  end_time?: string | null;
+  duration_seconds?: number;
+}
+
+function parseTs(raw?: string | null): number {
+  if (!raw) return NaN;
+  return new Date(raw.replace(' ', 'T')).getTime();
+}
+
 function formatDurationLabel(seconds?: number, status?: string): string {
   if (status === 'recording') return 'Gravando agora';
   if (!seconds || seconds <= 0) return '1 min';
@@ -124,8 +143,50 @@ export function DvrRecordingsView() {
   const [feedback, setFeedback] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
   const [jumpTime, setJumpTime] = useState<string>('');
+  const [currentMinute, setCurrentMinute] = useState<number | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  // Offset (s) a aplicar assim que o vídeo do novo bloco tiver metadados; currentTime antes disso é ignorado
+  const pendingOffsetRef = useRef<number | null>(null);
+  const [timeline, setTimeline] = useState<TimelineSeg[]>([]);
+
+  const {
+    dayTimeline,
+    preloadContainerRef,
+    playNext,
+    playPrev,
+    seekRelative,
+    refreshDateTimeline,
+  } = useDvrWindow({
+    token,
+    activeSegment,
+    setActiveSegment,
+    pendingOffsetRef,
+    videoRef,
+    onFeedback: (fb) => setFeedback(fb),
+  });
+
+  const handleTimeUpdate = (currentTimeSeconds: number) => {
+    if (!activeSegment?.start_time) return;
+    const startMs = parseTs(activeSegment.start_time);
+    if (isNaN(startMs)) return;
+    const currentMs = startMs + Math.floor(currentTimeSeconds) * 1000;
+    const min = new Date(currentMs).getMinutes();
+    if (min !== currentMinute) {
+      setCurrentMinute(min);
+    }
+  };
+
+  useEffect(() => {
+    if (activeSegment?.start_time) {
+      const startMs = parseTs(activeSegment.start_time);
+      if (!isNaN(startMs)) {
+        setCurrentMinute(new Date(startMs).getMinutes());
+      }
+    } else {
+      setCurrentMinute(null);
+    }
+  }, [activeSegment?.filename]);
 
   const safeParseJson = async (res: Response) => {
     const text = await res.text();
@@ -155,9 +216,18 @@ export function DvrRecordingsView() {
     }
   };
 
+  const applyPendingOffset = () => {
+    const v = videoRef.current;
+    if (!v || pendingOffsetRef.current === null) return;
+    v.currentTime = pendingOffsetRef.current;
+    pendingOffsetRef.current = null;
+    v.playbackRate = playbackSpeed;
+    v.play().catch(() => {});
+  };
+
   const handleJumpToTime = async (customTs?: string) => {
     if (!token) return;
-    const targetDate = selectedDate || (availableDates[0] || new Date().toISOString().split('T')[0]);
+    const targetDate = selectedDate || (availableDates[0] || localDateStr());
     let targetTimestamp = customTs;
     if (!targetTimestamp) {
       if (!jumpTime) return;
@@ -169,16 +239,23 @@ export function DvrRecordingsView() {
       });
       const data = await safeParseJson(res);
       if (res.ok && data.found && data.segment) {
-        setActiveSegment(data.segment);
         const offset = data.seek_offset || 0;
-        setTimeout(() => {
-          if (videoRef.current) {
-            videoRef.current.currentTime = offset;
-            videoRef.current.play().catch(() => {});
-          }
-        }, 200);
         const display = targetTimestamp.length >= 16 ? targetTimestamp.substring(11, 16) : targetTimestamp;
-        setFeedback({ text: `Carregado: bloco gravado das ${display} (${data.segment.filename}).`, type: 'success' });
+        if (activeSegment?.filename === data.segment.filename && videoRef.current) {
+          videoRef.current.currentTime = offset;
+          videoRef.current.play().catch(() => {});
+        } else {
+          pendingOffsetRef.current = offset;
+          setActiveSegment(data.segment);
+        }
+        if (data.gap) {
+          setFeedback({
+            text: `Sem gravação às ${display}. Mostrando a mais próxima: ${formatBRDateTime(data.segment.start_time)}.`,
+            type: 'error',
+          });
+        } else {
+          setFeedback({ text: `Carregado: ${display} (${data.segment.filename}).`, type: 'success' });
+        }
       } else {
         setFeedback({ text: data.message || `Nenhum vídeo gravado encontrado próximo das ${targetTimestamp}.`, type: 'error' });
       }
@@ -190,7 +267,7 @@ export function DvrRecordingsView() {
   const handleRulerMinuteClick = (minute: number) => {
     const minStr = String(minute).padStart(2, '0');
     const hrStr = selectedHour || (activeSegment?.start_time ? activeSegment.start_time.substring(11, 13) : '00');
-    const targetDate = selectedDate || (activeSegment?.start_time ? activeSegment.start_time.substring(0, 10) : new Date().toISOString().split('T')[0]);
+    const targetDate = selectedDate || (activeSegment?.start_time ? activeSegment.start_time.substring(0, 10) : localDateStr());
     const targetTs = `${targetDate} ${hrStr}:${minStr}:00`;
     handleJumpToTime(targetTs);
   };
@@ -198,14 +275,31 @@ export function DvrRecordingsView() {
   const handleSelectHour = (hr: string) => {
     setSelectedHour(hr);
     setOffset(0);
-    const targetDate = selectedDate || (availableDates[0] || new Date().toISOString().split('T')[0]);
+    const targetDate = selectedDate || (availableDates[0] || localDateStr());
     handleJumpToTime(`${targetDate} ${hr}:00:00`);
   };
+
+  const fetchTimeline = useCallback(async () => {
+    if (!token) return;
+    try {
+      const targetDate =
+        selectedDate || activeSegment?.start_time?.substring(0, 10) || availableDates[0] || localDateStr();
+      const res = await fetch(`/api/camera/dvr/timeline?date=${encodeURIComponent(targetDate)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await safeParseJson(res);
+        setTimeline(data.segments || []);
+      }
+    } catch {
+      // ignora
+    }
+  }, [token, selectedDate, availableDates, activeSegment?.start_time]);
 
   const fetchHoursSummary = useCallback(async () => {
     if (!token) return;
     try {
-      const targetDate = selectedDate || (availableDates[0] || new Date().toISOString().split('T')[0]);
+      const targetDate = selectedDate || (availableDates[0] || localDateStr());
       const res = await fetch(`/api/camera/dvr/hours?date=${encodeURIComponent(targetDate)}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -265,13 +359,11 @@ export function DvrRecordingsView() {
             setAvailableDates(data.available_dates);
           }
 
-          // Seleciona automaticamente o bloco mais recente concluído (ou o primeiro disponível) se nenhum estiver ativo
+          // Só escolhe automaticamente quando nada está tocando. Antes, qualquer bloco fora do filtro
+          // atual (ex.: pulo para 18:00 caindo em bloco 17:5x) era trocado pelo mais recente da lista.
           setActiveSegment((prev) => {
-            if (prev && items.some((s) => s.id === prev.id)) {
-              return items.find((s) => s.id === prev.id) || prev;
-            }
-            const firstReady = items.find((s) => s.status !== 'recording') || items[0] || null;
-            return firstReady;
+            if (prev) return items.find((s) => s.id === prev.id) || prev;
+            return items.find((s) => s.status !== 'recording') || items[0] || null;
           });
         }
       } catch {
@@ -289,13 +381,28 @@ export function DvrRecordingsView() {
     fetchDvrStatus();
     fetchSegments(offset);
     fetchHoursSummary();
+    fetchTimeline();
     const interval = setInterval(() => {
       fetchDvrStatus();
       fetchSegments(offset, true);
       fetchHoursSummary();
+      fetchTimeline();
+      const targetDate =
+        selectedDate || activeSegment?.start_time?.substring(0, 10) || availableDates[0] || localDateStr();
+      refreshDateTimeline(targetDate);
     }, 10000);
     return () => clearInterval(interval);
-  }, [fetchDvrStatus, fetchSegments, fetchHoursSummary, offset]);
+  }, [
+    fetchDvrStatus,
+    fetchSegments,
+    fetchHoursSummary,
+    fetchTimeline,
+    refreshDateTimeline,
+    offset,
+    selectedDate,
+    activeSegment?.start_time,
+    availableDates,
+  ]);
 
   const handleToggleDvr = async () => {
     if (!token || toggling) return;
@@ -396,42 +503,27 @@ export function DvrRecordingsView() {
     }
   };
 
-  // Controle de avanço/retrocesso em segundos no player principal
-  const handleSeekPlayer = (deltaSeconds: number) => {
-    if (!videoRef.current) return;
-    const video = videoRef.current;
-    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Infinity;
-    const nextTime = Math.max(0, Math.min(duration, video.currentTime + deltaSeconds));
-    video.currentTime = nextTime;
-  };
+  // Régua dos 60 Minutos (:00 a :59) na hora exibida
+  const rulerHour = selectedHour || (activeSegment?.start_time ? activeSegment.start_time.substring(11, 13) : '00');
+  const rulerDate = selectedDate || (activeSegment?.start_time ? activeSegment.start_time.substring(0, 10) : (availableDates[0] || localDateStr()));
+  const activeDate = activeSegment?.start_time ? activeSegment.start_time.substring(0, 10) : '';
+  const activeHour = activeSegment?.start_time ? activeSegment.start_time.substring(11, 13) : '';
+  const isPlayingInRulerHour = activeDate === rulerDate && activeHour === rulerHour;
 
-  // Ordenação cronológica para achar Bloco Anterior e Próximo Bloco
-  const chronologicalSegments = [...segments].sort((a, b) =>
-    (a.start_time || '').localeCompare(b.start_time || '')
-  );
+  const effectiveTimeline = dayTimeline.length > 0 ? dayTimeline : timeline;
 
-  const activeChronoIndex = activeSegment
-    ? chronologicalSegments.findIndex((s) => s.id === activeSegment.id)
-    : -1;
-
-  const previousChronoSegment =
-    activeChronoIndex > 0 ? chronologicalSegments[activeChronoIndex - 1] : null;
-  const nextChronoSegment =
-    activeChronoIndex >= 0 && activeChronoIndex < chronologicalSegments.length - 1
-      ? chronologicalSegments[activeChronoIndex + 1]
-      : null;
-
-  const handlePlayPreviousSegment = () => {
-    if (previousChronoSegment) {
-      setActiveSegment(previousChronoSegment);
-    }
-  };
-
-  const handlePlayNextSegment = () => {
-    if (nextChronoSegment) {
-      setActiveSegment(nextChronoSegment);
-    }
-  };
+  const minuteSlots = Array.from({ length: 60 }, (_, minute) => {
+    const minStr = String(minute).padStart(2, '0');
+    const slotStart = parseTs(`${rulerDate} ${rulerHour}:${minStr}:00`);
+    const slotEnd = slotStart + 60000;
+    const covered = effectiveTimeline.some((s) => {
+      const st = parseTs(s.start_time);
+      const en = s.end_time ? parseTs(s.end_time) : st + (s.duration_seconds || 60) * 1000;
+      return st < slotEnd && en > slotStart;
+    });
+    const isPlaying = isPlayingInRulerHour && currentMinute === minute;
+    return { minute, minStr, covered, isPlaying };
+  });
 
   const hoursList = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'));
 
@@ -483,16 +575,15 @@ export function DvrRecordingsView() {
             <Clock className="w-3.5 h-3.5 text-cyan-400" /> Tamanho do Bloco 24h:
           </span>
           {[
-            { label: '15 min (Padrão)', val: 900 },
-            { label: '10 min', val: 600 },
+            { label: '1 min (Padrão)', val: 60 },
+            { label: '2 min', val: 120 },
             { label: '5 min', val: 300 },
-            { label: '1 min', val: 60 },
           ].map((b) => (
             <button
               key={b.val}
               onClick={() => handleSetSegmentDuration(b.val)}
               className={`px-2.5 py-1 rounded text-xs font-mono font-semibold border transition-all cursor-pointer ${
-                (dvrStatus.segment_seconds || 900) === b.val
+                (dvrStatus.segment_seconds || 60) === b.val
                   ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/60 shadow-[0_0_10px_rgba(6,182,212,0.2)]'
                   : 'bg-[#141A26] border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200'
               }`}
@@ -615,6 +706,9 @@ export function DvrRecordingsView() {
 
         {activeSegment ? (
           <>
+            {/* Container oculto para preloading da janela deslizante */}
+            <div hidden ref={preloadContainerRef} style={{ display: 'none' }} />
+
             <div className="w-full aspect-video max-h-[58vh] bg-black rounded-xl overflow-hidden border border-zinc-800 flex items-center justify-center">
               <video
                 ref={videoRef}
@@ -622,7 +716,9 @@ export function DvrRecordingsView() {
                 src={`/api/camera/dvr/video/${activeSegment.filename}?token=${token}`}
                 controls
                 autoPlay
-                onEnded={handlePlayNextSegment}
+                onLoadedMetadata={applyPendingOffset}
+                onTimeUpdate={(e) => handleTimeUpdate(e.currentTarget.currentTime)}
+                onEnded={playNext}
                 className="w-full h-full object-contain"
               />
             </div>
@@ -631,9 +727,8 @@ export function DvrRecordingsView() {
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pt-2 border-t border-zinc-800/80">
               <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
                 <button
-                  onClick={handlePlayPreviousSegment}
-                  disabled={!previousChronoSegment}
-                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#141A26] hover:bg-slate-800 border border-slate-700 hover:border-cyan-500/40 text-slate-200 text-xs font-mono font-semibold transition-all cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
+                  onClick={playPrev}
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#141A26] hover:bg-slate-800 border border-slate-700 hover:border-cyan-500/40 text-slate-200 text-xs font-mono font-semibold transition-all cursor-pointer"
                   title="Ir para o bloco anterior"
                 >
                   <SkipBack className="w-3.5 h-3.5 text-cyan-400" />
@@ -641,59 +736,58 @@ export function DvrRecordingsView() {
                 </button>
 
                 <button
-                  onClick={() => handleSeekPlayer(-300)}
+                  onClick={() => seekRelative(-300)}
                   className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer"
-                  title="Voltar 5 minutos"
+                  title="Voltar 5 minutos (atravessa blocos)"
                 >
                   <Rewind className="w-3.5 h-3.5 text-cyan-400" />
                   <span>-5m</span>
                 </button>
 
                 <button
-                  onClick={() => handleSeekPlayer(-60)}
+                  onClick={() => seekRelative(-60)}
                   className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer"
-                  title="Voltar 1 minuto"
+                  title="Voltar 1 minuto (atravessa blocos)"
                 >
                   <span>-1m</span>
                 </button>
 
                 <button
-                  onClick={() => handleSeekPlayer(-15)}
+                  onClick={() => seekRelative(-15)}
                   className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-[#141A26] hover:bg-cyan-950/50 border border-cyan-500/30 hover:border-cyan-400 text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer"
-                  title="Voltar 15 segundos"
+                  title="Voltar 15 segundos (atravessa blocos)"
                 >
                   <span>-15s</span>
                 </button>
 
                 <button
-                  onClick={() => handleSeekPlayer(15)}
+                  onClick={() => seekRelative(15)}
                   className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/30 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer"
-                  title="Avançar 15 segundos"
+                  title="Avançar 15 segundos (atravessa blocos)"
                 >
                   <span>+15s</span>
                 </button>
 
                 <button
-                  onClick={() => handleSeekPlayer(60)}
+                  onClick={() => seekRelative(60)}
                   className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/30 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer"
-                  title="Avançar 1 minuto"
+                  title="Avançar 1 minuto (atravessa blocos)"
                 >
                   <span>+1m</span>
                 </button>
 
                 <button
-                  onClick={() => handleSeekPlayer(300)}
+                  onClick={() => seekRelative(300)}
                   className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#141A26] hover:bg-emerald-950/50 border border-emerald-500/30 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-bold transition-all cursor-pointer"
-                  title="Avançar 5 minutos"
+                  title="Avançar 5 minutos (atravessa blocos)"
                 >
                   <FastForward className="w-3.5 h-3.5 text-emerald-400" />
                   <span>+5m</span>
                 </button>
 
                 <button
-                  onClick={handlePlayNextSegment}
-                  disabled={!nextChronoSegment}
-                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#141A26] hover:bg-slate-800 border border-slate-700 hover:border-emerald-500/40 text-slate-200 text-xs font-mono font-semibold transition-all cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
+                  onClick={playNext}
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#141A26] hover:bg-slate-800 border border-slate-700 hover:border-emerald-500/40 text-slate-200 text-xs font-mono font-semibold transition-all cursor-pointer"
                   title="Avançar para o próximo bloco cronológico"
                 >
                   <span>Próximo</span>
@@ -740,26 +834,47 @@ export function DvrRecordingsView() {
               </div>
             </div>
 
-            {/* Régua da Hora Completa (00 a 59 min) */}
-            <div className="p-3 rounded-xl bg-[#101622] border border-cyan-500/30 space-y-2">
+            {/* Régua dos 60 Minutos (:00 a :59) */}
+            <div className="p-3 sm:p-4 rounded-xl bg-[#101622] border border-cyan-500/30 space-y-2.5">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-xs font-mono">
-                <span className="text-cyan-300 font-bold flex items-center gap-1.5">
+                <div className="flex items-center gap-2">
                   <Clock className="w-3.5 h-3.5 text-cyan-400" />
-                  RÉGUA DA HORA COMPLETA ({selectedHour ? `${selectedHour}h` : (activeSegment?.start_time ? activeSegment.start_time.substring(11, 13) + 'h' : 'Hora Selecionada')} — 00 a 59 min):
-                </span>
-                <span className="text-[11px] text-slate-400">
-                  Clique no minuto para pular diretamente naquele ponto da hora
-                </span>
+                  <span className="text-cyan-300 font-bold">
+                    RÉGUA DOS 60 MINUTOS ({rulerHour}h — {formatBRDateOnly(rulerDate)}):
+                  </span>
+                  {isPlayingInRulerHour && currentMinute !== null && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold">
+                      Tocando: :{String(currentMinute).padStart(2, '0')}
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-3 text-[11px] text-slate-400">
+                  <span className="flex items-center gap-1">
+                    <span className="w-2 h-2 rounded bg-emerald-500 inline-block" /> Gravado
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="w-2 h-2 rounded bg-zinc-700 inline-block" /> Sem gravação
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="w-2 h-2 rounded bg-cyan-400 inline-block" /> Em reprodução
+                  </span>
+                </div>
               </div>
-              <div className="grid grid-cols-6 sm:grid-cols-12 gap-1.5">
-                {[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55].map((min) => (
+              <div className="grid grid-cols-6 sm:grid-cols-10 md:grid-cols-12 gap-1 sm:gap-1.5">
+                {minuteSlots.map(({ minute, minStr, covered, isPlaying }) => (
                   <button
-                    key={min}
-                    onClick={() => handleRulerMinuteClick(min)}
-                    className="px-2 py-1.5 rounded bg-[#161D2B] hover:bg-cyan-500/25 border border-slate-700 hover:border-cyan-400 text-slate-300 hover:text-cyan-300 text-xs font-mono font-bold transition-all cursor-pointer text-center"
-                    title={`Pular para ${String(min).padStart(2, '0')} min`}
+                    key={minute}
+                    onClick={() => handleRulerMinuteClick(minute)}
+                    className={`py-1.5 sm:py-2 px-1 rounded border text-[11px] sm:text-xs font-mono font-bold transition-all cursor-pointer text-center relative ${
+                      isPlaying
+                        ? 'bg-cyan-500 text-black border-cyan-300 ring-2 ring-cyan-400/80 shadow-[0_0_12px_rgba(6,182,212,0.6)] font-extrabold z-10 scale-[1.03]'
+                        : covered
+                        ? 'bg-emerald-950/40 border-emerald-500/40 hover:bg-cyan-500/25 hover:border-cyan-400 text-emerald-300 hover:text-cyan-300'
+                        : 'bg-[#141A26]/80 border-slate-800 text-slate-500 hover:border-slate-600 hover:text-slate-300'
+                    }`}
+                    title={`${rulerHour}:${minStr} ${covered ? '(Com gravação)' : '(Sem gravação - busca o mais próximo)'}${isPlaying ? ' [Em reprodução]' : ''}`}
                   >
-                    :{String(min).padStart(2, '0')}
+                    :{minStr}
                   </button>
                 ))}
               </div>
@@ -974,7 +1089,10 @@ export function DvrRecordingsView() {
               return (
                 <div
                   key={seg.id}
-                  onClick={() => setActiveSegment(seg)}
+                  onClick={() => {
+                    pendingOffsetRef.current = null;
+                    setActiveSegment(seg);
+                  }}
                   className={`bg-[#0D111A] border rounded-xl p-3.5 transition-all cursor-pointer flex flex-col justify-between gap-3 relative ${
                     isSelected
                       ? 'border-emerald-500/90 ring-1 ring-emerald-500/40 shadow-[0_0_20px_rgba(16,185,129,0.2)] bg-[#101824]'

@@ -19,6 +19,10 @@ interface CameraStatus {
   subtype: number;
   user: string;
   detector_active?: boolean;
+  detection_mode?: 'hybrid' | 'camera' | 'yolo';
+  yolo_awake?: boolean;
+  camera_event_active?: boolean;
+  last_camera_event_code?: string;
   person_detected?: boolean;
   people_count?: number;
   last_confidence?: number;
@@ -31,6 +35,7 @@ interface CameraStatus {
   is_night_active?: boolean;
   clip_min_duration?: number;
   clip_max_duration?: number;
+  target_overlay?: boolean;
 }
 
 export function App() {
@@ -101,6 +106,10 @@ export function App() {
               cameraIp={camStatus.ip}
               currentSubtype={camStatus.subtype}
               detectorActive={camStatus.detector_active}
+              detectionMode={camStatus.detection_mode}
+              yoloAwake={camStatus.yolo_awake}
+              cameraEventActive={camStatus.camera_event_active}
+              lastCameraEventCode={camStatus.last_camera_event_code}
               personDetected={camStatus.person_detected}
               peopleCount={camStatus.people_count}
               lastConfidence={camStatus.last_confidence}
@@ -132,6 +141,7 @@ export function App() {
               currentNightEndTime={camStatus.night_end_time}
               currentClipMinDuration={camStatus.clip_min_duration}
               currentClipMaxDuration={camStatus.clip_max_duration}
+              currentTargetOverlay={camStatus.target_overlay}
               onConfigSaved={fetchStatus}
             />
           )}

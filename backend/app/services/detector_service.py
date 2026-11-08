@@ -128,6 +128,9 @@ class DetectorService:
         self._last_cfg_fetch = 0.0
         
         # Telemetria em tempo real
+        self.detection_mode = "hybrid" # "hybrid", "camera", "yolo"
+        self.yolo_awake = False
+        self.hybrid_wake_duration = 20.0 # Segundos que o YOLO permanece ativo após gatilho da câmera
         self.is_active = False
         self.last_person_detected = False
         self.last_confidence = 0.0
@@ -149,11 +152,17 @@ class DetectorService:
         if self._running:
             return
         self._running = True
-        if self.model is None:
-            self.load_model("yolov8n")
+        cfg = get_night_watch_config() or {}
+        self.detection_mode = cfg.get("detection_mode", "hybrid")
+        model_name = cfg.get("model_type", "yolov8n")
+        
+        # No modo 'camera', não precisa alocar YOLO na inicialização; carrega sob demanda se trocar de modo
+        if self.detection_mode != "camera" and self.model is None:
+            self.load_model(model_name)
+            
         self._thread = threading.Thread(target=self._detection_loop, daemon=True)
         self._thread.start()
-        logger.info("Detector YOLO de Pessoas iniciado.")
+        logger.info(f"Detector de Pessoas iniciado (Modo: {self.detection_mode.upper()}).")
 
     def stop(self):
         self._running = False
@@ -190,6 +199,102 @@ class DetectorService:
         except Exception:
             return frame
 
+    def _trigger_flagrante(
+        self,
+        cfg: dict,
+        max_conf: float,
+        event_type: str = "PERSON_DETECTED",
+        reason: str = "",
+    ):
+        """
+        Dispara a sequência de flagrante de segurança:
+        1. Foto 1 em P&B (IR / milissegundo zero, antes da comutação óptica).
+        2. Acionamento do Flash LED de Luz Branca.
+        3. Comutação mecânica e Foto 2 Full Color 1080p nítida.
+        4. Envio imediato da foto no WhatsApp.
+        5. Gravação de vídeo dinâmico MP4 com áudio.
+        6. Registro no SQLite e upload automático para o Google Drive.
+        """
+        now_sec = time.time()
+        self.last_detection_time = now_sec
+        self.detections_count += 1
+        min_duration = int(cfg.get("clip_min_duration", getattr(camera_service, "clip_min_duration", 20)))
+        max_duration = int(cfg.get("clip_max_duration", getattr(camera_service, "clip_max_duration", 120)))
+        configured_flash = cfg.get("flash_duration", 2.5)
+        flash_duration = max(float(configured_flash), float(min_duration) + 3.5)
+
+        motivo = reason or f"Pessoa detectada ({max_conf:.1%})"
+        logger.warning(
+            f"[!] FLAGRANTE DISPARADO [{event_type}]: {motivo}! Luz Branca ({flash_duration:.1f}s), Foto 1080p e Vídeo Dinâmico ({min_duration}s base, até {max_duration}s)..."
+        )
+
+        # 1. Foto 1: Flagrante Instantâneo (Preto e Branco / IR no milissegundo zero, antes do flash)
+        snapshot_pb = camera_service.take_snapshot(prefix="snapshot_pb")
+        log_detection_event(
+            confidence=max_conf,
+            flash_triggered=False,
+            snapshot_path=snapshot_pb,
+            video_path=None,
+            event_type=event_type,
+        )
+        logger.info(f"[+] Foto 1 (Flagrante P&B) capturada: {snapshot_pb}")
+
+        # 2. Aciona Flash de Luz Branca (WhiteMode + WDR Off)
+        camera_service.trigger_flash(seconds=flash_duration)
+
+        # 3. Aguarda 1.8s para comutação mecânica do filtro IR-cut, desligamento do WDR e luz plena
+        time.sleep(1.8)
+
+        # 4. Foto 2: Foto com Flash (Full Color 1080p nítida com o ambiente 100% iluminado)
+        snapshot_flash = camera_service.take_snapshot(prefix="snapshot_flash")
+        evolution_service.send_alert_photo_async(snapshot_flash, max_conf)
+
+        # 5. Grava clipe de vídeo MP4 em alta definição com áudio sincronizado e extensão dinâmica
+        video_desc = f"Gravação Noturna X9 [{event_type}]: {motivo}"
+        def _upload_video_when_ready(fpath, fname):
+            logger.info(f"[+] Gravação finalizada, enviando vídeo ao Google Drive: {fname}")
+            gdrive_service.upload_file_async(
+                fname,
+                description=video_desc,
+                file_type="recording",
+            )
+            evolution_service.send_alert_video_async(fpath, max_conf)
+
+        video_filename = camera_service.record_clip(
+            seconds=min_duration,
+            max_seconds=max_duration,
+            on_complete=_upload_video_when_ready,
+        )
+
+        # Pré-registra na fila offline
+        gdrive_service.enqueue_file(
+            video_filename,
+            description=video_desc,
+            file_type="recording",
+        )
+
+        # 6. Salva no SQLite o evento principal com a foto colorida com flash e o vídeo
+        log_detection_event(
+            confidence=max_conf,
+            flash_triggered=True,
+            snapshot_path=snapshot_flash,
+            video_path=video_filename,
+            event_type=event_type,
+        )
+        logger.info(f"[+] Evento gravado no banco com Foto Flash ({snapshot_flash}) e vídeo ({video_filename})")
+
+        # 7. Backup automático para Google Drive (foto flagrante P&B e foto flash colorido)
+        gdrive_service.upload_file_async(
+            snapshot_pb,
+            description=f"Detecção X9 [Flagrante P&B]: {motivo}",
+            file_type="snapshot",
+        )
+        gdrive_service.upload_file_async(
+            snapshot_flash,
+            description=f"Detecção X9 [Flash Colorido]: {motivo}",
+            file_type="snapshot",
+        )
+
     def _detection_loop(self):
         while self._running:
             try:
@@ -200,10 +305,15 @@ class DetectorService:
                     self._last_cfg_fetch = now_sec
                 cfg = self._cached_cfg
 
-                # Rotação de modelo se configurado outro
+                # Modo de Detecção selecionado: "hybrid" (padrão), "camera" (100% câmera) ou "yolo" (contínuo)
+                detection_mode = cfg.get("detection_mode", "hybrid")
+                self.detection_mode = detection_mode
+
+                # Rotação ou carregamento sob demanda do modelo YOLO (quando não estiver em 100% câmera)
                 model_type = cfg.get("model_type", "yolov8n")
-                if self.model is None or self.current_model_type != model_type:
-                    self.load_model(model_type)
+                if detection_mode != "camera":
+                    if self.model is None or self.current_model_type != model_type:
+                        self.load_model(model_type)
 
                 # Limpeza periódica de retenção (1 vez por dia)
                 if now_sec - self.last_cleanup_time > 86400:
@@ -211,7 +321,73 @@ class DetectorService:
                     cleanup_retention(retention_days)
                     self.last_cleanup_time = now_sec
 
-                # 2. Pega último frame da câmera para análise contínua 24/7
+                # Gating do MODO VIGIA (Flash, Alarme Noturno e Snapshot de Invasão)
+                vigia_enabled = bool(cfg.get("enabled", 1))
+                start_t = cfg.get("start_time", "00:00")
+                end_t = cfg.get("end_time", "06:00")
+                in_schedule = self.is_in_schedule(start_t, end_t)
+                self.is_active = vigia_enabled and in_schedule
+                should_trigger_alarm = (vigia_enabled and in_schedule) or self.test_mode
+
+                # =========================================================================
+                # MODO 1: 100% CÂMERA (Zero IA / Zero CPU no Servidor)
+                # =========================================================================
+                if detection_mode == "camera":
+                    self.yolo_awake = False
+                    camera_service.update_active_tracks([])
+                    self.people_count = 0
+                    self.last_person_detected = False
+
+                    cam_event_time = camera_service.last_camera_event_time
+                    cam_event_recent = (now_sec - cam_event_time) < 4.0
+                    cam_code = camera_service.last_camera_event_code or "SmartMotionHuman"
+
+                    if cam_event_recent and should_trigger_alarm:
+                        if camera_service.is_recording_clip:
+                            camera_service.extend_clip(additional_seconds=10.0)
+                            self.last_detection_time = now_sec
+                        elif (now_sec - self.last_detection_time > self.cooldown_seconds):
+                            self._trigger_flagrante(
+                                cfg=cfg,
+                                max_conf=1.0,
+                                event_type="CAMERA_EVENT",
+                                reason=f"Detecção Nativa Intelbras ({cam_code})"
+                            )
+
+                    time.sleep(0.3)
+                    continue
+
+                # =========================================================================
+                # MODO 2: HÍBRIDO (Padrão - Câmera Sentinela dispara, YOLO acorda e valida)
+                # =========================================================================
+                if detection_mode == "hybrid":
+                    cam_event_time = camera_service.last_camera_event_time
+                    cam_event_recent = (now_sec - cam_event_time) < self.hybrid_wake_duration
+                    has_active_track = len(self.tracker.tracks) > 0
+                    should_wake_yolo = (
+                        cam_event_recent
+                        or has_active_track
+                        or camera_service.is_recording_clip
+                        or self.test_mode
+                    )
+
+                    if not should_wake_yolo:
+                        # YOLO em repouso: CPU fica fria
+                        self.yolo_awake = False
+                        camera_service.update_active_tracks([])
+                        self.people_count = 0
+                        self.last_person_detected = False
+                        time.sleep(0.3)
+                        continue
+
+                    self.yolo_awake = True
+                else:
+                    # MODO 3: YOLO CONTÍNUO (Analisa todos os quadros 24/7)
+                    self.yolo_awake = True
+
+                # =========================================================================
+                # EXECUÇÃO DO YOLO (Modo Híbrido acordado OU Modo YOLO Contínuo)
+                # =========================================================================
                 frame = None
                 with camera_service._lock:
                     if camera_service.latest_frame_raw is not None:
@@ -222,19 +398,16 @@ class DetectorService:
                     continue
 
                 conf_thresh = float(cfg.get("confidence_threshold", 0.45))
-                # Histerese de rastreamento: se já há pessoa rastreada na cena, mantém o bbox vivo
-                # com limiar ligeiramente menor para não piscar quando a pessoa passa atrás da grade/estante
                 has_active_track = len(self.tracker.tracks) > 0
                 query_conf = max(0.28, conf_thresh - 0.12) if has_active_track else max(0.32, conf_thresh - 0.05)
 
                 yolo_input = self._enhance_frame_for_yolo(frame)
-                # Classe 0 = Person: roda SEMPRE para desenhar bounding box no monitor ao vivo 24/7
                 results = self.model.predict(
                     source=yolo_input,
                     classes=[0],
                     conf=query_conf,
                     verbose=False,
-                    imgsz=640, # Padrão nativo do YOLOv8 (640x640)
+                    imgsz=640,
                 )
 
                 detections = []
@@ -242,15 +415,12 @@ class DetectorService:
                     for b in results[0].boxes:
                         coords = b.xyxy.cpu().numpy()[0]
                         conf = float(b.conf.cpu().numpy()[0])
-                        # Para iniciar o primeiro track na cena exige conf_thresh (ou >= 0.35 no fundo do portão);
-                        # para manter um track já existente aceita query_conf (histerese anti-pisca)
                         if has_active_track or conf >= min(conf_thresh, 0.38):
                             detections.append({
                                 "box": [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])],
                                 "conf": conf,
                             })
 
-                # Atualiza rastreador e propaga caixas ativas para o streaming da câmera (24/7)
                 active_tracks = self.tracker.update(detections)
                 camera_service.update_active_tracks(active_tracks)
 
@@ -261,103 +431,17 @@ class DetectorService:
                 self.last_confidence = max_conf
                 self.people_count = len(active_tracks)
 
-                # 3. Gating do MODO VIGIA (Flash, Alarme Noturno e Snapshot de Invasão)
-                vigia_enabled = bool(cfg.get("enabled", 1))
-                start_t = cfg.get("start_time", "00:00")
-                end_t = cfg.get("end_time", "06:00")
-                in_schedule = self.is_in_schedule(start_t, end_t)
-                
-                # Telemetria: Modo Vigia ativo se habilitado e no horário
-                self.is_active = vigia_enabled and in_schedule
-
-                # Apenas dispara alarme/flash se o Modo Vigia estiver armado no horário (ou em test_mode)
-                should_trigger_alarm = (vigia_enabled and in_schedule) or self.test_mode
-
                 if person_detected and should_trigger_alarm:
                     if camera_service.is_recording_clip:
-                        # Extensão Dinâmica: a pessoa continua na cena! Estende a gravação e o flash por mais 10s
                         camera_service.extend_clip(additional_seconds=10.0)
                         self.last_detection_time = now_sec
                     elif (now_sec - self.last_detection_time > self.cooldown_seconds):
-                        self.last_detection_time = now_sec
-                        self.detections_count += 1
-                        min_duration = int(cfg.get("clip_min_duration", getattr(camera_service, "clip_min_duration", 20)))
-                        max_duration = int(cfg.get("clip_max_duration", getattr(camera_service, "clip_max_duration", 120)))
-                        # Flash cobre a transição óptica (1.8s), o snapshot colorido e a duração inicial de vídeo no modo 6_flash_wdr_off
-                        configured_flash = cfg.get("flash_duration", 2.5)
-                        flash_duration = max(float(configured_flash), float(min_duration) + 3.5)
-
-                        logger.warning(
-                            f"[!] MODO VIGIA: PESSOA DETECTADA ({max_conf:.1%})! Luz Branca ({flash_duration:.1f}s), Foto 1080p e Vídeo Dinâmico ({min_duration}s base, até {max_duration}s)..."
-                        )
-
-                        # 1. Foto 1: Flagrante Instantâneo (Preto e Branco / IR no milissegundo zero, antes do flash)
-                        snapshot_pb = camera_service.take_snapshot(prefix="snapshot_pb")
-                        log_detection_event(
-                            confidence=max_conf,
-                            flash_triggered=False,
-                            snapshot_path=snapshot_pb,
-                            video_path=None,
-                        )
-                        logger.info(f"[+] Foto 1 (Flagrante P&B) capturada: {snapshot_pb}")
-
-                        # 2. Aciona Flash de Luz Branca (WhiteMode + WDR Off que cobrirá foto colorida e gravação)
-                        camera_service.trigger_flash(seconds=flash_duration)
-                        
-                        # 3. Aguarda 1.8s para comutação mecânica do filtro IR-cut, desligamento do WDR e luz plena
-                        time.sleep(1.8)
-                        
-                        # 4. Foto 2: Foto com Flash (Full Color 1080p nítida com o ambiente 100% iluminado)
-                        snapshot_flash = camera_service.take_snapshot(prefix="snapshot_flash")
-                        # Envio imediato da foto de flagrante no WhatsApp (assíncrono)
-                        evolution_service.send_alert_photo_async(snapshot_flash, max_conf)
-
-                        # 5. Grava clipe de vídeo MP4 em alta definição com áudio sincronizado e extensão dinâmica
-                        # O upload para o Google Drive e WhatsApp é agendado para quando o ffmpeg terminar de renderizar o arquivo completo
-                        video_desc = f"Gravação Noturna X9: Vídeo de Invasão ({max_conf:.1%})"
-                        def _upload_video_when_ready(fpath, fname):
-                            logger.info(f"[+] Gravação finalizada, enviando vídeo ao Google Drive: {fname}")
-                            gdrive_service.upload_file_async(
-                                fname,
-                                description=video_desc,
-                                file_type="recording"
-                            )
-                            # Envio do vídeo no WhatsApp (assíncrono)
-                            evolution_service.send_alert_video_async(fpath, max_conf)
-
-                        video_filename = camera_service.record_clip(
-                            seconds=min_duration,
-                            max_seconds=max_duration,
-                            on_complete=_upload_video_when_ready,
-                        )
-
-                        # Pré-registra preventivamente o vídeo no SQLite: se o backend cair ou reiniciar
-                        # durante a gravação do ffmpeg, o vídeo já está garantido na fila de sincronização
-                        gdrive_service.enqueue_file(
-                            video_filename,
-                            description=video_desc,
-                            file_type="recording"
-                        )
-
-                        # 6. Salva no SQLite o evento principal com a foto colorida com flash e o vídeo
-                        log_detection_event(
-                            confidence=max_conf,
-                            flash_triggered=True,
-                            snapshot_path=snapshot_flash,
-                            video_path=video_filename,
-                        )
-                        logger.info(f"[+] Evento gravado no banco com Foto Flash ({snapshot_flash}) e vídeo ({video_filename})")
-
-                        # 7. Backup automático para Google Drive (foto flagrante P&B e foto flash colorido)
-                        gdrive_service.upload_file_async(
-                            snapshot_pb,
-                            description=f"Detecção Noturna X9 [Flagrante P&B]: Pessoa detectada ({max_conf:.1%})",
-                            file_type="snapshot"
-                        )
-                        gdrive_service.upload_file_async(
-                            snapshot_flash,
-                            description=f"Detecção Noturna X9 [Flash Colorido]: Pessoa detectada ({max_conf:.1%})",
-                            file_type="snapshot"
+                        event_type = "HYBRID_DETECTION" if detection_mode == "hybrid" else "PERSON_DETECTED"
+                        self._trigger_flagrante(
+                            cfg=cfg,
+                            max_conf=max_conf,
+                            event_type=event_type,
+                            reason=f"Pessoa confirmada ({max_conf:.1%})"
                         )
 
                 elapsed = time.time() - loop_t0

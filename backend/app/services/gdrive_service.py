@@ -730,6 +730,20 @@ class GoogleDriveService:
             logger.warning(f"[Google Drive DVR] Erro ao listar segmentos na subpasta '{self.DVR_FOLDER_NAME}': {e}")
             return []
 
+    def _resolve_dvr_file_id(self, service, filename: str, drive_file_id: str | None = None) -> str | None:
+        """Resolve o fileId do Google Drive para um segmento DVR."""
+        if drive_file_id:
+            return drive_file_id
+        dvr_folder_id = self.get_or_create_dvr_folder_id()
+        if not dvr_folder_id:
+            return None
+        q = f"name = '{filename}' and '{dvr_folder_id}' in parents and trashed = false"
+        res = service.files().list(q=q, fields="files(id)").execute()
+        files = res.get("files", [])
+        if not files:
+            return None
+        return files[0]["id"]
+
     def get_dvr_file_bytes(self, filename: str, drive_file_id: str | None = None) -> bytes | None:
         """Baixa os bytes de um segmento DVR na subpasta Gravacoes_24h."""
         if not self.is_configured:
@@ -738,22 +752,38 @@ class GoogleDriveService:
             service = self._get_service()
             if not service:
                 return None
-
-            target_id = drive_file_id
+            target_id = self._resolve_dvr_file_id(service, filename, drive_file_id)
             if not target_id:
-                dvr_folder_id = self.get_or_create_dvr_folder_id()
-                if not dvr_folder_id:
-                    return None
-                q = f"name = '{filename}' and '{dvr_folder_id}' in parents and trashed = false"
-                res = service.files().list(q=q, fields="files(id)").execute()
-                files = res.get("files", [])
-                if not files:
-                    return None
-                target_id = files[0]["id"]
-
+                return None
             return service.files().get_media(fileId=target_id).execute()
         except Exception as e:
             logger.warning(f"[Google Drive DVR] Erro ao baixar segmento '{filename}': {e}")
+            return None
+
+    def get_dvr_file_range(
+        self,
+        filename: str,
+        drive_file_id: str | None = None,
+        start: int = 0,
+        end: int = 0,
+    ) -> bytes | None:
+        """Baixa só o intervalo [start, end] (inclusive) de um segmento DVR na subpasta Gravacoes_24h."""
+        if not self.is_configured:
+            return None
+        try:
+            service = self._get_service()
+            if not service:
+                return None
+            target_id = self._resolve_dvr_file_id(service, filename, drive_file_id)
+            if not target_id:
+                return None
+            req = service.files().get_media(fileId=target_id)
+            if getattr(req, "headers", None) is None:
+                req.headers = {}
+            req.headers["Range"] = f"bytes={start}-{end}"
+            return req.execute()
+        except Exception as e:
+            logger.warning(f"[Google Drive DVR] Erro ao baixar range {start}-{end} de '{filename}': {e}")
             return None
 
     def delete_dvr_file_by_name(self, filename: str, drive_file_id: str | None = None) -> bool:

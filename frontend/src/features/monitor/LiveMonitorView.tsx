@@ -34,6 +34,10 @@ interface LiveMonitorViewProps {
   cameraIp: string;
   currentSubtype?: number;
   detectorActive?: boolean;
+  detectionMode?: 'hybrid' | 'camera' | 'yolo';
+  yoloAwake?: boolean;
+  cameraEventActive?: boolean;
+  lastCameraEventCode?: string;
   personDetected?: boolean;
   peopleCount?: number;
   lastConfidence?: number;
@@ -53,6 +57,10 @@ export function LiveMonitorView({
   cameraIp,
   currentSubtype = 1,
   detectorActive,
+  detectionMode = 'hybrid',
+  yoloAwake = false,
+  cameraEventActive = false,
+  lastCameraEventCode,
   personDetected,
   peopleCount,
   lastConfidence,
@@ -612,7 +620,10 @@ export function LiveMonitorView({
   const handleDvrJumpToTime = async (timeStr?: string) => {
     const target = timeStr || dvrJumpTime;
     if (!target || !token) return;
-    const today = new Date().toISOString().split('T')[0];
+    const d = new Date();
+    const p = (n: number) => String(n).padStart(2, '0');
+    // Data LOCAL: toISOString() é UTC e depois das 21h (BRT) já aponta para amanhã, buscando horário "no futuro"
+    const today = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
     const fullTs = `${today} ${target}:00`;
     setDvrLoading(true);
     setActionMessage(null);
@@ -634,10 +645,11 @@ export function LiveMonitorView({
         } else {
           setDvrVideoUrl(cleanUrl);
         }
-        setActionMessage({
-          text: `Carregado gravação às ${target}`,
-          type: 'success',
-        });
+        setActionMessage(
+          data.gap
+            ? { text: `Sem gravação às ${target}; mostrando a mais próxima (${data.segment?.start_time}).`, type: 'error' }
+            : { text: `Carregado gravação às ${target}`, type: 'success' }
+        );
       } else {
         setActionMessage({
           text: data.message || `Nenhum vídeo gravado próximo das ${target}.`,
@@ -654,32 +666,38 @@ export function LiveMonitorView({
     }
   };
 
+  // Bloco vizinho cronológico vindo do servidor (a lista paginada de 50 itens perdia o bloco atual
+  // e o "próximo" caía direto no ao vivo).
+  const fetchAdjacentBlock = async (direction: 'next' | 'prev') => {
+    if (!token || !dvrSegmentInfo) return null;
+    try {
+      const res = await fetch(
+        `/api/camera/dvr/adjacent?filename=${encodeURIComponent(dvrSegmentInfo.filename)}&direction=${direction}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const data = await safeParseJson(res);
+      return res.ok && data.found && data.segment ? data.segment : null;
+    } catch {
+      return null;
+    }
+  };
+
   const handlePlayPreviousBlock = async () => {
     if (!token || !dvrSegmentInfo) return;
     setDvrLoading(true);
     try {
-      const res = await fetch('/api/camera/dvr/segments?limit=50', {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (res.ok) {
-        const data = await safeParseJson(res);
-        const items: any[] = Array.isArray(data) ? data : data.items || [];
-        const currentIdx = items.findIndex((s) => s.filename === dvrSegmentInfo.filename);
-        if (currentIdx >= 0 && currentIdx + 1 < items.length) {
-          const prevSeg = items[currentIdx + 1];
-          const cleanUrl = `/api/camera/dvr/video/${prevSeg.filename}?token=${token}`;
-          setDvrSegmentInfo(prevSeg);
-          setDvrSeekOffset(0);
-          setDvrVideoUrl(cleanUrl);
-          setActionMessage({
-            text: `Bloco anterior carregado: ${prevSeg.start_time}`,
-            type: 'success',
-          });
-          return;
-        }
+      const prevSeg = await fetchAdjacentBlock('prev');
+      if (prevSeg) {
+        const cleanUrl = `/api/camera/dvr/video/${prevSeg.filename}?token=${token}`;
+        setDvrSegmentInfo(prevSeg);
+        setDvrSeekOffset(0);
+        setDvrVideoUrl(cleanUrl);
+        setActionMessage({
+          text: `Bloco anterior carregado: ${prevSeg.start_time}`,
+          type: 'success',
+        });
+        return;
       }
-    } catch {
-      // fallback
     } finally {
       setDvrLoading(false);
     }
@@ -693,28 +711,18 @@ export function LiveMonitorView({
     if (!token || !dvrSegmentInfo) return;
     setDvrLoading(true);
     try {
-      const res = await fetch('/api/camera/dvr/segments?limit=50', {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (res.ok) {
-        const data = await safeParseJson(res);
-        const items: any[] = Array.isArray(data) ? data : data.items || [];
-        const currentIdx = items.findIndex((s) => s.filename === dvrSegmentInfo.filename);
-        if (currentIdx > 0) {
-          const nextSeg = items[currentIdx - 1];
-          const cleanUrl = `/api/camera/dvr/video/${nextSeg.filename}?token=${token}`;
-          setDvrSegmentInfo(nextSeg);
-          setDvrSeekOffset(0);
-          setDvrVideoUrl(cleanUrl);
-          setActionMessage({
-            text: `Próximo bloco carregado: ${nextSeg.start_time}`,
-            type: 'success',
-          });
-          return;
-        }
+      const nextSeg = await fetchAdjacentBlock('next');
+      if (nextSeg) {
+        const cleanUrl = `/api/camera/dvr/video/${nextSeg.filename}?token=${token}`;
+        setDvrSegmentInfo(nextSeg);
+        setDvrSeekOffset(0);
+        setDvrVideoUrl(cleanUrl);
+        setActionMessage({
+          text: `Próximo bloco carregado: ${nextSeg.start_time}`,
+          type: 'success',
+        });
+        return;
       }
-    } catch {
-      // fallback
     } finally {
       setDvrLoading(false);
     }
@@ -942,6 +950,35 @@ export function LiveMonitorView({
             <div className="flex items-center gap-1 sm:gap-1.5 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-cyan-950/80 backdrop-blur-md border border-cyan-500/50 text-cyan-300 text-[10px] sm:text-xs font-mono font-semibold shadow-[0_0_10px_rgba(6,182,212,0.2)]">
               <ShieldAlert className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
               <span>VIGIA: {detectionsCount || 0} ALARMES</span>
+            </div>
+          )}
+
+          {/* Badge do Modo de Detecção */}
+          <div className="hidden sm:flex items-center gap-1 sm:gap-1.5 px-2 py-0.5 sm:px-2 sm:py-1 rounded bg-black/60 backdrop-blur-md border border-slate-700/80 text-[10px] sm:text-xs font-mono">
+            {detectionMode === 'camera' && (
+              <span className="text-emerald-400 font-bold flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                100% CÂMERA
+              </span>
+            )}
+            {detectionMode === 'hybrid' && (
+              <span className="text-cyan-300 font-bold flex items-center gap-1">
+                <span className={`w-1.5 h-1.5 rounded-full ${yoloAwake ? 'bg-amber-400 animate-ping' : 'bg-cyan-500'}`} />
+                HÍBRIDO {yoloAwake ? '(YOLO ATIVO)' : '(STANDBY)'}
+              </span>
+            )}
+            {detectionMode === 'yolo' && (
+              <span className="text-purple-300 font-bold flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-purple-500" />
+                YOLO 24/7
+              </span>
+            )}
+          </div>
+
+          {/* Alerta Visual de Evento Nativo da Câmera (IVS / SMD) */}
+          {cameraEventActive && (
+            <div className="flex items-center gap-1 sm:gap-1.5 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-amber-950/90 backdrop-blur-md border border-amber-500 text-amber-300 text-[10px] sm:text-xs font-mono font-bold animate-pulse shadow-[0_0_10px_rgba(245,158,11,0.3)]">
+              <span>CÂMERA: {lastCameraEventCode || 'IVS'}</span>
             </div>
           )}
         </div>

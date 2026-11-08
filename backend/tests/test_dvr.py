@@ -34,7 +34,7 @@ def isolated_db(monkeypatch, tmp_path):
 def test_dvr_config_defaults_and_update():
     cfg = get_dvr_config()
     assert cfg["enabled"] is True
-    assert cfg["segment_seconds"] == 900
+    assert cfg["segment_seconds"] == 60
     assert cfg["retention_days"] == 15
     assert cfg["subtype"] == 0
 
@@ -106,7 +106,8 @@ def test_dvr_segments_crud_and_filters():
     assert refreshed["drive_file_id"] == "drv_2"
 
 
-def test_find_dvr_segment_for_seek():
+def test_find_dvr_segment_for_seek(monkeypatch):
+    monkeypatch.setattr("app.db.db._is_dvr_file_available", lambda *a, **k: True)
     now_dt = get_now().replace(tzinfo=None)
     seg1_start = now_dt - timedelta(seconds=400)
     seg1_end = now_dt - timedelta(seconds=100)
@@ -140,6 +141,21 @@ def test_find_dvr_segment_for_seek():
     assert res_200s is not None
     assert res_200s["segment"]["filename"] == "dvr_prev.mp4"
     assert 195 <= res_200s["seek_offset"] <= 205
+    assert res_200s["gap"] is False
+
+
+def test_seek_in_gap_picks_nearest_and_flags_gap(monkeypatch):
+    monkeypatch.setattr("app.db.db._is_dvr_file_available", lambda *a, **k: True)
+    # 16h (termina 16:01) e 20h (começa 20:00): alvo 18h NÃO pode cair em "ao vivo" nem ser silencioso
+    upsert_dvr_segment("dvr_gap_a.mp4", "2025-01-01 16:00:00", "2025-01-01 16:01:00", 60, 5000000, "local")
+    upsert_dvr_segment("dvr_gap_b.mp4", "2025-01-01 20:00:00", "2025-01-01 20:01:00", 60, 5000000, "local")
+    res = find_dvr_segment_for_seek(target_time_str="2025-01-01 19:30:00")
+    assert res["gap"] is True
+    assert res["segment"]["filename"] == "dvr_gap_b.mp4"
+    res = find_dvr_segment_for_seek(target_time_str="2025-01-01 16:30:00")
+    assert res["segment"]["filename"] == "dvr_gap_a.mp4"
+    inside = find_dvr_segment_for_seek(target_time_str="2025-01-01 20:00:30")
+    assert inside["gap"] is False and inside["seek_offset"] == 30
 
 
 def test_cleanup_dvr_retention_15_days(monkeypatch):
@@ -444,8 +460,178 @@ def test_dynamic_clip_and_dvr_config_extension():
 
     # Testa atualização de dvr config
     st = dvr_service.update_config(segment_seconds=900, retention_days=20, subtype=0)
-    assert st["segment_duration"] == 900
+    assert st["segment_duration"] == 300  # teto: blocos maiores estouram o tmpfs
     assert st["retention_days"] == 20
+
+
+def test_gdrive_get_dvr_file_range_direct(monkeypatch):
+    from app.services.gdrive_service import gdrive_service, GoogleDriveService
+
+    monkeypatch.setattr(GoogleDriveService, "is_configured", property(lambda self: True))
+
+    mock_req = MagicMock()
+    mock_req.headers = {}
+    mock_req.execute.return_value = b"CHUNK_100_200"
+
+    mock_service = MagicMock()
+    mock_service.files().get_media.return_value = mock_req
+    monkeypatch.setattr(gdrive_service, "_get_service", lambda: mock_service)
+
+    res = gdrive_service.get_dvr_file_range("dvr_test.mp4", drive_file_id="drv_id_123", start=100, end=200)
+    assert res == b"CHUNK_100_200"
+    assert mock_req.headers["Range"] == "bytes=100-200"
+    mock_service.files().get_media.assert_called_with(fileId="drv_id_123")
+
+
+def test_dvr_video_range_streaming_from_drive(monkeypatch):
+    from app.routers.camera import get_dvr_video, _dvr_range_cache, _gdrive_download_semaphore
+    from app.services.gdrive_service import gdrive_service, GoogleDriveService
+
+    monkeypatch.setattr(GoogleDriveService, "is_configured", property(lambda self: True))
+    _dvr_range_cache.clear()
+
+    total_file_size = 5000000
+    upsert_dvr_segment(
+        filename="dvr_remote_20261105_100000.mp4",
+        start_time="2026-11-05 10:00:00",
+        duration_seconds=60,
+        size_bytes=total_file_size,
+        status="synced",
+        drive_file_id="drv_remote_abc",
+    )
+
+    calls = []
+    def fake_range(filename, drive_file_id=None, start=0, end=0):
+        calls.append((filename, drive_file_id, start, end))
+        return b"D" * (end - start + 1)
+
+    monkeypatch.setattr(gdrive_service, "get_dvr_file_range", fake_range)
+
+    # 1. Range explícito parcial (ex: bytes=100-199)
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/camera/dvr/video/dvr_remote_20261105_100000.mp4",
+        "headers": [(b"range", b"bytes=100-199")],
+    }
+    req = Request(scope)
+    resp = get_dvr_video("dvr_remote_20261105_100000.mp4", req, user="admin")
+
+    assert resp.status_code == 206
+    assert resp.headers["Content-Range"] == "bytes 100-199/5000000"
+    assert resp.headers["Accept-Ranges"] == "bytes"
+    assert resp.headers["Content-Length"] == "100"
+    assert resp.headers["Cache-Control"] == "private, max-age=3600"
+    assert len(resp.body) == 100
+    assert calls == [("dvr_remote_20261105_100000.mp4", "drv_remote_abc", 100, 199)]
+
+    # 2. Re-leitura do mesmo range utiliza cache LRU em RAM (não chama Drive novamente)
+    resp_cached = get_dvr_video("dvr_remote_20261105_100000.mp4", req, user="admin")
+    assert resp_cached.status_code == 206
+    assert len(calls) == 1  # sem novo hit no Drive
+    assert _gdrive_download_semaphore._value == 3  # semáforo sempre liberado
+
+
+def test_dvr_video_open_ended_range_capped_at_2mb(monkeypatch):
+    from app.routers.camera import get_dvr_video, _dvr_range_cache
+    from app.services.gdrive_service import gdrive_service, GoogleDriveService
+
+    monkeypatch.setattr(GoogleDriveService, "is_configured", property(lambda self: True))
+    _dvr_range_cache.clear()
+
+    total_file_size = 10000000  # 10 MB
+    upsert_dvr_segment(
+        filename="dvr_remote_open.mp4",
+        start_time="2026-11-05 11:00:00",
+        duration_seconds=60,
+        size_bytes=total_file_size,
+        status="synced",
+        drive_file_id="drv_open_id",
+    )
+
+    calls = []
+    def fake_range(filename, drive_file_id=None, start=0, end=0):
+        calls.append((filename, drive_file_id, start, end))
+        return b"Z" * (end - start + 1)
+
+    monkeypatch.setattr(gdrive_service, "get_dvr_file_range", fake_range)
+
+    # Range aberto (bytes=0-) deve limitar chunk a 2 MB (2 * 1024 * 1024 = 2097152 bytes)
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/camera/dvr/video/dvr_remote_open.mp4",
+        "headers": [(b"range", b"bytes=0-")],
+    }
+    req = Request(scope)
+    resp = get_dvr_video("dvr_remote_open.mp4", req, user="admin")
+
+    expected_chunk = 2 * 1024 * 1024
+    assert resp.status_code == 206
+    assert resp.headers["Content-Range"] == f"bytes 0-{expected_chunk - 1}/10000000"
+    assert resp.headers["Accept-Ranges"] == "bytes"
+    assert resp.headers["Content-Length"] == str(expected_chunk)
+    assert len(resp.body) == expected_chunk
+    assert calls == [("dvr_remote_open.mp4", "drv_open_id", 0, expected_chunk - 1)]
+
+
+def test_dvr_range_cache_lru_eviction():
+    from app.routers.camera import DvrRangeCache
+
+    cache = DvrRangeCache(max_bytes=100)
+    cache.put("clip.mp4", 0, 49, b"A" * 50)
+    cache.put("clip.mp4", 50, 99, b"B" * 50)
+    assert len(cache) == 2
+    assert cache.total_bytes == 100
+
+    # Acessa primeiro item tornando o segundo LRU
+    assert cache.get("clip.mp4", 0, 49) == b"A" * 50
+
+    # Inserção de novo chunk expulsa o item menos recente ("clip.mp4", 50, 99)
+    cache.put("clip.mp4", 100, 149, b"C" * 50)
+    assert len(cache) == 2
+    assert cache.get("clip.mp4", 50, 99) is None
+    assert cache.get("clip.mp4", 0, 49) == b"A" * 50
+    assert cache.get("clip.mp4", 100, 149) == b"C" * 50
+
+
+def test_dvr_video_fallback_download_when_size_missing(monkeypatch, tmp_path):
+    from app.routers.camera import get_dvr_video
+    from app.services.gdrive_service import gdrive_service, GoogleDriveService
+    from app.services.dvr_service import dvr_service
+
+    monkeypatch.setattr(GoogleDriveService, "is_configured", property(lambda self: True))
+    monkeypatch.setattr(dvr_service, "recordings_dir", str(tmp_path / "buffer"))
+
+    # Segmento sem size_bytes ou size_bytes=0 -> aciona fallback para download inteiro
+    upsert_dvr_segment(
+        filename="dvr_remote_nosize.mp4",
+        start_time="2026-11-05 12:00:00",
+        duration_seconds=60,
+        size_bytes=0,
+        status="synced",
+        drive_file_id="drv_nosize_id",
+    )
+
+    fallback_called = []
+    def fake_bytes(filename, drive_file_id=None):
+        fallback_called.append((filename, drive_file_id))
+        return b"FULL_VIDEO_CONTENT" * 1000
+
+    monkeypatch.setattr(gdrive_service, "get_dvr_file_bytes", fake_bytes)
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/camera/dvr/video/dvr_remote_nosize.mp4",
+        "headers": [],
+    }
+    req = Request(scope)
+    resp = get_dvr_video("dvr_remote_nosize.mp4", req, user="admin")
+
+    assert fallback_called == [("dvr_remote_nosize.mp4", "drv_nosize_id")]
+    assert resp.status_code == 200 or resp.status_code == 206
+
 
 
 

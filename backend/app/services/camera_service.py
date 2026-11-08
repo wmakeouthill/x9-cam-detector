@@ -36,6 +36,7 @@ class CameraService:
         self.night_end_time = db_cfg.get("night_end_time", "05:00")
         self.clip_min_duration = int(db_cfg.get("clip_min_duration", 20))
         self.clip_max_duration = int(db_cfg.get("clip_max_duration", 120))
+        self.target_overlay = bool(db_cfg.get("target_overlay", 1))
 
         self._running = False
         self._thread = None
@@ -58,6 +59,13 @@ class CameraService:
         self.width = 0
         self.height = 0
         self.last_frame_time = 0.0
+
+        # Eventos Nativos da Câmera (IVS, Linha/Cerca Virtual e SMD Pessoa/Veículo)
+        self.camera_event_active = False
+        self.last_camera_event_time = 0.0
+        self.last_camera_event_code: str | None = None
+        self.last_camera_event_data: dict = {}
+        self._event_thread: threading.Thread | None = None
 
         os.makedirs("snapshots", exist_ok=True)
         self._placeholder_jpeg = self._create_placeholder("X9 MONITOR - INICIANDO...")
@@ -89,6 +97,7 @@ class CameraService:
         night_end_time: str = "05:00",
         clip_min_duration: int = 20,
         clip_max_duration: int = 120,
+        target_overlay: bool = True,
     ):
         with self._lock:
             self.ip = ip
@@ -102,17 +111,20 @@ class CameraService:
             self.night_end_time = night_end_time
             self.clip_min_duration = int(clip_min_duration)
             self.clip_max_duration = int(clip_max_duration)
+            self.target_overlay = bool(target_overlay)
             self.status = "CONNECTING"
         # Persiste no banco com senha criptografada em AES-256
         save_camera_config(
             ip, port, http_port, user, password, subtype,
             image_profile_mode, night_start_time, night_end_time,
             self.clip_min_duration, self.clip_max_duration,
+            self.target_overlay,
         )
         logger.info(
-            f"Configuração da câmera salva e atualizada: {ip}:{port} (Subtype {subtype}, Perfil {image_profile_mode}, Janela Noturna {night_start_time}-{night_end_time}, Clips {self.clip_min_duration}-{self.clip_max_duration}s)"
+            f"Configuração da câmera salva e atualizada: {ip}:{port} (Subtype {subtype}, Perfil {image_profile_mode}, Janela Noturna {night_start_time}-{night_end_time}, Clips {self.clip_min_duration}-{self.clip_max_duration}s, TargetOverlay: {self.target_overlay})"
         )
         threading.Thread(target=self._ensure_optimal_camera_image_rpc, daemon=True).start()
+        threading.Thread(target=self._apply_target_overlay_rpc, daemon=True).start()
 
     @property
     def is_recording_clip(self) -> bool:
@@ -209,13 +221,88 @@ class CameraService:
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
-        logger.info("Worker de captura RTSP iniciado.")
+        self._event_thread = threading.Thread(target=self._event_stream_loop, daemon=True)
+        self._event_thread.start()
+        logger.info("Worker de captura RTSP e escuta de eventos nativos da câmera (IVS/SMD) iniciados.")
 
     def stop(self):
         self._running = False
         if self._thread:
             self._thread.join(timeout=2)
-        logger.info("Worker de captura RTSP encerrado.")
+        if self._event_thread:
+            self._event_thread.join(timeout=2)
+        logger.info("Workers de captura RTSP e eventos de câmera encerrados.")
+
+    def _event_stream_loop(self):
+        """
+        Escuta eventos nativos em tempo real direto da câmera Intelbras via CGI Event Stream:
+        - CrossRegionDetection: Cerca Virtual / Invasão de Perímetro
+        - CrossLineDetection: Linha Virtual
+        - SmartMotionHuman: Detecção Inteligente de Pessoas (SMD)
+        - SmartMotionVehicle: Detecção Inteligente de Veículos (SMD)
+        - VideoMotion: Detecção de Movimento Geral
+        """
+        codes = "CrossRegionDetection,CrossLineDetection,SmartMotionHuman,SmartMotionVehicle,VideoMotion"
+        while self._running:
+            try:
+                # Aguarda câmera estar online
+                if self.status != "ONLINE":
+                    time.sleep(2.0)
+                    continue
+
+                url = f"http://{self.ip}:{self.http_port}/cgi-bin/eventManager.cgi?action=attach&codes=[{codes}]"
+                logger.info(f"[Câmera IVS/SMD] Conectando ao fluxo de eventos nativos da câmera: {self.ip}:{self.http_port}...")
+                
+                with requests.get(
+                    url,
+                    auth=HTTPDigestAuth(self.user, self.password),
+                    stream=True,
+                    timeout=(8.0, 60.0),
+                ) as resp:
+                    if resp.status_code != 200:
+                        logger.warning(f"[Câmera IVS/SMD] Resposta inesperada ao conectar no eventManager: {resp.status_code}")
+                        time.sleep(5.0)
+                        continue
+
+                    logger.info("[Câmera IVS/SMD] Conexão com eventos nativos estabelecida com sucesso!")
+                    for raw_line in resp.iter_lines():
+                        if not self._running:
+                            break
+                        if not raw_line:
+                            continue
+
+                        line_str = raw_line.decode("utf-8", errors="ignore").strip()
+                        if "Code=" not in line_str or "action=" not in line_str:
+                            continue
+
+                        # Parseia Code=<tipo>;action=<Start|Stop>;index=0...
+                        event = {}
+                        for part in line_str.split(";"):
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                event[k.strip()] = v.strip()
+
+                        code = event.get("Code")
+                        action = event.get("action", "")
+
+                        if not code:
+                            continue
+
+                        if action.lower() in ("start", "pulse"):
+                            now = time.time()
+                            self.camera_event_active = True
+                            self.last_camera_event_time = now
+                            self.last_camera_event_code = code
+                            self.last_camera_event_data = event
+                            logger.info(f"[CÂMERA IVS/SMD] Disparo de evento nativo: {code} (action={action})")
+                        elif action.lower() == "stop":
+                            if self.last_camera_event_code == code:
+                                self.camera_event_active = False
+
+            except Exception as e:
+                if self._running:
+                    logger.debug(f"[Câmera IVS/SMD] Conexão com fluxo de eventos interrompida ({e}). Reconectando em 5s...")
+                    time.sleep(5.0)
 
     def _create_placeholder(self, text: str) -> bytes:
         img = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -461,10 +548,64 @@ class CameraService:
                 pass
 
     def _ensure_optimal_camera_hardware_rpc(self, timeout: float = 5.0) -> bool:
-        """Executa a calibração completa de áudio (AAC 16kHz) e imagem (WDR Dia/Noite + Smart IR + Relógio)."""
+        """Executa a calibração completa de áudio (AAC 16kHz), imagem (WDR Dia/Noite + Smart IR + Relógio) e Sobreposição Nativa (IVS)."""
         ok_audio = self._ensure_optimal_camera_audio_rpc(timeout=timeout)
         ok_image = self._ensure_optimal_camera_image_rpc(timeout=timeout)
+        ok_overlay = self._apply_target_overlay_rpc(timeout=timeout)
         return bool(ok_audio and ok_image)
+
+    def _apply_target_overlay_rpc(self, timeout: float = 5.0) -> bool:
+        """
+        Ativa ou desativa a sobreposição nativa de alvo e regras (Target Overlay / IVS)
+        diretamente no hardware da câmera Intelbras via CGI e JSON-RPC 2.0.
+        Isso faz a câmera desenhar as caixas de detecção no próprio fluxo de vídeo (0% CPU).
+        """
+        val_str = "true" if self.target_overlay else "false"
+        ok = False
+
+        # 1. Tentativa via CGI configManager (stateless HTTP Digest)
+        try:
+            url = (
+                f"http://{self.ip}:{self.http_port}/cgi-bin/configManager.cgi?"
+                f"action=setConfig&VideoAnalyseRule[0][0].ShowTrack={val_str}"
+                f"&VideoAnalyseRule[0][0].ShowRule={val_str}"
+                f"&VideoInAnalyse[0].ShowTrack={val_str}"
+            )
+            resp = requests.get(url, auth=HTTPDigestAuth(self.user, self.password), timeout=timeout)
+            if resp.status_code == 200 and "OK" in resp.text.upper():
+                ok = True
+                logger.info(f"[Target Overlay] CGI configurado na câmera: ShowTrack={val_str}")
+        except Exception as e:
+            logger.debug(f"[Target Overlay] Tentativa CGI falhou: {e}")
+
+        # 2. Tentativa via JSON-RPC 2.0 (VideoAnalyseRule)
+        s, sid = None, None
+        try:
+            with self._rpc_lock:
+                s, sid, _rpc = self._rpc_login(timeout=timeout)
+                if _rpc:
+                    cfg_res = _rpc("configManager.getConfig", {"name": "VideoAnalyseRule"})
+                    rules = cfg_res.get("params", {}).get("table", {})
+                    if rules and isinstance(rules, dict):
+                        changed = False
+                        for ch, ch_rules in rules.items():
+                            if isinstance(ch_rules, list):
+                                for r in ch_rules:
+                                    if isinstance(r, dict):
+                                        r["ShowTrack"] = self.target_overlay
+                                        r["ShowRule"] = self.target_overlay
+                                        changed = True
+                        if changed:
+                            set_res = _rpc("configManager.setConfig", {"name": "VideoAnalyseRule", "table": rules})
+                            if set_res.get("result"):
+                                ok = True
+                                logger.info(f"[Target Overlay] RPC2 VideoAnalyseRule salvo: ShowTrack={self.target_overlay}")
+        except Exception as e:
+            logger.debug(f"[Target Overlay] Tentativa RPC2 falhou: {e}")
+        finally:
+            self._rpc_logout(s, sid)
+
+        return ok
 
     def _ensure_optimal_camera_audio_rpc(self, timeout: float = 5.0) -> bool:
         """

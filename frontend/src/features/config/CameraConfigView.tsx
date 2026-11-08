@@ -18,6 +18,7 @@ import {
   Moon,
   Clock,
   Film,
+  Target,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -32,6 +33,7 @@ interface CameraConfigViewProps {
   currentNightEndTime?: string;
   currentClipMinDuration?: number;
   currentClipMaxDuration?: number;
+  currentTargetOverlay?: boolean;
   onConfigSaved: () => void;
 }
 
@@ -54,6 +56,7 @@ export function CameraConfigView({
   currentNightEndTime,
   currentClipMinDuration,
   currentClipMaxDuration,
+  currentTargetOverlay,
   onConfigSaved,
 }: CameraConfigViewProps) {
   const { token } = useAuthStore();
@@ -68,6 +71,7 @@ export function CameraConfigView({
   const [nightEndTime, setNightEndTime] = useState(currentNightEndTime || '05:00');
   const [clipMinDuration, setClipMinDuration] = useState<number>(currentClipMinDuration || 20);
   const [clipMaxDuration, setClipMaxDuration] = useState<number>(currentClipMaxDuration || 120);
+  const [targetOverlay, setTargetOverlay] = useState<boolean>(currentTargetOverlay !== undefined ? currentTargetOverlay : true);
 
   const [hasLoaded, setHasLoaded] = useState(false);
 
@@ -87,6 +91,7 @@ export function CameraConfigView({
       if (currentNightEndTime) setNightEndTime(currentNightEndTime);
       if (currentClipMinDuration !== undefined) setClipMinDuration(currentClipMinDuration);
       if (currentClipMaxDuration !== undefined) setClipMaxDuration(currentClipMaxDuration);
+      if (currentTargetOverlay !== undefined) setTargetOverlay(currentTargetOverlay);
       setHasLoaded(true);
     }
   }, [
@@ -100,6 +105,7 @@ export function CameraConfigView({
     currentNightEndTime,
     currentClipMinDuration,
     currentClipMaxDuration,
+    currentTargetOverlay,
     hasLoaded,
   ]);
 
@@ -228,6 +234,7 @@ export function CameraConfigView({
           night_end_time: nightEndTime,
           clip_min_duration: Number(clipMinDuration),
           clip_max_duration: Number(clipMaxDuration),
+          target_overlay: targetOverlay,
         }),
       });
 
@@ -666,6 +673,39 @@ export function CameraConfigView({
             <span>
               <b className="text-zinc-200">Como funciona:</b> Ao detectar uma pessoa, a câmera aciona o flash e inicia a gravação de {clipMinDuration}s. A cada frame em que a pessoa continua visível, o sistema estende a gravação em +10s (e mantém a luz acesa) até o limite de {clipMaxDuration}s. Quando a pessoa sai, o vídeo é finalizado e enviado de uma só vez para o WhatsApp e Google Drive.
             </span>
+          </div>
+        </div>
+
+        {/* Inteligência de Borda & Sobreposição Nativa (Intelbras IVS) */}
+        <div className="pt-4 border-t border-zinc-800/80 space-y-4">
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-bold uppercase tracking-wider text-emerald-400 font-mono flex items-center gap-2">
+              <Target className="w-4 h-4 text-emerald-400" /> Sobreposição Nativa de Alvo (Target Overlay / IVS)
+            </label>
+            <span className="text-[10px] font-mono text-zinc-500 bg-zinc-900 border border-zinc-800 px-2 py-0.5 rounded">
+              HARDWARE DA CÂMERA
+            </span>
+          </div>
+
+          <div className="p-4 rounded-xl bg-[#0C1017] border border-zinc-800/90 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <p className="text-xs font-semibold text-zinc-200 flex items-center gap-2">
+                Ativar Marcação de Alvo Nativa (Intelbras ShowTrack / ShowRule)
+              </p>
+              <p className="text-[11px] text-zinc-400 leading-relaxed">
+                Faz o chip da câmera carimbar os retângulos de detecção de pessoas e regras de IVS diretamente no fluxo de vídeo (0% de CPU no servidor). Ideal para os modos <b className="text-zinc-200">Híbrido</b> e <b className="text-zinc-200">100% Câmera</b>.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setTargetOverlay(!targetOverlay)}
+              className={`w-12 h-6 flex items-center rounded-full p-1 cursor-pointer transition-colors shrink-0 ${
+                targetOverlay ? 'bg-emerald-600 justify-end shadow-[0_0_10px_rgba(16,185,129,0.3)]' : 'bg-zinc-700 justify-start'
+              }`}
+            >
+              <div className="w-4 h-4 bg-white rounded-full shadow-md" />
+            </button>
           </div>
         </div>
 
