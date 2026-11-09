@@ -13,7 +13,7 @@ import socket
 import concurrent.futures
 from app.core.config import settings
 from app.core.time import get_now, get_now_str
-from app.db import get_camera_config, save_camera_config, save_image_profile_mode
+from app.db import get_camera_config, save_camera_config, save_image_profile_mode, update_camera_config_partial
 
 # Força transporte TCP para evitar corrupção de imagem e pacotes perdidos
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
@@ -66,6 +66,7 @@ class CameraService:
         self.last_camera_event_time = 0.0
         self.last_camera_event_code: str | None = None
         self.last_camera_event_data: dict = {}
+        self.on_camera_event = None  # Callback callable(code, action, event) para acordar o detector em 0ms
         self._event_thread: threading.Thread | None = None
 
         os.makedirs("snapshots", exist_ok=True)
@@ -308,6 +309,11 @@ class CameraService:
                             self.last_camera_event_code = code
                             self.last_camera_event_data = event
                             logger.info(f"[CÂMERA IVS/SMD] Disparo de evento nativo: {code} (action={action})")
+                            if callable(self.on_camera_event):
+                                try:
+                                    self.on_camera_event(code, action, event)
+                                except Exception as cb_err:
+                                    logger.debug(f"Erro no callback on_camera_event: {cb_err}")
                         elif action.lower() == "stop":
                             if self.last_camera_event_code == code:
                                 self.camera_event_active = False
@@ -486,6 +492,33 @@ class CameraService:
             "night_start_time": self.night_start_time,
             "night_end_time": self.night_end_time,
             "is_night_active": self.is_night_active,
+        }
+
+    def set_target_overlay(self, enabled: bool) -> dict:
+        """Ativa ou desativa a sobreposição nativa de alvo na câmera e persiste no SQLite."""
+        with self._lock:
+            self.target_overlay = bool(enabled)
+        update_camera_config_partial(target_overlay=1 if self.target_overlay else 0)
+        logger.info(f"[Target Overlay] Configuração persistida e atualizada: {self.target_overlay}")
+        threading.Thread(target=self._apply_target_overlay_rpc, daemon=True).start()
+        return {"status": "ok", "target_overlay": self.target_overlay}
+
+    def set_clip_duration(self, min_duration: int, max_duration: int) -> dict:
+        """Atualiza a duração mínima e máxima das gravações dinâmicas de alarme e persiste no SQLite."""
+        with self._lock:
+            self.clip_min_duration = int(min_duration)
+            self.clip_max_duration = int(max_duration)
+        update_camera_config_partial(
+            clip_min_duration=self.clip_min_duration,
+            clip_max_duration=self.clip_max_duration
+        )
+        logger.info(
+            f"[Clip Duration] Configuração persistida: min={self.clip_min_duration}s, max={self.clip_max_duration}s"
+        )
+        return {
+            "status": "ok",
+            "clip_min_duration": self.clip_min_duration,
+            "clip_max_duration": self.clip_max_duration
         }
 
     def _rpc_login(self, timeout: float = 5.0):
@@ -879,7 +912,25 @@ class CameraService:
 
                 mode = "WhiteMode" if on else "InfraredMode"
 
-                # 1. LightingScheme
+                # 1. Lighting_V2: Acionamento físico imediato do LED Branco / IR (milissegundo zero)
+                lighting_v2_cfg = _rpc("configManager.getConfig", {"name": "Lighting_V2"})
+                if lighting_v2_cfg.get("result"):
+                    lighting_v2 = lighting_v2_cfg["params"]["table"]
+                    for p in range(len(lighting_v2[0])):
+                        lighting_v2[0][p][1]["Mode"] = "Manual" if on else "Off"
+                        lighting_v2[0][p][1]["PercentOfMaxBrightness"] = 100
+                        lighting_v2[0][p][1]["NearLight"][0]["Light"] = intensity if on else 0
+                        lighting_v2[0][p][1]["Angle"] = 50
+                        if on:
+                            lighting_v2[0][p][0]["MiddleLight"][0]["Light"] = 0
+                            lighting_v2[0][p][0]["Mode"] = "Off"
+                        else:
+                            lighting_v2[0][p][0]["Mode"] = "Auto" if is_night else "Off"
+                            lighting_v2[0][p][0]["Correction"] = 50
+                            lighting_v2[0][p][0]["MiddleLight"][0]["Light"] = 100 if is_night else 0
+                    _rpc("configManager.setConfig", {"name": "Lighting_V2", "table": lighting_v2})
+
+                # 2. LightingScheme
                 scheme_cfg = _rpc("configManager.getConfig", {"name": "LightingScheme"})
                 if scheme_cfg.get("result"):
                     scheme = scheme_cfg["params"]["table"]
@@ -895,28 +946,6 @@ class CameraService:
                     for p in range(len(daynight[0])):
                         daynight[0][p]["Mode"] = "Color" if on else rest_dn_mode
                     _rpc("configManager.setConfig", {"name": "VideoInDayNight", "table": daynight})
-
-                # 3. Lighting_V2
-                lighting_v2_cfg = _rpc("configManager.getConfig", {"name": "Lighting_V2"})
-                if lighting_v2_cfg.get("result"):
-                    lighting_v2 = lighting_v2_cfg["params"]["table"]
-                    for p in range(len(lighting_v2[0])):
-                        # Index 1 = WhiteLight (Luz Branca / Flash)
-                        lighting_v2[0][p][1]["Mode"] = "Manual" if on else "Off"
-                        lighting_v2[0][p][1]["PercentOfMaxBrightness"] = 100
-                        lighting_v2[0][p][1]["NearLight"][0]["Light"] = intensity if on else 0
-                        lighting_v2[0][p][1]["NearLight"][0]["Angle"] = 50
-                        if on:
-                            # Desliga o IR durante o flash para fotos e vídeos em cores puras
-                            lighting_v2[0][p][0]["MiddleLight"][0]["Light"] = 0
-                            lighting_v2[0][p][0]["Mode"] = "Off"
-                        else:
-                            # Restaura o Smart IR automático (Mode="Auto") no modo de espera noturno
-                            lighting_v2[0][p][0]["Mode"] = "Auto" if is_night else "Off"
-                            lighting_v2[0][p][0]["Correction"] = 50
-                            lighting_v2[0][p][0]["MiddleLight"][0]["Light"] = 100 if is_night else 0
-                    _rpc("configManager.setConfig", {"name": "Lighting_V2", "table": lighting_v2})
-
                 # 4. WDR, Exposição e Cor dinâmicos no Flash (6_flash_wdr_off quando on=True -> 4_ir_with_wdr38 quando on=False)
                 bl_cfg = _rpc("configManager.getConfig", {"name": "VideoInBacklight"})
                 if bl_cfg.get("result"):
@@ -1111,17 +1140,25 @@ class CameraService:
             "message": "Não foi possível enviar o comando de reboot à câmera. Verifique se ela está acessível na rede.",
         }
 
-    def take_snapshot(self, prefix: str = "snapshot") -> str:
+    def take_snapshot(self, prefix: str = "snapshot", from_memory: bool = False) -> str:
         """
         Tira um snapshot em alta resolução:
-        Tenta via CGI snapshot da câmera (1080p nativo direto do sensor).
-        Se falhar, usa o último frame recebido do RTSP.
+        - from_memory=True: Captura instantânea em ~2ms direto do frame RTSP na memória RAM (Zero latência de rede/CGI).
+        - from_memory=False: Tenta via CGI snapshot da câmera (1080p nativo direto do sensor). Se falhar, usa o último frame recebido do RTSP.
         """
         timestamp = get_now_str("%Y%m%d_%H%M%S")
         filename = f"{prefix}_{timestamp}.jpg"
         snapshots_dir = "backend/snapshots" if os.path.exists("backend/snapshots") else "snapshots"
         os.makedirs(snapshots_dir, exist_ok=True)
         filepath = os.path.join(snapshots_dir, filename)
+
+        if from_memory:
+            with self._lock:
+                frame = self.latest_frame_raw if self.latest_frame_raw is not None else self.latest_frame_annotated
+                if frame is not None:
+                    cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    logger.info(f"Snapshot instantâneo RAM salvo: {filepath}")
+                    return filename
 
         try:
             url = f"http://{self.ip}:{self.http_port}/cgi-bin/snapshot.cgi?channel=1"
@@ -1135,8 +1172,9 @@ class CameraService:
             logger.warning(f"Snapshot CGI falhou ({e}), usando frame RTSP...")
 
         with self._lock:
-            if self.latest_frame_raw is not None:
-                cv2.imwrite(filepath, self.latest_frame_raw, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            frame = self.latest_frame_raw if self.latest_frame_raw is not None else self.latest_frame_annotated
+            if frame is not None:
+                cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 logger.info(f"Snapshot RTSP salvo: {filepath}")
                 return filename
 

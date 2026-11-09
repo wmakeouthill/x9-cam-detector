@@ -334,6 +334,36 @@ def test_gdrive_connection(user: str = Depends(get_current_user)):
 def sync_gdrive_now(user: str = Depends(get_current_user)):
     return gdrive_service.sync_now()
 
+@router.get("/config")
+def get_camera_configuration(user: str = Depends(get_current_user)):
+    cfg = get_camera_config()
+    ip = cfg.get("ip") or camera_service.ip or settings.CAMERA_IP
+    port = cfg.get("port") or camera_service.port or settings.CAMERA_PORT
+    http_port = cfg.get("http_port") or camera_service.http_port or settings.CAMERA_HTTP_PORT
+    user_name = cfg.get("user") or camera_service.user or settings.CAMERA_USER
+    subtype = cfg.get("subtype") if cfg.get("subtype") is not None else camera_service.subtype
+    image_profile_mode = cfg.get("image_profile_mode") or camera_service.image_profile_mode
+    night_start_time = cfg.get("night_start_time") or camera_service.night_start_time
+    night_end_time = cfg.get("night_end_time") or camera_service.night_end_time
+    clip_min_duration = cfg.get("clip_min_duration") or camera_service.clip_min_duration
+    clip_max_duration = cfg.get("clip_max_duration") or camera_service.clip_max_duration
+    target_overlay = bool(cfg.get("target_overlay", camera_service.target_overlay))
+
+    return {
+        "ip": ip,
+        "port": port,
+        "http_port": http_port,
+        "user": user_name,
+        "subtype": subtype,
+        "image_profile_mode": image_profile_mode,
+        "night_start_time": night_start_time,
+        "night_end_time": night_end_time,
+        "clip_min_duration": clip_min_duration,
+        "clip_max_duration": clip_max_duration,
+        "target_overlay": target_overlay,
+        "has_password": bool(cfg.get("password") or settings.CAMERA_PASSWORD),
+    }
+
 @router.post("/config")
 def update_config(req: CameraConfigRequest, user: str = Depends(get_current_user)):
     pwd = req.password.strip() if req.password else ""
@@ -386,6 +416,23 @@ def change_stream_subtype(req: SubtypeRequest, user: str = Depends(get_current_u
         "subtype": req.subtype,
         "name": "1080p FHD" if req.subtype == 0 else "480p Substream",
     }
+
+class TargetOverlayRequest(BaseModel):
+    target_overlay: bool
+
+@router.post("/target-overlay")
+def set_target_overlay_endpoint(req: TargetOverlayRequest, user: str = Depends(get_current_user)):
+    return camera_service.set_target_overlay(req.target_overlay)
+
+class ClipDurationRequest(BaseModel):
+    clip_min_duration: int
+    clip_max_duration: int
+
+@router.post("/clip-duration")
+def set_clip_duration_endpoint(req: ClipDurationRequest, user: str = Depends(get_current_user)):
+    if req.clip_min_duration < 5 or req.clip_max_duration < req.clip_min_duration:
+        raise HTTPException(status_code=400, detail="Durações de clipe inválidas. O mínimo deve ser >= 5s e menor que o máximo.")
+    return camera_service.set_clip_duration(req.clip_min_duration, req.clip_max_duration)
 
 class WhatsAppConfigRequest(BaseModel):
     enabled: bool = False
@@ -473,13 +520,13 @@ def reset_whatsapp_instance(req: WhatsAppResetRequest, user: str = Depends(get_c
 @router.post("/whatsapp/test")
 def test_whatsapp_notification(req: WhatsAppTestRequest, user: str = Depends(get_current_user)):
     current = get_whatsapp_config(decrypt_key=True)
-    api_url = (req.api_url or current["api_url"]).strip()
-    instance = (req.instance_name or current["instance_name"]).strip()
-    target = (req.target_number or current["target_number"]).strip()
-    key = req.api_key.strip() if (req.api_key and req.api_key.strip() != "••••••••") else current["api_key"]
+    api_url = (req.api_url or current.get("api_url") or settings.EVOLUTION_API_URL or "http://evolution-api:8080").strip()
+    instance = (req.instance_name or current.get("instance_name") or settings.EVOLUTION_INSTANCE_NAME or "x9-vigia").strip()
+    target = (req.target_number or current.get("target_number") or "").strip()
+    key = req.api_key.strip() if (req.api_key and req.api_key.strip() != "••••••••") else (current.get("api_key") or settings.EVOLUTION_API_KEY or "x9-evolution-key-2026")
 
-    if not api_url or not instance or not target or not key:
-        raise HTTPException(status_code=400, detail="Preencha URL, Instância, API Key e Número antes de testar.")
+    if not api_url or not instance or not target:
+        raise HTTPException(status_code=400, detail="Preencha URL, Instância e Número de WhatsApp antes de testar.")
 
     conn_res = evolution_service.test_connection(api_url, key, instance)
     if not conn_res.get("connected"):

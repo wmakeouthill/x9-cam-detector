@@ -137,6 +137,12 @@ class DetectorService:
         self.people_count = 0
         self.detections_count = 0
         self.test_mode = False # Por padrão desligado; segue rigorosamente a janela cadastrada
+        self.wake_event = threading.Event()
+
+    def _on_camera_event(self, code: str, action: str, event: dict):
+        """Acorda o detector YOLO no milissegundo zero quando a câmera detecta movimento."""
+        if action.lower() in ("start", "pulse"):
+            self.wake_event.set()
 
     def load_model(self, model_name: str = "yolov8n"):
         try:
@@ -160,12 +166,15 @@ class DetectorService:
         if self.detection_mode != "camera" and self.model is None:
             self.load_model(model_name)
             
+        camera_service.on_camera_event = self._on_camera_event
         self._thread = threading.Thread(target=self._detection_loop, daemon=True)
         self._thread.start()
         logger.info(f"Detector de Pessoas iniciado (Modo: {self.detection_mode.upper()}).")
 
     def stop(self):
         self._running = False
+        self.wake_event.set()
+        camera_service.on_camera_event = None
         if self._thread:
             self._thread.join(timeout=2)
         logger.info("Detector YOLO encerrado.")
@@ -207,13 +216,13 @@ class DetectorService:
         reason: str = "",
     ):
         """
-        Dispara a sequência de flagrante de segurança:
-        1. Foto 1 em P&B (IR / milissegundo zero, antes da comutação óptica).
-        2. Acionamento do Flash LED de Luz Branca.
-        3. Comutação mecânica e Foto 2 Full Color 1080p nítida.
-        4. Envio imediato da foto no WhatsApp.
-        5. Gravação de vídeo dinâmico MP4 com áudio.
-        6. Registro no SQLite e upload automático para o Google Drive.
+        Dispara a sequência de flagrante de segurança com ZERO LATÊNCIA:
+        1. Aciona Flash LED de Luz Branca no instante zero (t=0ms).
+        2. Inicia gravação de vídeo dinâmico MP4 no instante zero (t=0ms).
+        3. Foto 1 em P&B capturada instantaneamente da memória RAM (2ms, sem bloqueio de rede).
+        4. Transição óptica e Foto 2 Colorida com Flash executadas em thread assíncrona,
+           sem travar o loop de detecção nem atrasar a gravação.
+        5. Registro no SQLite e upload automático para Google Drive e WhatsApp.
         """
         now_sec = time.time()
         self.last_detection_time = now_sec
@@ -225,31 +234,13 @@ class DetectorService:
 
         motivo = reason or f"Pessoa detectada ({max_conf:.1%})"
         logger.warning(
-            f"[!] FLAGRANTE DISPARADO [{event_type}]: {motivo}! Luz Branca ({flash_duration:.1f}s), Foto 1080p e Vídeo Dinâmico ({min_duration}s base, até {max_duration}s)..."
+            f"[!] FLAGRANTE INSTANTÂNEO [{event_type}]: {motivo}! Luz Branca ({flash_duration:.1f}s), Foto RAM e Vídeo Dinâmico ({min_duration}s base, até {max_duration}s)..."
         )
 
-        # 1. Foto 1: Flagrante Instantâneo (Preto e Branco / IR no milissegundo zero, antes do flash)
-        snapshot_pb = camera_service.take_snapshot(prefix="snapshot_pb")
-        log_detection_event(
-            confidence=max_conf,
-            flash_triggered=False,
-            snapshot_path=snapshot_pb,
-            video_path=None,
-            event_type=event_type,
-        )
-        logger.info(f"[+] Foto 1 (Flagrante P&B) capturada: {snapshot_pb}")
-
-        # 2. Aciona Flash de Luz Branca (WhiteMode + WDR Off)
+        # 1. ACIONA FLASH LED DE LUZ BRANCA IMEDIATAMENTE (Milissegundo Zero)
         camera_service.trigger_flash(seconds=flash_duration)
 
-        # 3. Aguarda 1.8s para comutação mecânica do filtro IR-cut, desligamento do WDR e luz plena
-        time.sleep(1.8)
-
-        # 4. Foto 2: Foto com Flash (Full Color 1080p nítida com o ambiente 100% iluminado)
-        snapshot_flash = camera_service.take_snapshot(prefix="snapshot_flash")
-        evolution_service.send_alert_photo_async(snapshot_flash, max_conf)
-
-        # 5. Grava clipe de vídeo MP4 em alta definição com áudio sincronizado e extensão dinâmica
+        # 2. INICIA GRAVAÇÃO DINÂMICA DE VÍDEO IMEDIATAMENTE (Milissegundo Zero)
         video_desc = f"Gravação Noturna X9 [{event_type}]: {motivo}"
         def _upload_video_when_ready(fpath, fname):
             logger.info(f"[+] Gravação finalizada, enviando vídeo ao Google Drive: {fname}")
@@ -273,27 +264,54 @@ class DetectorService:
             file_type="recording",
         )
 
-        # 6. Salva no SQLite o evento principal com a foto colorida com flash e o vídeo
+        # 3. FOTO 1: Flagrante Instantâneo P&B gravado direto da memória RAM (2ms, sem bloqueio HTTP)
+        snapshot_pb = camera_service.take_snapshot(prefix="snapshot_pb", from_memory=True)
         log_detection_event(
             confidence=max_conf,
             flash_triggered=True,
-            snapshot_path=snapshot_flash,
+            snapshot_path=snapshot_pb,
             video_path=video_filename,
             event_type=event_type,
         )
-        logger.info(f"[+] Evento gravado no banco com Foto Flash ({snapshot_flash}) e vídeo ({video_filename})")
+        logger.info(f"[+] Foto 1 (Flagrante P&B instantâneo da RAM) capturada: {snapshot_pb}")
 
-        # 7. Backup automático para Google Drive (foto flagrante P&B e foto flash colorido)
-        gdrive_service.upload_file_async(
-            snapshot_pb,
-            description=f"Detecção X9 [Flagrante P&B]: {motivo}",
-            file_type="snapshot",
-        )
-        gdrive_service.upload_file_async(
-            snapshot_flash,
-            description=f"Detecção X9 [Flash Colorido]: {motivo}",
-            file_type="snapshot",
-        )
+        # 4. Transição óptica e Foto 2 Colorida com Flash em THREAD ASSÍNCRONA SEPARADA
+        # (O loop de detecção e o vídeo continuam rodando sem NENHUM freeze ou bloqueio!)
+        def _flagrante_optical_transition_worker():
+            try:
+                # Aguarda comutação mecânica do filtro IR-cut, desligamento do WDR e luz plena (1.5s)
+                time.sleep(1.5)
+
+                # Foto 2: Foto com Flash (Full Color 1080p da RAM com o ambiente iluminado)
+                snapshot_flash = camera_service.take_snapshot(prefix="snapshot_flash", from_memory=True)
+                evolution_service.send_alert_photo_async(snapshot_flash, max_conf)
+
+                # Atualiza no banco o registro com a foto colorida
+                log_detection_event(
+                    confidence=max_conf,
+                    flash_triggered=True,
+                    snapshot_path=snapshot_flash,
+                    video_path=video_filename,
+                    event_type=event_type,
+                )
+                logger.info(f"[+] Evento atualizado com Foto Flash ({snapshot_flash}) e vídeo ({video_filename})")
+
+                # Backup automático para Google Drive (foto flagrante P&B e foto flash colorido)
+                gdrive_service.upload_file_async(
+                    snapshot_pb,
+                    description=f"Detecção X9 [Flagrante P&B]: {motivo}",
+                    file_type="snapshot",
+                )
+                gdrive_service.upload_file_async(
+                    snapshot_flash,
+                    description=f"Detecção X9 [Flash Colorido]: {motivo}",
+                    file_type="snapshot",
+                )
+            except Exception as e:
+                logger.error(f"Erro no worker de transição óptica do flagrante: {e}")
+
+        t_bg = threading.Thread(target=_flagrante_optical_transition_worker, daemon=True)
+        t_bg.start()
 
     def _detection_loop(self):
         while self._running:
@@ -372,12 +390,13 @@ class DetectorService:
                     )
 
                     if not should_wake_yolo:
-                        # YOLO em repouso: CPU fica fria
+                        # YOLO em repouso: CPU fica fria (acorda em 0ms quando wake_event é disparado pelo hook)
                         self.yolo_awake = False
                         camera_service.update_active_tracks([])
                         self.people_count = 0
                         self.last_person_detected = False
-                        time.sleep(0.3)
+                        self.wake_event.wait(timeout=0.25)
+                        self.wake_event.clear()
                         continue
 
                     self.yolo_awake = True

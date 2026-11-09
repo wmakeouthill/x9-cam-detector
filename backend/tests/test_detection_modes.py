@@ -188,3 +188,62 @@ def test_camera_toggle_continuous_light():
         assert res2["continuous_light"] is False
         assert cam.continuous_light is False
         assert cam.is_flash_active is False
+
+def test_flagrante_zero_delay_order():
+    """Valida que _trigger_flagrante dispara Flash e Gravação no milissegundo zero sem bloqueio prévio."""
+    detector = DetectorService()
+    cfg = {"clip_min_duration": 20, "clip_max_duration": 120, "flash_duration": 5.0}
+
+    call_order = []
+
+    def mock_trigger_flash(seconds):
+        call_order.append(("trigger_flash", seconds))
+
+    def mock_record_clip(seconds, max_seconds, on_complete):
+        call_order.append(("record_clip", seconds))
+        return "video_test.mp4"
+
+    def mock_take_snapshot(prefix, from_memory=False):
+        call_order.append(("take_snapshot", prefix, from_memory))
+        return f"{prefix}_test.jpg"
+
+    with patch("app.services.detector_service.camera_service.trigger_flash", side_effect=mock_trigger_flash), \
+         patch("app.services.detector_service.camera_service.record_clip", side_effect=mock_record_clip), \
+         patch("app.services.detector_service.camera_service.take_snapshot", side_effect=mock_take_snapshot), \
+         patch("app.services.detector_service.log_detection_event"), \
+         patch("app.services.detector_service.gdrive_service.enqueue_file"), \
+         patch("threading.Thread") as mock_thread:
+
+        detector._trigger_flagrante(cfg=cfg, max_conf=0.92, event_type="PERSON_DETECTED")
+
+        # 1. Flash deve ser a PRIMEIRA ação chamada
+        assert call_order[0][0] == "trigger_flash"
+        # 2. Gravação de vídeo deve ser a SEGUNDA ação chamada
+        assert call_order[1][0] == "record_clip"
+        # 3. Snapshot PB deve vir da memória RAM (from_memory=True)
+        assert call_order[2] == ("take_snapshot", "snapshot_pb", True)
+        # 4. Transição óptica e foto colorida foram despachadas para worker em background
+        assert mock_thread.called is True
+
+def test_take_snapshot_from_memory_zero_http():
+    """Valida que take_snapshot(from_memory=True) grava direto da memória sem requisição HTTP."""
+    cam = CameraService()
+    import numpy as np
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    cam.latest_frame_raw = dummy_frame
+
+    with patch("requests.get") as mock_get:
+        snap_file = cam.take_snapshot(prefix="test_ram", from_memory=True)
+        assert "test_ram_" in snap_file
+        # Nenhuma requisição HTTP na rede deve ter sido feita!
+        assert mock_get.call_count == 0
+
+def test_camera_event_wakes_detector_immediately():
+    """Valida que o evento nativo da câmera ativa o wake_event instantaneamente."""
+    detector = DetectorService()
+    assert not detector.wake_event.is_set()
+
+    # Disparo de evento 'start' da câmera
+    detector._on_camera_event("SmartMotionHuman", "Start", {})
+    assert detector.wake_event.is_set()
+

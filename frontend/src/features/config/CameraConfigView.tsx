@@ -60,54 +60,179 @@ export function CameraConfigView({
   onConfigSaved,
 }: CameraConfigViewProps) {
   const { token } = useAuthStore();
-  const [ip, setIp] = useState(currentIp || '192.168.1.108');
+  const [loadingConfig, setLoadingConfig] = useState(true);
+  const [ip, setIp] = useState(currentIp || '');
   const [port, setPort] = useState(currentPort || 554);
   const [httpPort, setHttpPort] = useState(currentHttpPort || 80);
   const [user, setUser] = useState(currentUser || 'admin');
   const [password, setPassword] = useState('');
-  const [subtype, setSubtype] = useState(currentSubtype || 0);
+  const [subtype, setSubtype] = useState(currentSubtype !== undefined ? currentSubtype : 1);
   const [imageProfileMode, setImageProfileMode] = useState<'auto' | 'day' | 'night'>(currentImageProfileMode || 'auto');
-  const [nightStartTime, setNightStartTime] = useState(currentNightStartTime || '22:00');
-  const [nightEndTime, setNightEndTime] = useState(currentNightEndTime || '05:00');
+  const [nightStartTime, setNightStartTime] = useState(currentNightStartTime || '');
+  const [nightEndTime, setNightEndTime] = useState(currentNightEndTime || '');
   const [clipMinDuration, setClipMinDuration] = useState<number>(currentClipMinDuration || 20);
   const [clipMaxDuration, setClipMaxDuration] = useState<number>(currentClipMaxDuration || 120);
   const [targetOverlay, setTargetOverlay] = useState<boolean>(currentTargetOverlay !== undefined ? currentTargetOverlay : true);
 
-  const [hasLoaded, setHasLoaded] = useState(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileSavedMsg, setProfileSavedMsg] = useState<string | null>(null);
+  const [clipSaving, setClipSaving] = useState(false);
+  const [clipSavedMsg, setClipSavedMsg] = useState<string | null>(null);
+  const [overlaySaving, setOverlaySaving] = useState(false);
+  const [overlaySavedMsg, setOverlaySavedMsg] = useState<string | null>(null);
+
+  // Busca SEMPRE a configuração real gravada no banco ao entrar na tela (sem presets fictícios)
+  useEffect(() => {
+    if (!token) return;
+    let isMounted = true;
+    setLoadingConfig(true);
+    fetch('/api/camera/config', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => {
+        if (res.ok) return res.json();
+        throw new Error('Falha ao carregar configuração');
+      })
+      .then((cfg) => {
+        if (!isMounted) return;
+        if (cfg.ip) setIp(cfg.ip);
+        if (cfg.port !== undefined) setPort(cfg.port);
+        if (cfg.http_port !== undefined) setHttpPort(cfg.http_port);
+        if (cfg.user) setUser(cfg.user);
+        if (cfg.subtype !== undefined) setSubtype(cfg.subtype);
+        if (cfg.image_profile_mode) setImageProfileMode(cfg.image_profile_mode);
+        if (cfg.night_start_time) setNightStartTime(cfg.night_start_time);
+        if (cfg.night_end_time) setNightEndTime(cfg.night_end_time);
+        if (cfg.clip_min_duration !== undefined) setClipMinDuration(cfg.clip_min_duration);
+        if (cfg.clip_max_duration !== undefined) setClipMaxDuration(cfg.clip_max_duration);
+        if (cfg.target_overlay !== undefined) setTargetOverlay(Boolean(cfg.target_overlay));
+      })
+      .catch(() => {
+        // Fallback para props se offline
+        if (!isMounted) return;
+        if (currentIp) setIp(currentIp);
+        if (currentNightStartTime) setNightStartTime(currentNightStartTime);
+        if (currentNightEndTime) setNightEndTime(currentNightEndTime);
+      })
+      .finally(() => {
+        if (isMounted) setLoadingConfig(false);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [token]);
+
+  const applyImageProfileSchedule = async (newMode: 'auto' | 'day' | 'night', start: string, end: string) => {
+    setImageProfileMode(newMode);
+    setNightStartTime(start);
+    setNightEndTime(end);
+    if (!token) return;
+    setProfileSaving(true);
+    setProfileSavedMsg(null);
+    try {
+      const res = await fetch('/api/camera/image-profile', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          mode: newMode,
+          start_time: start,
+          end_time: end,
+        }),
+      });
+      if (res.ok) {
+        setProfileSavedMsg('✓ Perfil e Janela salvos com sucesso!');
+        setTimeout(() => setProfileSavedMsg(null), 3000);
+        onConfigSaved();
+      }
+    } catch {
+      // offline
+    } finally {
+      setProfileSaving(false);
+    }
+  };
+
+  const handleSubtypeChange = async (newSubtype: number) => {
+    setSubtype(newSubtype);
+    if (!token) return;
+    try {
+      await fetch('/api/camera/subtype', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ subtype: newSubtype }),
+      });
+      onConfigSaved();
+    } catch {
+      // offline
+    }
+  };
+
+  const saveClipDuration = async (minD: number, maxD: number) => {
+    setClipMinDuration(minD);
+    setClipMaxDuration(maxD);
+    if (!token) return;
+    setClipSaving(true);
+    setClipSavedMsg(null);
+    try {
+      const res = await fetch('/api/camera/clip-duration', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          clip_min_duration: minD,
+          clip_max_duration: maxD,
+        }),
+      });
+      if (res.ok) {
+        setClipSavedMsg('✓ Duração de gravação salva com sucesso!');
+        setTimeout(() => setClipSavedMsg(null), 3000);
+        onConfigSaved();
+      }
+    } catch {
+      // offline
+    } finally {
+      setClipSaving(false);
+    }
+  };
+
+  const handleToggleTargetOverlay = async () => {
+    const nextVal = !targetOverlay;
+    setTargetOverlay(nextVal);
+    if (!token) return;
+    setOverlaySaving(true);
+    setOverlaySavedMsg(null);
+    try {
+      const res = await fetch('/api/camera/target-overlay', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ target_overlay: nextVal }),
+      });
+      if (res.ok) {
+        setOverlaySavedMsg(nextVal ? '✓ Alvo IVS ativado na câmera!' : '✓ Alvo IVS desativado!');
+        setTimeout(() => setOverlaySavedMsg(null), 3000);
+        onConfigSaved();
+      }
+    } catch {
+      // offline
+    } finally {
+      setOverlaySaving(false);
+    }
+  };
 
   // Refs para scroll suave
   const formRef = useRef<HTMLDivElement>(null);
   const detectorRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!hasLoaded && currentIp) {
-      setIp(currentIp);
-      setPort(currentPort || 554);
-      setHttpPort(currentHttpPort || 80);
-      setUser(currentUser || 'admin');
-      if (currentSubtype !== undefined) setSubtype(currentSubtype);
-      if (currentImageProfileMode) setImageProfileMode(currentImageProfileMode);
-      if (currentNightStartTime) setNightStartTime(currentNightStartTime);
-      if (currentNightEndTime) setNightEndTime(currentNightEndTime);
-      if (currentClipMinDuration !== undefined) setClipMinDuration(currentClipMinDuration);
-      if (currentClipMaxDuration !== undefined) setClipMaxDuration(currentClipMaxDuration);
-      if (currentTargetOverlay !== undefined) setTargetOverlay(currentTargetOverlay);
-      setHasLoaded(true);
-    }
-  }, [
-    currentIp,
-    currentPort,
-    currentHttpPort,
-    currentUser,
-    currentSubtype,
-    currentImageProfileMode,
-    currentNightStartTime,
-    currentNightEndTime,
-    currentClipMinDuration,
-    currentClipMaxDuration,
-    currentTargetOverlay,
-    hasLoaded,
-  ]);
 
   const [saving, setSaving] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -117,6 +242,20 @@ export function CameraConfigView({
   const [foundCameras, setFoundCameras] = useState<FoundDevice[]>([]);
   const [message, setMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [detectorMessage, setDetectorMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
+
+  if (loadingConfig) {
+    return (
+      <div className="w-full h-full p-4 sm:p-8 flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3 p-8 rounded-2xl bg-[#080B10] border border-zinc-800 text-center font-mono max-w-md shadow-2xl">
+          <RefreshCw className="w-8 h-8 animate-spin text-emerald-400" />
+          <p className="text-sm font-semibold text-zinc-100">Carregando Configurações Salvas</p>
+          <p className="text-xs text-zinc-400">
+            Buscando os parâmetros reais gravados no banco de dados SQLite, sem carregar presets fictícios.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   const presetSubnets = [
     { label: '192.168.1.0/24 (Principal)', value: '192.168.1' },
@@ -431,7 +570,7 @@ export function CameraConfigView({
                       type="radio"
                       name="subtype"
                       checked={subtype === 0}
-                      onChange={() => setSubtype(0)}
+                      onChange={() => handleSubtypeChange(0)}
                       className="accent-emerald-500"
                     />
                     <div>
@@ -451,7 +590,7 @@ export function CameraConfigView({
                       type="radio"
                       name="subtype"
                       checked={subtype === 1}
-                      onChange={() => setSubtype(1)}
+                      onChange={() => handleSubtypeChange(1)}
                       className="accent-emerald-500"
                     />
                     <div>
@@ -496,7 +635,7 @@ export function CameraConfigView({
                   type="radio"
                   name="imageProfileMode"
                   checked={imageProfileMode === 'auto'}
-                  onChange={() => setImageProfileMode('auto')}
+                  onChange={() => applyImageProfileSchedule('auto', nightStartTime, nightEndTime)}
                   className="accent-emerald-500"
                 />
               </div>
@@ -521,7 +660,7 @@ export function CameraConfigView({
                   type="radio"
                   name="imageProfileMode"
                   checked={imageProfileMode === 'day'}
-                  onChange={() => setImageProfileMode('day')}
+                  onChange={() => applyImageProfileSchedule('day', nightStartTime, nightEndTime)}
                   className="accent-amber-500"
                 />
               </div>
@@ -546,7 +685,7 @@ export function CameraConfigView({
                   type="radio"
                   name="imageProfileMode"
                   checked={imageProfileMode === 'night'}
-                  onChange={() => setImageProfileMode('night')}
+                  onChange={() => applyImageProfileSchedule('night', nightStartTime, nightEndTime)}
                   className="accent-indigo-500"
                 />
               </div>
@@ -559,10 +698,17 @@ export function CameraConfigView({
           {/* Configuração de Janela Noturna */}
           <div className="pt-2 border-t border-zinc-800/80 space-y-3">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-              <label className="text-xs font-semibold text-zinc-300 font-mono flex items-center gap-2">
-                <Clock className="w-3.5 h-3.5 text-emerald-400" />
-                Janela do Horário Noturno (quando o perfil estiver em Automático)
-              </label>
+              <div className="flex items-center gap-2 flex-wrap">
+                <label className="text-xs font-semibold text-zinc-300 font-mono flex items-center gap-2">
+                  <Clock className="w-3.5 h-3.5 text-emerald-400" />
+                  Janela do Horário Noturno (quando o perfil estiver em Automático)
+                </label>
+                {profileSavedMsg && (
+                  <span className="text-[11px] font-mono text-emerald-400 animate-fade-in bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/30">
+                    {profileSavedMsg}
+                  </span>
+                )}
+              </div>
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="text-[10px] text-zinc-500 font-mono">Presets:</span>
                 {[
@@ -574,10 +720,7 @@ export function CameraConfigView({
                   <button
                     key={p.label}
                     type="button"
-                    onClick={() => {
-                      setNightStartTime(p.start);
-                      setNightEndTime(p.end);
-                    }}
+                    onClick={() => applyImageProfileSchedule(imageProfileMode, p.start, p.end)}
                     className={`px-2 py-0.5 rounded text-[10px] font-mono border transition-all cursor-pointer ${
                       nightStartTime === p.start && nightEndTime === p.end
                         ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50'
@@ -599,6 +742,7 @@ export function CameraConfigView({
                   type="time"
                   value={nightStartTime}
                   onChange={(e) => setNightStartTime(e.target.value)}
+                  onBlur={() => applyImageProfileSchedule(imageProfileMode, nightStartTime, nightEndTime)}
                   className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none"
                 />
               </div>
@@ -607,12 +751,23 @@ export function CameraConfigView({
                 <label className="block text-xs font-medium text-zinc-400 mb-1 font-mono">
                   Fim da Noite (Restaura Colorido + WDR 60)
                 </label>
-                <input
-                  type="time"
-                  value={nightEndTime}
-                  onChange={(e) => setNightEndTime(e.target.value)}
-                  className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none"
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="time"
+                    value={nightEndTime}
+                    onChange={(e) => setNightEndTime(e.target.value)}
+                    onBlur={() => applyImageProfileSchedule(imageProfileMode, nightStartTime, nightEndTime)}
+                    className="flex-1 bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    disabled={profileSaving}
+                    onClick={() => applyImageProfileSchedule(imageProfileMode, nightStartTime, nightEndTime)}
+                    className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-mono transition-colors cursor-pointer flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    {profileSaving ? 'Salvando...' : 'Salvar Horário'}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -621,18 +776,20 @@ export function CameraConfigView({
         {/* Card 4: Gravação Dinâmica de Alarme & Flagrante (Post-Roll Buffer) */}
         <div className="bg-[#080B10] border border-zinc-800/90 rounded-xl p-4 sm:p-6 space-y-4 sm:space-y-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-zinc-800/80 pb-3 gap-2">
-            <div>
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs font-bold uppercase tracking-wider text-emerald-400 font-mono flex items-center gap-2">
                 <Film className="w-4 h-4 text-emerald-400" /> 4. Gravação Dinâmica de Alarme (Post-Roll / Extensão por Movimento)
               </span>
-              <p className="text-[11px] text-zinc-400 font-mono mt-0.5">
-                Grava um único vídeo contínuo enquanto houver pessoa na cena, evitando vídeos picotados de 10 em 10 segundos
-              </p>
+              {clipSavedMsg && (
+                <span className="text-[11px] font-mono text-emerald-400 animate-fade-in bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/30">
+                  {clipSavedMsg}
+                </span>
+              )}
             </div>
             <span className="text-[10px] font-mono text-zinc-500">ALARM::DYNAMIC_CLIP</span>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             <div>
               <label className="block text-xs font-semibold text-zinc-300 mb-1.5 font-mono">
                 Duração Base Inicial (Segundos)
@@ -643,6 +800,7 @@ export function CameraConfigView({
                 max={60}
                 value={clipMinDuration}
                 onChange={(e) => setClipMinDuration(Number(e.target.value))}
+                onBlur={() => saveClipDuration(clipMinDuration, clipMaxDuration)}
                 className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 sm:p-3 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none min-h-[42px]"
               />
               <p className="text-[10px] text-zinc-500 font-mono mt-1">
@@ -660,11 +818,23 @@ export function CameraConfigView({
                 max={300}
                 value={clipMaxDuration}
                 onChange={(e) => setClipMaxDuration(Number(e.target.value))}
+                onBlur={() => saveClipDuration(clipMinDuration, clipMaxDuration)}
                 className="w-full bg-[#0E131C] border border-zinc-700/60 rounded-lg p-2.5 sm:p-3 text-sm text-zinc-100 font-mono focus:border-emerald-500 focus:outline-none min-h-[42px]"
               />
               <p className="text-[10px] text-zinc-500 font-mono mt-1">
                 Padrão: 120s (2 min). Protege o upload do WhatsApp caso alguém fique parado no campo de visão.
               </p>
+            </div>
+
+            <div className="flex flex-col justify-end">
+              <button
+                type="button"
+                disabled={clipSaving}
+                onClick={() => saveClipDuration(clipMinDuration, clipMaxDuration)}
+                className="w-full px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-mono transition-colors cursor-pointer flex items-center justify-center gap-1.5 min-h-[42px]"
+              >
+                {clipSaving ? 'Salvando...' : 'Salvar Duração'}
+              </button>
             </div>
           </div>
 
@@ -678,10 +848,17 @@ export function CameraConfigView({
 
         {/* Inteligência de Borda & Sobreposição Nativa (Intelbras IVS) */}
         <div className="pt-4 border-t border-zinc-800/80 space-y-4">
-          <div className="flex items-center justify-between">
-            <label className="text-xs font-bold uppercase tracking-wider text-emerald-400 font-mono flex items-center gap-2">
-              <Target className="w-4 h-4 text-emerald-400" /> Sobreposição Nativa de Alvo (Target Overlay / IVS)
-            </label>
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2">
+              <label className="text-xs font-bold uppercase tracking-wider text-emerald-400 font-mono flex items-center gap-2">
+                <Target className="w-4 h-4 text-emerald-400" /> Sobreposição Nativa de Alvo (Target Overlay / IVS)
+              </label>
+              {overlaySavedMsg && (
+                <span className="text-[11px] font-mono text-emerald-400 animate-fade-in bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/30">
+                  {overlaySavedMsg}
+                </span>
+              )}
+            </div>
             <span className="text-[10px] font-mono text-zinc-500 bg-zinc-900 border border-zinc-800 px-2 py-0.5 rounded">
               HARDWARE DA CÂMERA
             </span>
@@ -699,8 +876,9 @@ export function CameraConfigView({
 
             <button
               type="button"
-              onClick={() => setTargetOverlay(!targetOverlay)}
-              className={`w-12 h-6 flex items-center rounded-full p-1 cursor-pointer transition-colors shrink-0 ${
+              disabled={overlaySaving}
+              onClick={handleToggleTargetOverlay}
+              className={`w-12 h-6 flex items-center rounded-full p-1 cursor-pointer transition-colors shrink-0 disabled:opacity-50 ${
                 targetOverlay ? 'bg-emerald-600 justify-end shadow-[0_0_10px_rgba(16,185,129,0.3)]' : 'bg-zinc-700 justify-start'
               }`}
             >

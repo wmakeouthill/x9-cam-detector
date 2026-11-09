@@ -15,6 +15,7 @@ export function NightWatchView() {
   const [enabled, setEnabled] = useState(true);
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [loadingConfig, setLoadingConfig] = useState(true);
   const [isWhatsappModalOpen, setIsWhatsappModalOpen] = useState(false);
   const [whatsappStatus, setWhatsappStatus] = useState<{ enabled: boolean; target_number: string } | null>(null);
 
@@ -35,6 +36,7 @@ export function NightWatchView() {
 
   useEffect(() => {
     if (!token) return;
+    setLoadingConfig(true);
     fetch('/api/camera/nightwatch', {
       headers: { Authorization: `Bearer ${token}` },
     })
@@ -49,7 +51,10 @@ export function NightWatchView() {
         if (data.enabled !== undefined) setEnabled(Boolean(data.enabled));
         if (data.detection_mode) setDetectionMode(data.detection_mode);
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        setLoadingConfig(false);
+      });
     fetchWhatsappStatus();
   }, [token]);
 
@@ -82,6 +87,20 @@ export function NightWatchView() {
       setLoading(false);
     }
   };
+
+  if (loadingConfig) {
+    return (
+      <div className="flex-1 p-4 sm:p-8 flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3 p-8 rounded-2xl bg-[#0D111A] border border-slate-800 text-center font-mono max-w-md shadow-2xl">
+          <Clock className="w-8 h-8 animate-spin text-cyan-400" />
+          <p className="text-sm font-semibold text-slate-100">Carregando Regras Salvas</p>
+          <p className="text-xs text-slate-400">
+            Buscando os parâmetros reais gravados no banco de dados SQLite.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 p-3.5 sm:p-6 md:p-8 max-w-3xl overflow-y-auto">

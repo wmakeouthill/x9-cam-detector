@@ -4,6 +4,7 @@ from app.db.db import (
     get_camera_config,
     save_camera_config,
     save_image_profile_mode,
+    update_camera_config_partial,
     get_night_watch_config,
     save_night_watch_config,
     log_detection_event,

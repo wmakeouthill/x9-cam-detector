@@ -35,6 +35,23 @@ def test_database_init_and_crud():
     assert cfg["password"] == "p@ssword!#"
     assert cfg["subtype"] == 1
 
+    # Testa atualização parcial de configurações individuais sem resetar os demais
+    from app.db import update_camera_config_partial
+    updated_cfg = update_camera_config_partial(
+        night_start_time="23:30",
+        night_end_time="06:30",
+        clip_min_duration=25,
+        clip_max_duration=150,
+        target_overlay=0,
+    )
+    assert updated_cfg["ip"] == "192.168.1.200"
+    assert updated_cfg["password"] == "p@ssword!#"
+    assert updated_cfg["night_start_time"] == "23:30"
+    assert updated_cfg["night_end_time"] == "06:30"
+    assert updated_cfg["clip_min_duration"] == 25
+    assert updated_cfg["clip_max_duration"] == 150
+    assert updated_cfg["target_overlay"] == 0
+
     save_night_watch_config(True, "00:30", "05:30", 3.0, 0.50, "yolov8s", 15)
     nw = get_night_watch_config()
     assert nw["start_time"] == "00:30"

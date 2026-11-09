@@ -483,17 +483,21 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
             </div>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-300 mb-1.5 font-mono">
-                Chave de Autenticação (API Key)
-              </label>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-xs font-semibold text-slate-300 font-mono">
+                  Chave de Autenticação (API Key)
+                </label>
+                <span className="text-[10px] text-emerald-400 font-mono bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/30">
+                  {apiKey && apiKey !== '••••••••' ? 'Chave personalizada' : '✓ Usando chave do .env'}
+                </span>
+              </div>
               <div className="relative">
                 <input
                   type={showKey ? 'text' : 'password'}
-                  placeholder="x9-evolution-key-2026"
+                  placeholder="Deixe vazio para usar a chave configurada no .env"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
                   className="w-full bg-[#0D121B] border border-slate-700/80 rounded-lg pl-3 pr-10 py-2 text-xs text-slate-100 font-mono focus:outline-none focus:border-emerald-500 transition-colors"
-                  required={enabled}
                 />
                 <button
                   type="button"
@@ -504,7 +508,7 @@ export function WhatsAppConfigModal({ isOpen, onClose, onSaved }: WhatsAppConfig
                 </button>
               </div>
               <p className="text-[10px] text-slate-500 mt-1 font-mono">
-                Chave da Evolution configurada no docker-compose (padrão: <code>x9-evolution-key-2026</code>). Criptografada com AES-256 no banco local.
+                Não precisa digitar novamente: se deixar vazio, o sistema usa automaticamente a chave do <code>.env</code>.
               </p>
             </div>
           </div>

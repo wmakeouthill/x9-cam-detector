@@ -295,6 +295,33 @@ def save_image_profile_mode(mode: str, start_time: str | None = None, end_time: 
     conn.commit()
     conn.close()
 
+def update_camera_config_partial(**kwargs) -> dict:
+    """
+    Atualiza colunas pontuais da tabela camera_config preservando todos os demais parâmetros já salvos.
+    Retorna a configuração completa atualizada.
+    """
+    valid_cols = {
+        "ip", "port", "http_port", "user", "subtype",
+        "image_profile_mode", "night_start_time", "night_end_time",
+        "clip_min_duration", "clip_max_duration", "target_overlay",
+    }
+    updates = {k: v for k, v in kwargs.items() if k in valid_cols and v is not None}
+    if not updates:
+        return get_camera_config()
+
+    set_clause = ", ".join(f"{col} = ?" for col in updates.keys())
+    values = list(updates.values())
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        UPDATE camera_config
+        SET {set_clause}, updated_at = CURRENT_TIMESTAMP
+        WHERE id = 1
+    """, values)
+    conn.commit()
+    conn.close()
+    return get_camera_config()
+
 def get_night_watch_config() -> dict:
     conn = get_connection()
     cursor = conn.cursor()
@@ -687,10 +714,14 @@ def get_whatsapp_config(decrypt_key: bool = False) -> dict:
     api_key_val = ""
     if has_key:
         api_key_val = decrypt_credential(encrypted_key) if decrypt_key else "••••••••"
+    elif settings.EVOLUTION_API_KEY:
+        has_key = True
+        api_key_val = settings.EVOLUTION_API_KEY if decrypt_key else "••••••••"
+
     return {
         "enabled": bool(row["enabled"]),
-        "api_url": row["api_url"] or "",
-        "instance_name": row["instance_name"] or "",
+        "api_url": row["api_url"] or settings.EVOLUTION_API_URL or "http://evolution-api:8080",
+        "instance_name": row["instance_name"] or settings.EVOLUTION_INSTANCE_NAME or "x9-vigia",
         "target_number": row["target_number"] or "",
         "send_photo": bool(row["send_photo"]),
         "send_video": bool(row["send_video"]),
@@ -715,8 +746,12 @@ def save_whatsapp_config(
 
     if api_key and api_key.strip() and api_key != "••••••••":
         new_encrypted = encrypt_credential(api_key.strip())
-    else:
+    elif existing_encrypted:
         new_encrypted = existing_encrypted
+    elif settings.EVOLUTION_API_KEY:
+        new_encrypted = encrypt_credential(settings.EVOLUTION_API_KEY)
+    else:
+        new_encrypted = ""
 
     cursor.execute("""
         INSERT INTO whatsapp_config (id, enabled, api_url, api_key_encrypted, instance_name, target_number, send_photo, send_video, updated_at)
