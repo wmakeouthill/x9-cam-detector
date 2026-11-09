@@ -164,3 +164,27 @@ def test_camera_target_overlay_config_and_rpc():
     )
     cfg2 = get_camera_config()
     assert cfg2.get("target_overlay") == 0
+
+def test_camera_toggle_continuous_light():
+    """Valida acionamento contínuo da luz branca 100% (toggle) e proteção contra desligamento por flash temporário."""
+    cam = CameraService()
+    assert cam.continuous_light is False
+    assert cam.is_flash_active is False
+
+    with patch.object(cam, "_set_camera_lighting_rpc", return_value=True) as mock_rpc:
+        # 1. Liga contínuo
+        res = cam.toggle_light(True)
+        assert res["status"] == "ok"
+        assert res["continuous_light"] is True
+        assert cam.continuous_light is True
+        assert cam.is_flash_active is True
+
+        # 2. Disparo de flash temporário enquanto contínuo não afeta a luz contínua
+        flash_res = cam.trigger_flash(seconds=2.0)
+        assert flash_res.get("continuous_light") is True
+
+        # 3. Toggle sem argumento inverte para False
+        res2 = cam.toggle_light()
+        assert res2["continuous_light"] is False
+        assert cam.continuous_light is False
+        assert cam.is_flash_active is False

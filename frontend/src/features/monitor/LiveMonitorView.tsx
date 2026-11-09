@@ -24,6 +24,7 @@ import {
   Sun,
   Moon,
   Clock,
+  Lightbulb,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -47,6 +48,8 @@ interface LiveMonitorViewProps {
   nightStartTime?: string;
   nightEndTime?: string;
   isNightActive?: boolean;
+  continuousLight?: boolean;
+  flashActive?: boolean;
   onRefreshStatus: () => void;
 }
 
@@ -70,11 +73,14 @@ export function LiveMonitorView({
   nightStartTime = '22:00',
   nightEndTime = '05:00',
   isNightActive = false,
+  continuousLight = false,
+  flashActive = false,
   onRefreshStatus,
 }: LiveMonitorViewProps) {
   const { token } = useAuthStore();
   const [streamKey, setStreamKey] = useState(Date.now());
   const [flashLoading, setFlashLoading] = useState(false);
+  const [continuousLightLoading, setContinuousLightLoading] = useState(false);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [recordLoading, setRecordLoading] = useState(false);
   const [subtypeLoading, setSubtypeLoading] = useState(false);
@@ -185,6 +191,39 @@ export function LiveMonitorView({
       setActionMessage({ text: err.message || 'Erro ao alterar resolução da câmera.', type: 'error' });
     } finally {
       setSubtypeLoading(false);
+    }
+  };
+
+  const handleToggleContinuousLight = async () => {
+    if (continuousLightLoading) return;
+    setContinuousLightLoading(true);
+    setActionMessage(null);
+    try {
+      const res = await fetch('/api/camera/light/toggle', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ state: !continuousLight }),
+      });
+      const data = await safeParseJson(res);
+      if (res.ok) {
+        const isNowOn = Boolean(data.continuous_light);
+        setActionMessage({
+          text: isNowOn
+            ? 'Luz Branca ligada em 100% contínuo! Permanecerá acesa até desligar.'
+            : 'Luz Branca desligada. Perfil de repouso (WDR/IR) restaurado.',
+          type: 'success',
+        });
+        onRefreshStatus();
+      } else {
+        throw new Error(data.detail || 'Falha ao controlar iluminação da câmera.');
+      }
+    } catch (err: any) {
+      setActionMessage({ text: err.message || 'Erro ao alternar luz contínua.', type: 'error' });
+    } finally {
+      setContinuousLightLoading(false);
     }
   };
 
@@ -981,6 +1020,14 @@ export function LiveMonitorView({
               <span>CÂMERA: {lastCameraEventCode || 'IVS'}</span>
             </div>
           )}
+
+          {/* Alerta Visual de Luz Branca Ativa (100% Contínua ou Flash) */}
+          {(continuousLight || flashActive) && (
+            <div className="flex items-center gap-1 sm:gap-1.5 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded bg-yellow-400 text-black text-[10px] sm:text-xs font-mono font-bold shadow-[0_0_15px_rgba(250,204,21,0.6)] animate-pulse">
+              <Lightbulb className="w-3.5 h-3.5 text-black shrink-0" />
+              <span>{continuousLight ? 'LUZ 100% LIGADA' : 'FLASH ACESO'}</span>
+            </div>
+          )}
         </div>
 
         {/* HUD Superior Direito: Seletor de Resolução & FPS */}
@@ -1429,11 +1476,37 @@ export function LiveMonitorView({
           </span>
         </button>
 
-        {/* Disparar Flash */}
+        {/* Alternar Luz Branca Contínua 100% (Liga / Desliga persistente) */}
+        <button
+          onClick={handleToggleContinuousLight}
+          disabled={continuousLightLoading || !isOnline}
+          className={`flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-2.5 sm:px-4 sm:py-3 rounded-lg border font-semibold text-[11px] sm:text-xs uppercase tracking-wider transition-all disabled:opacity-40 cursor-pointer min-h-[44px] ${
+            continuousLight
+              ? 'bg-yellow-400 text-black border-yellow-300 shadow-[0_0_20px_rgba(250,204,21,0.6)] font-bold animate-pulse hover:bg-yellow-300'
+              : 'bg-gradient-to-r from-amber-600/20 to-yellow-600/20 border-amber-500/40 hover:border-amber-400 hover:bg-amber-600/30 text-amber-300 shadow-[0_0_15px_rgba(245,158,11,0.1)]'
+          }`}
+          title={
+            continuousLight
+              ? 'Luz Branca 100% ACESA. Clique para DESLIGAR e restaurar modo de repouso.'
+              : 'Acende o LED de Luz Branca em 100% indefinidamente até você clicar novamente.'
+          }
+        >
+          {continuousLightLoading ? (
+            <RefreshCw className="w-3.5 h-3.5 sm:w-4 sm:h-4 animate-spin shrink-0" />
+          ) : (
+            <Lightbulb className={`w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0 ${continuousLight ? 'text-black fill-black' : 'text-amber-400'}`} />
+          )}
+          <span className="truncate">
+            {continuousLightLoading ? 'Alternando...' : continuousLight ? 'Luz: 100% ON' : 'Luz 100% (ON/OFF)'}
+          </span>
+        </button>
+
+        {/* Disparar Flash Rápido (Pulso 2s) */}
         <button
           onClick={handleTriggerFlash}
-          disabled={flashLoading || !isOnline}
-          className="flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-2.5 sm:px-4 sm:py-3 rounded-lg bg-gradient-to-r from-amber-600/20 to-yellow-600/20 border border-amber-500/40 hover:border-amber-400 hover:bg-amber-600/30 text-amber-300 font-semibold text-[11px] sm:text-xs uppercase tracking-wider transition-all disabled:opacity-40 cursor-pointer shadow-[0_0_15px_rgba(245,158,11,0.1)] min-h-[44px]"
+          disabled={flashLoading || continuousLight || !isOnline}
+          className="flex items-center justify-center gap-1.5 sm:gap-2 px-3 py-2.5 sm:px-4 sm:py-3 rounded-lg bg-[#141A26] border border-amber-500/30 hover:border-amber-400 hover:bg-amber-950/40 text-amber-300 font-semibold text-[11px] sm:text-xs uppercase tracking-wider transition-all disabled:opacity-40 cursor-pointer min-h-[44px]"
+          title={continuousLight ? 'Luz 100% já está acesa continuamente' : 'Dispara um pulso rápido de luz branca por 2 segundos'}
         >
           <Zap className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-400 shrink-0" />
           <span className="truncate">{flashLoading ? 'Acendendo...' : 'Flash 2s'}</span>

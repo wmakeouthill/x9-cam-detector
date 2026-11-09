@@ -44,6 +44,7 @@ class CameraService:
         self._rpc_lock = threading.Lock()
         self._flash_active = False
         self._flash_until = 0.0
+        self._continuous_light = False
 
         self._clip_active = False
         self._clip_lock = threading.Lock()
@@ -131,6 +132,16 @@ class CameraService:
         with self._clip_lock:
             return self._clip_active
 
+    @property
+    def continuous_light(self) -> bool:
+        with self._lock:
+            return self._continuous_light
+
+    @property
+    def is_flash_active(self) -> bool:
+        with self._lock:
+            return bool(self._flash_active or self._continuous_light)
+
     def extend_clip(self, additional_seconds: float = 10.0) -> bool:
         """
         Estende o tempo da gravação de alarme ativa enquanto houver movimento/pessoa detectada.
@@ -172,10 +183,10 @@ class CameraService:
         src_h = self.height if self.height > 0 else h
         scale_x = w / float(src_w)
         scale_y = h / float(src_h)
-        ui_scale = max(1.0, w / 960.0)
-        box_thickness = max(2, int(2 * ui_scale))
-        font_scale = 0.45 * ui_scale
-        font_thickness = max(1, int(1 * ui_scale))
+        ui_scale = max(0.8, min(1.2, w / 1920.0))
+        box_thickness = max(1, int(1 * ui_scale))
+        font_scale = 0.36 * ui_scale
+        font_thickness = 1
 
         PERSON_PALETTE = [
             (255, 200, 0),   # Ciano Neon
@@ -196,17 +207,19 @@ class CameraService:
             x2 = min(w - 1, int(bx2 * scale_x))
             y2 = min(h - 1, int(by2 * scale_y))
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness, lineType=cv2.LINE_AA)
 
             label = f"PESSOA #{track_id} ({int(conf * 100)}%)"
             (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
-            pad = int(6 * ui_scale)
-            label_y = max(y1, th + pad)
-            cv2.rectangle(frame, (x1, label_y - th - pad), (x1 + tw + pad + 2, label_y + baseline), color, -1)
+            pad = int(3 * ui_scale)
+            label_y = y1 - pad if (y1 - th - 2 * pad) > 0 else y1 + th + pad
+            badge_top = label_y - th - pad
+            badge_bottom = label_y + baseline + 1
+            cv2.rectangle(frame, (x1, badge_top), (x1 + tw + 2 * pad, badge_bottom), color, -1)
             cv2.putText(
                 frame,
                 label,
-                (x1 + int(4 * ui_scale), label_y - int(2 * ui_scale)),
+                (x1 + pad, label_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 font_scale,
                 (10, 15, 20),
@@ -956,14 +969,51 @@ class CameraService:
         finally:
             self._rpc_logout(s, sid)
 
+    def toggle_light(self, on: bool | None = None) -> dict:
+        """
+        Liga ou desliga o LED de Luz Branca (100% contínuo) da câmera Intelbras VIP 1230 FC+.
+        Ao ligar contínuo, a luz permanece 100% acesa indefinidamente até novo clique.
+        Ao desligar, restaura o perfil ótimo vigente (Smart IR + WDR à noite ou Color de dia).
+        """
+        with self._lock:
+            if on is None:
+                target_state = not self._continuous_light
+            else:
+                target_state = bool(on)
+
+            self._continuous_light = target_state
+            if target_state:
+                self._flash_active = True
+                self._flash_until = 0.0
+            else:
+                self._flash_active = False
+                self._flash_until = 0.0
+
+        def _light_worker():
+            try:
+                action_str = "LIGADO (100% CONTÍNUO)" if target_state else "DESLIGADO (RESTAURANDO VIGENTE)"
+                logger.info(f"[LUZ CONTÍNUA] Configurando LED de luz branca para {action_str}...")
+                ok = self._set_camera_lighting_rpc(on=target_state, intensity=100)
+                if not ok:
+                    time.sleep(0.3)
+                    self._set_camera_lighting_rpc(on=target_state, intensity=100)
+            except Exception as e:
+                logger.error(f"[LUZ CONTÍNUA] Erro ao alternar iluminação: {e}")
+
+        threading.Thread(target=_light_worker, daemon=True).start()
+        return {"status": "ok", "continuous_light": target_state}
+
     def trigger_flash(self, seconds: float = 2.0) -> dict:
         """
         Dispara o LED de luz branca da câmera Intelbras VIP 1230 FC+ por N segundos.
         Deduplica cliques múltiplos estendendo o timer sem criar threads concorrentes.
+        Se a luz contínua estiver ativa, não desliga após o timer.
         """
         now = time.time()
         target_until = now + max(0.05, float(seconds))
         with self._lock:
+            if self._continuous_light:
+                return {"status": "triggered", "duration": seconds, "continuous_light": True}
             if target_until > self._flash_until:
                 self._flash_until = target_until
             if self._flash_active:
@@ -981,10 +1031,16 @@ class CameraService:
 
                 while True:
                     with self._lock:
+                        if self._continuous_light:
+                            return
                         remaining = self._flash_until - time.time()
                     if remaining <= 0:
                         break
                     time.sleep(min(remaining, 0.25))
+
+                with self._lock:
+                    if self._continuous_light:
+                        return
 
                 logger.info("[FLASH] Desligando LED de luz branca (restaurando perfil WDR vigente)...")
                 if not self._set_camera_lighting_rpc(on=False):
@@ -994,7 +1050,8 @@ class CameraService:
                 logger.error(f"[FLASH] Erro no worker de flash: {e}")
             finally:
                 with self._lock:
-                    self._flash_active = False
+                    if not self._continuous_light:
+                        self._flash_active = False
 
         t = threading.Thread(target=_flash_worker, daemon=True)
         t.start()

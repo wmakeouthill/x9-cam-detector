@@ -633,6 +633,36 @@ def test_dvr_video_fallback_download_when_size_missing(monkeypatch, tmp_path):
     assert resp.status_code == 200 or resp.status_code == 206
 
 
+def test_dvr_prune_ram_buffer_emergency_fifo_when_gdrive_fails(monkeypatch, tmp_path):
+    from app.services.dvr_service import dvr_service, MIN_FREE_BUFFER_BYTES
+    from app.services.gdrive_service import GoogleDriveService
+
+    buf = tmp_path / "ram_buf"
+    buf.mkdir()
+    monkeypatch.setattr(dvr_service, "recordings_dir", str(buf))
+    monkeypatch.setattr(GoogleDriveService, "is_configured", property(lambda self: True))
+
+    fnames = ["dvr_20261108_100000.mp4", "dvr_20261108_100500.mp4", "dvr_20261108_101000.mp4", "dvr_20261108_101500.mp4"]
+    for f in fnames:
+        (buf / f).write_bytes(b"x" * 20000)
+        upsert_dvr_segment(filename=f, start_time="2026-11-08 10:00:00", duration_seconds=300, size_bytes=20000, status="local")
+
+    dvr_service.current_segment = fnames[-1]
+
+    class FakeUsage:
+        free = MIN_FREE_BUFFER_BYTES - 1000
+
+    monkeypatch.setattr("shutil.disk_usage", lambda path: FakeUsage())
+
+    dvr_service._prune_ram_buffer()
+
+    # O bloco mais antigo não sincronizado DEVE ter sido descartado em emergência para manter a gravação viva
+    assert not (buf / fnames[0]).exists()
+    # O bloco atualmente em gravação NUNCA é descartado
+    assert (buf / fnames[-1]).exists()
+
+
+
 
 
 

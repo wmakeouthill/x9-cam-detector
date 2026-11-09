@@ -968,14 +968,11 @@ def find_dvr_segment_for_seek(seconds_ago: int = 30, target_time_str: str | None
     candidates = [dict(r) for r in cursor.fetchall()]
 
     chosen = None
-    to_mark_failed = []
 
     for seg in candidates:
         fname = seg.get("filename") or ""
         drive_id = seg.get("drive_file_id")
         if not _is_dvr_file_available(fname, drive_id):
-            if not drive_id and seg.get("status") != "recording":
-                to_mark_failed.append(seg.get("id"))
             continue
 
         try:
@@ -1033,12 +1030,6 @@ def find_dvr_segment_for_seek(seconds_ago: int = 30, target_time_str: str | None
             best.append((abs(dist.total_seconds()), seg))
         if best:
             chosen = min(best, key=lambda x: x[0])[1]
-
-    # Marca no banco arquivos orfãos detectados
-    if to_mark_failed:
-        placeholders = ",".join("?" for _ in to_mark_failed)
-        cursor.execute(f"UPDATE dvr_segments SET status = 'failed' WHERE id IN ({placeholders})", to_mark_failed)
-        conn.commit()
 
     conn.close()
     if not chosen:

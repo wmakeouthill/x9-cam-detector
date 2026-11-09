@@ -33,6 +33,7 @@ services:
       - ./backend/app:/app/app
       - ./token.json:/app/token.json
       - ./client_secret.json:/app/client_secret.json
+      - ./service_account.json:/app/service_account.json
     tmpfs:
       - /tmp/x9_dvr_buffer:size=512m,mode=1777
     healthcheck:

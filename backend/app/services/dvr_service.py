@@ -508,6 +508,7 @@ class DvrService:
         seg_map = {s["filename"]: s.get("status") for s in list_dvr_segments(limit=200)}
         # Com pouco espaço livre, qualquer bloco sincronizado (menos o atual) pode sair, do mais antigo ao mais novo
         candidates_to_prune = files if low_space else files[:-RAM_CUSHION_MAX_SEGMENTS]
+        # 1. Primeira passagem: descarta blocos já sincronizados (ou se Drive desativado)
         for fname in candidates_to_prune:
             if fname == self.current_segment:
                 continue
@@ -522,9 +523,37 @@ class DvrService:
                 if low_space:
                     try:
                         if shutil.disk_usage(self.recordings_dir).free >= MIN_FREE_BUFFER_BYTES * 2:
-                            break
+                            return
                     except OSError:
+                        return
+
+        # 2. Segunda passagem de emergência (Buffer Crítico):
+        # Se o Drive falhou (token expirado/sem conexão) e o buffer RAM está esgotando (< MIN_FREE_BUFFER_BYTES),
+        # aplica FIFO descartando os blocos mais antigos (exceto o bloco em gravação).
+        # Isso garante que a gravação 24h NUNCA trave ou derrube o FFmpeg por falta de espaço no tmpfs!
+        try:
+            critically_low = shutil.disk_usage(self.recordings_dir).free < MIN_FREE_BUFFER_BYTES
+        except OSError:
+            critically_low = False
+
+        if critically_low:
+            remaining = sorted([
+                f for f in os.listdir(self.recordings_dir)
+                if f.startswith("dvr_") and f.lower().endswith(".mp4") and f != self.current_segment
+            ])
+            for fname in remaining:
+                fpath = os.path.join(self.recordings_dir, fname)
+                try:
+                    os.remove(fpath)
+                    self._faststart_done.discard(fname)
+                    logger.warning(
+                        f"[DVR 24h Buffer de Emergência] Espaço livre crítico (<{MIN_FREE_BUFFER_BYTES // (1024*1024)}MB). "
+                        f"Descartado bloco antigo não sincronizado '{fname}' para manter gravação contínua ativa!"
+                    )
+                    if shutil.disk_usage(self.recordings_dir).free >= MIN_FREE_BUFFER_BYTES * 1.5:
                         break
+                except OSError:
+                    pass
 
     def _migrate_legacy_disk_segments(self):
         """

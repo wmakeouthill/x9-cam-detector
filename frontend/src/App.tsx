@@ -36,6 +36,8 @@ interface CameraStatus {
   clip_min_duration?: number;
   clip_max_duration?: number;
   target_overlay?: boolean;
+  continuous_light?: boolean;
+  flash_active?: boolean;
 }
 
 export function App() {
@@ -119,6 +121,8 @@ export function App() {
               nightStartTime={camStatus.night_start_time}
               nightEndTime={camStatus.night_end_time}
               isNightActive={camStatus.is_night_active}
+              continuousLight={camStatus.continuous_light}
+              flashActive={camStatus.flash_active}
               onRefreshStatus={fetchStatus}
             />
           )}

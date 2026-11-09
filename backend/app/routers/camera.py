@@ -39,6 +39,9 @@ router = APIRouter(prefix="/api/camera", tags=["camera"])
 class FlashRequest(BaseModel):
     seconds: float = 2.0
 
+class ToggleLightRequest(BaseModel):
+    state: bool | None = None
+
 class SnapshotRequest(BaseModel):
     with_flash: bool = False
 
@@ -118,6 +121,8 @@ def get_camera_status(user: str = Depends(get_current_user)):
         "clip_max_duration": camera_service.clip_max_duration,
         "target_overlay": camera_service.target_overlay,
         "is_recording_clip": camera_service.is_recording_clip,
+        "continuous_light": camera_service.continuous_light,
+        "flash_active": camera_service.is_flash_active,
     }
 
 @router.post("/image-profile")
@@ -142,6 +147,14 @@ def toggle_test_mode(req: TestModeRequest, user: str = Depends(get_current_user)
 @router.post("/flash")
 def trigger_flash(req: FlashRequest, user: str = Depends(get_current_user)):
     return camera_service.trigger_flash(seconds=req.seconds)
+
+@router.post("/light/toggle")
+def toggle_light(req: ToggleLightRequest = ToggleLightRequest(), user: str = Depends(get_current_user)):
+    return camera_service.toggle_light(on=req.state)
+
+@router.post("/flash/toggle")
+def toggle_flash_alias(req: ToggleLightRequest = ToggleLightRequest(), user: str = Depends(get_current_user)):
+    return camera_service.toggle_light(on=req.state)
 
 @router.post("/reboot")
 def reboot_camera(user: str = Depends(get_current_user)):
