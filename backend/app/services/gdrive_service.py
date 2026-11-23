@@ -3,6 +3,8 @@ import time
 import queue
 import threading
 import logging
+import requests
+from requests.adapters import HTTPAdapter
 from datetime import datetime, timedelta, timezone
 from app.core.config import settings
 from app.db import (
@@ -29,6 +31,15 @@ class GoogleDriveService:
         self.last_cloud_cleanup_time = 0.0
         self._last_reconcile_time = 0.0
         self._last_dvr_reconcile_time = 0.0
+        self._dvr_reconcile_lock = threading.Lock()
+        self._creds_lock = threading.Lock()
+        self._cached_creds = None
+        self._cached_token_path: str | None = None
+        self._cached_token_mtime: float = 0.0
+        self._http_session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=16)
+        self._http_session.mount("https://", adapter)
+        self._http_session.mount("http://", adapter)
         self._dvr_folder_id: str | None = None
         self._start_workers()
         self._enqueue_existing_pending()
@@ -310,51 +321,103 @@ class GoogleDriveService:
                 logger.warning(f"[Google Drive Sync] Conexão falhou ao subir {filename} ({err}). Interrompendo lote até o próximo ciclo.")
                 break
 
+    def _resolve_token_path(self) -> str | None:
+        for candidate in ("token.json", os.path.join("..", "token.json")):
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    def _get_credentials(self, force_refresh: bool = False):
+        """
+        Carrega e mantém em cache thread-safe as credenciais OAuth (ou Service Account).
+        Evita reler token.json do disco e recriar discovery.build a cada fatia Range de 2 MB.
+        """
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        with self._creds_lock:
+            token_file = self._resolve_token_path()
+            if token_file:
+                try:
+                    mtime = os.path.getmtime(token_file)
+                except OSError:
+                    mtime = 0.0
+                try:
+                    from google.oauth2.credentials import Credentials
+                    from google.auth.transport.requests import Request
+
+                    if (
+                        self._cached_creds is None
+                        or self._cached_token_path != token_file
+                        or mtime != self._cached_token_mtime
+                    ):
+                        self._cached_creds = Credentials.from_authorized_user_file(token_file, scopes)
+                        self._cached_token_path = token_file
+                        self._cached_token_mtime = mtime
+
+                    creds = self._cached_creds
+                    needs_refresh = force_refresh or not creds.valid or creds.expired
+                    if not needs_refresh and getattr(creds, "expiry", None):
+                        exp = creds.expiry
+                        now_utc = datetime.now(timezone.utc) if exp.tzinfo else datetime.utcnow()
+                        if (exp - now_utc).total_seconds() < 60:
+                            needs_refresh = True
+
+                    if needs_refresh and creds.refresh_token:
+                        creds.refresh(Request())
+                        tmp_token = token_file + ".tmp"
+                        try:
+                            with open(tmp_token, "w", encoding="utf-8") as f:
+                                f.write(creds.to_json())
+                            os.replace(tmp_token, token_file)
+                        except OSError:
+                            with open(token_file, "w", encoding="utf-8") as f:
+                                f.write(creds.to_json())
+                        try:
+                            self._cached_token_mtime = os.path.getmtime(token_file)
+                        except OSError:
+                            pass
+                    return creds
+                except Exception as e:
+                    logger.warning(f"[Google Drive] Falha ao carregar token.json OAuth: {e}")
+                    self._cached_creds = None
+
+            # 2. Service Account fallback
+            creds_file = settings.GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE
+            if not os.path.exists(creds_file) and os.path.exists(os.path.join("..", creds_file)):
+                creds_file = os.path.join("..", creds_file)
+
+            if os.path.exists(creds_file):
+                try:
+                    from google.oauth2 import service_account
+                    from google.auth.transport.requests import Request
+
+                    creds = service_account.Credentials.from_service_account_file(creds_file, scopes=scopes)
+                    if force_refresh or not creds.valid or not creds.token:
+                        creds.refresh(Request())
+                    return creds
+                except Exception as e:
+                    logger.warning(f"[Google Drive] Falha ao carregar service_account.json: {e}")
+
+            return None
+
+    def _get_access_token(self, force_refresh: bool = False) -> str | None:
+        creds = self._get_credentials(force_refresh=force_refresh)
+        return getattr(creds, "token", None) if creds else None
+
     def _get_service(self):
         """
         Retorna o serviço autenticado da Google Drive API.
         Prioridade 1: OAuth 2.0 (token.json) com a cota pessoal da sua conta @gmail.com.
         Prioridade 2: Service Account (service_account.json).
         """
-        scopes = [
-            "https://www.googleapis.com/auth/drive",
-        ]
-
-        # 1. OAuth pessoal (token.json)
-        token_file = "token.json"
-        if not os.path.exists(token_file) and os.path.exists(os.path.join("..", token_file)):
-            token_file = os.path.join("..", token_file)
-
-        if os.path.exists(token_file):
-            try:
-                from google.oauth2.credentials import Credentials
-                from google.auth.transport.requests import Request
-                from googleapiclient.discovery import build
-
-                creds = Credentials.from_authorized_user_file(token_file, scopes)
-                if creds and creds.expired and creds.refresh_token:
-                    creds.refresh(Request())
-                    with open(token_file, "w", encoding="utf-8") as f:
-                        f.write(creds.to_json())
-                return build("drive", "v3", credentials=creds)
-            except Exception as e:
-                logger.warning(f"[Google Drive] Falha ao carregar token.json OAuth: {e}")
-
-        # 2. Service Account
-        creds_file = settings.GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE
-        if not os.path.exists(creds_file) and os.path.exists(os.path.join("..", creds_file)):
-            creds_file = os.path.join("..", creds_file)
-
-        if os.path.exists(creds_file):
-            try:
-                from google.oauth2 import service_account
-                from googleapiclient.discovery import build
-                creds = service_account.Credentials.from_service_account_file(creds_file, scopes=scopes)
-                return build("drive", "v3", credentials=creds)
-            except Exception as e:
-                logger.warning(f"[Google Drive] Falha ao carregar service_account.json: {e}")
-
-        return None
+        creds = self._get_credentials()
+        if not creds:
+            return None
+        try:
+            from googleapiclient.discovery import build
+            return build("drive", "v3", credentials=creds, cache_discovery=False)
+        except Exception as e:
+            logger.warning(f"[Google Drive] Falha ao inicializar cliente Drive API: {e}")
+            return None
 
     def _upload_file(self, filepath: str, description: str = "") -> dict:
         # Se o arquivo estiver sendo gerado no momento (ex: MP4 terminando ffmpeg), aguarda até 10s
@@ -718,7 +781,7 @@ class GoogleDriveService:
                 res = service.files().list(
                     q=q,
                     fields="nextPageToken, files(id, name, createdTime, size, mimeType, webViewLink)",
-                    pageSize=100,
+                    pageSize=1000,
                     pageToken=page_token,
                 ).execute()
                 files.extend(res.get("files", []))
@@ -767,9 +830,42 @@ class GoogleDriveService:
         start: int = 0,
         end: int = 0,
     ) -> bytes | None:
-        """Baixa só o intervalo [start, end] (inclusive) de um segmento DVR na subpasta Gravacoes_24h."""
+        """
+        Baixa só o intervalo [start, end] (inclusive) de um segmento DVR na subpasta Gravacoes_24h.
+        Caminho rápido: HTTP GET direto com requests.Session (keep-alive + Bearer em cache),
+        evitando recriar discovery.build + handshake TLS a cada fatia de 2 MB.
+        """
         if not self.is_configured:
             return None
+
+        if drive_file_id:
+            access_token = self._get_access_token()
+            if access_token:
+                url = f"https://www.googleapis.com/drive/v3/files/{drive_file_id}?alt=media"
+                for attempt in range(2):
+                    try:
+                        resp = self._http_session.get(
+                            url,
+                            headers={
+                                "Authorization": f"Bearer {access_token}",
+                                "Range": f"bytes={start}-{end}",
+                            },
+                            timeout=(5, 25),
+                        )
+                        if resp.status_code in (200, 206):
+                            return resp.content
+                        if resp.status_code == 401 and attempt == 0:
+                            access_token = self._get_access_token(force_refresh=True)
+                            if access_token:
+                                continue
+                        logger.warning(
+                            f"[Google Drive DVR] HTTP {resp.status_code} ao baixar range {start}-{end} de '{filename}'"
+                        )
+                        return None
+                    except Exception as e:
+                        logger.warning(f"[Google Drive DVR] Erro HTTP ao baixar range {start}-{end} de '{filename}': {e}")
+                        return None
+
         try:
             service = self._get_service()
             if not service:
@@ -848,18 +944,36 @@ class GoogleDriveService:
         return deleted_count
 
     def reconcile_dvr_from_drive(self, force: bool = False):
-        """Sincroniza a tabela dvr_segments com os arquivos presentes na subpasta Gravacoes_24h do Google Drive."""
+        """
+        Sincroniza a tabela dvr_segments com os arquivos presentes na subpasta Gravacoes_24h do Google Drive.
+        - Usa cooldown de 5 min (300s) e lock não-bloqueante para evitar tempestades de API/SQLite.
+        - Infere a duração real a partir da distância para o bloco consecutivo (preservando blocos de 2m/5m)
+          e faz um único bulk upsert transacional no SQLite.
+        """
         if not self.is_configured:
             return
 
         now = time.time()
-        if not force and (now - self._last_dvr_reconcile_time) < 15.0:
+        if not force and (now - self._last_dvr_reconcile_time) < 300.0:
             return
-        self._last_dvr_reconcile_time = now
+
+        if not self._dvr_reconcile_lock.acquire(blocking=False):
+            return
 
         try:
-            from app.db import upsert_dvr_segment
+            self._last_dvr_reconcile_time = time.time()
+            from app.db import bulk_sync_dvr_segments_from_drive, get_dvr_config
+
             drive_files = self.list_dvr_drive_files()
+            if not drive_files:
+                return
+
+            try:
+                cfg_seg_sec = max(60, min(300, int(get_dvr_config().get("segment_seconds") or 60)))
+            except Exception:
+                cfg_seg_sec = 60
+
+            parsed = []
             for finfo in drive_files:
                 fname = finfo.get("name", "")
                 if not fname.lower().endswith(".mp4"):
@@ -870,20 +984,47 @@ class GoogleDriveService:
                 start_ts = self._extract_timestamp(fname, finfo.get("createdTime"))
                 try:
                     start_dt = datetime.strptime(start_ts, "%Y-%m-%d %H:%M:%S")
-                    end_ts = (start_dt + timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
-                    end_ts = None
-                upsert_dvr_segment(
-                    filename=fname,
-                    start_time=start_ts,
-                    end_time=end_ts,
-                    duration_seconds=60,
-                    size_bytes=size_bytes,
-                    status="synced",
-                    drive_file_id=finfo.get("id"),
-                )
+                    start_dt = None
+                parsed.append({
+                    "filename": fname,
+                    "start_time": start_ts,
+                    "start_dt": start_dt,
+                    "size_bytes": size_bytes,
+                    "drive_file_id": finfo.get("id"),
+                })
+
+            parsed.sort(key=lambda item: item["start_time"])
+
+            records = []
+            total = len(parsed)
+            for idx, item in enumerate(parsed):
+                start_dt = item["start_dt"]
+                dur = cfg_seg_sec
+                if start_dt is not None and idx + 1 < total and parsed[idx + 1]["start_dt"] is not None:
+                    delta = (parsed[idx + 1]["start_dt"] - start_dt).total_seconds()
+                    if 30 <= delta <= 360:
+                        dur = int(round(delta))
+                    elif item["size_bytes"] >= 25 * 1024 * 1024:
+                        dur = max(cfg_seg_sec, 300)
+                elif item["size_bytes"] >= 25 * 1024 * 1024:
+                    dur = max(cfg_seg_sec, 300)
+
+                end_ts = (start_dt + timedelta(seconds=dur)).strftime("%Y-%m-%d %H:%M:%S") if start_dt else None
+                records.append({
+                    "filename": item["filename"],
+                    "start_time": item["start_time"],
+                    "end_time": end_ts,
+                    "duration_seconds": dur,
+                    "size_bytes": item["size_bytes"],
+                    "drive_file_id": item["drive_file_id"],
+                })
+
+            bulk_sync_dvr_segments_from_drive(records)
         except Exception as e:
             logger.warning(f"[Google Drive DVR] Erro ao reconciliar segmentos DVR do Drive: {e}")
+        finally:
+            self._dvr_reconcile_lock.release()
 
     def test_connection(self) -> dict:
         if not settings.GOOGLE_DRIVE_FOLDER_ID:

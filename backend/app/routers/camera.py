@@ -12,6 +12,7 @@ from app.services.gdrive_service import gdrive_service
 from app.services.dvr_service import dvr_service
 from app.services.evolution_service import evolution_service
 from app.core.config import settings
+from app.core.time import get_now
 from app.db import (
     get_camera_config,
     get_night_watch_config,
@@ -783,8 +784,8 @@ class DvrRangeCache:
         with self._lock:
             return len(self._cache)
 
-_dvr_range_cache = DvrRangeCache(max_bytes=64 * 1024 * 1024)
-_gdrive_download_semaphore = threading.BoundedSemaphore(3)
+_dvr_range_cache = DvrRangeCache(max_bytes=96 * 1024 * 1024)
+_gdrive_download_semaphore = threading.BoundedSemaphore(6)
 _dvr_download_locks: dict[str, threading.Lock] = {}
 _dvr_download_locks_guard = threading.Lock()
 
@@ -811,24 +812,24 @@ def get_dvr_video(filename: str, request: Request, user: str = Depends(get_curre
         drive_file_id = seg_row.get("drive_file_id")
         size_bytes = int(seg_row.get("size_bytes") or 0)
 
-        # Se tem drive_file_id e tamanho conhecido, serve fatias em fluxo por HTTP Range (206)
-        if drive_file_id and size_bytes > 0:
-            range_header = request.headers.get("range")
+        # Se tem drive_file_id, tamanho conhecido e o cliente pediu Range, serve fatias em fluxo (206).
+        # Sem Range (ex.: botão "Baixar MP4"), cai no download completo para não truncar em 2 MB.
+        range_header = request.headers.get("range")
+        if drive_file_id and size_bytes > 0 and range_header:
             max_chunk = 2 * 1024 * 1024  # 2 MB para Range sem fim
 
             start = 0
             end = None
-            if range_header:
-                try:
-                    range_val = range_header.strip().lower().replace("bytes=", "")
-                    start_str, end_str = (range_val.split("-", 1) + [""])[:2]
-                    if start_str:
-                        start = int(start_str)
-                    if end_str:
-                        end = int(end_str)
-                except Exception:
-                    start = 0
-                    end = None
+            try:
+                range_val = range_header.strip().lower().replace("bytes=", "")
+                start_str, end_str = (range_val.split("-", 1) + [""])[:2]
+                if start_str:
+                    start = int(start_str)
+                if end_str:
+                    end = int(end_str)
+            except Exception:
+                start = 0
+                end = None
 
             if end is None:
                 end = min(size_bytes - 1, start + max_chunk - 1)
@@ -847,7 +848,7 @@ def get_dvr_video(filename: str, request: Request, user: str = Depends(get_curre
                         if chunk:
                             _dvr_range_cache.put(safe_name, start, end, chunk)
 
-            if chunk is not None:
+            if chunk:
                 actual_end = start + len(chunk) - 1
                 return Response(
                     content=chunk,

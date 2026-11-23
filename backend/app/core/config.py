@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "X9 Cam Detector"
     JWT_SECRET: str = os.getenv("JWT_SECRET", "x9-cam-detector-super-secret-key-2026")
     JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRATION_MINUTES: int = 60 * 24 # 24 horas
+    JWT_EXPIRATION_MINUTES: int = int(os.getenv("JWT_EXPIRATION_MINUTES", str(60 * 24 * 7))) # 7 dias
 
     # Usuário padrão do sistema
     ADMIN_USERNAME: str = os.getenv("ADMIN_USERNAME", "admin")

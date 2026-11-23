@@ -907,7 +907,20 @@ export function LiveMonitorView({
             muted={!dvrMode}
             playsInline
             preload="auto"
-            onError={() => {
+            onError={async () => {
+              // Ignora erros no vídeo oculto de pré-aquecimento (modo Ao Vivo)
+              if (!dvrMode) return;
+              // Verifica se o erro foi sessão expirada (o interceptador de 401 desloga automaticamente)
+              if (token) {
+                try {
+                  const authRes = await fetch('/api/auth/me', {
+                    headers: { Authorization: `Bearer ${token}` },
+                  });
+                  if (authRes.status === 401) return;
+                } catch {
+                  // segue para fallback local
+                }
+              }
               setActionMessage({
                 text: 'Vídeo indisponível neste segundo. Carregando bloco anterior...',
                 type: 'error',

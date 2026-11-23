@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 
 export interface DvrSegment {
   id: number;
@@ -18,21 +18,6 @@ export interface TimelineSeg {
   end_time?: string | null;
   duration_seconds?: number;
   status?: string;
-}
-
-// Constantes configuráveis da Janela Deslizante de Gravações DVR
-export const DVR_WINDOW_CONFIG = {
-  W_BEHIND: 2,
-  W_AHEAD_DESKTOP: 10,
-  W_AHEAD_MOBILE: 5,
-  MAX_PARALLEL_PRELOAD: 3,
-};
-
-function getWAhead(): number {
-  if (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(max-width: 768px)').matches) {
-    return DVR_WINDOW_CONFIG.W_AHEAD_MOBILE;
-  }
-  return DVR_WINDOW_CONFIG.W_AHEAD_DESKTOP;
 }
 
 function addDays(dateStr: string, days: number): string {
@@ -72,29 +57,15 @@ export function useDvrWindow({
   onEndReached,
   onFeedback,
 }: UseDvrWindowProps) {
-  // Playlist unificada contínua (pode cruzar dias)
+  // Playlist unificada contínua (pode cruzar fronteira de dias)
   const [playlist, setPlaylist] = useState<TimelineSeg[]>([]);
-  // Timeline do dia atual (para a régua de minutos e checagens)
+  // Timeline do dia atual (para a régua de 60 minutos)
   const [dayTimeline, setDayTimeline] = useState<TimelineSeg[]>([]);
 
   // Cache de timelines por data YYYY-MM-DD
   const timelineCacheRef = useRef<Map<string, TimelineSeg[]>>(new Map());
-
-  // Container para elementos <video> ocultos de pré-carregamento
-  const preloadContainerRef = useRef<HTMLDivElement | null>(null);
-
-  // Mapa de elementos <video> ativos indexados por filename
-  const preloadVideoMapRef = useRef<Map<string, HTMLVideoElement>>(new Map());
-
-  // Fila de preloading e controle de concorrência (máx 3 paralelos)
-  const loadingFilesRef = useRef<Set<string>>(new Set());
-  const loadedFilesRef = useRef<Set<string>>(new Set());
-  const priorityQueueRef = useRef<string[]>([]);
-
-  // Último activeSegment.filename processado para evitar loops de refetch
   const lastActiveFilenameRef = useRef<string | null>(null);
 
-  // Helper para buscar timeline de uma data específica
   const fetchTimelineForDate = useCallback(
     async (dateStr: string): Promise<TimelineSeg[]> => {
       if (!token || !dateStr) return [];
@@ -118,7 +89,6 @@ export function useDvrWindow({
     [token]
   );
 
-  // Invalida cache de uma data (por ex. no polling periódico de gravações)
   const refreshDateTimeline = useCallback(
     async (dateStr: string) => {
       if (!token || !dateStr) return;
@@ -138,93 +108,22 @@ export function useDvrWindow({
     [token]
   );
 
-  // Descarrega um elemento de vídeo para limitar memória (removeAttribute('src') + load())
-  const discardPreloadVideo = useCallback((filename: string) => {
-    const el = preloadVideoMapRef.current.get(filename);
-    if (el) {
-      try {
-        el.oncanplaythrough = null;
-        el.onloadeddata = null;
-        el.onerror = null;
-        el.removeAttribute('src');
-        el.load();
-        if (el.parentNode) {
-          el.parentNode.removeChild(el);
-        }
-      } catch {}
-      preloadVideoMapRef.current.delete(filename);
-    }
-    loadingFilesRef.current.delete(filename);
-    loadedFilesRef.current.delete(filename);
-  }, []);
-
-  // Processa a fila de preloading respeitando MAX_PARALLEL_PRELOAD (3) e ordem de proximidade
-  const pumpPreloadQueue = useCallback(() => {
-    if (!token || !preloadContainerRef.current) return;
-    const maxParallel = DVR_WINDOW_CONFIG.MAX_PARALLEL_PRELOAD;
-
-    while (loadingFilesRef.current.size < maxParallel && priorityQueueRef.current.length > 0) {
-      const nextFilename = priorityQueueRef.current.shift();
-      if (!nextFilename) break;
-
-      if (loadedFilesRef.current.has(nextFilename) || loadingFilesRef.current.has(nextFilename)) {
-        continue;
-      }
-
-      loadingFilesRef.current.add(nextFilename);
-
-      let videoEl = preloadVideoMapRef.current.get(nextFilename);
-      if (!videoEl) {
-        videoEl = document.createElement('video');
-        videoEl.preload = 'auto';
-        videoEl.muted = true;
-        videoEl.playsInline = true;
-        videoEl.hidden = true;
-        videoEl.style.display = 'none';
-        preloadContainerRef.current.appendChild(videoEl);
-        preloadVideoMapRef.current.set(nextFilename, videoEl);
-      }
-
-      const onReady = () => {
-        loadingFilesRef.current.delete(nextFilename);
-        loadedFilesRef.current.add(nextFilename);
-        pumpPreloadQueue();
-      };
-
-      videoEl.oncanplaythrough = onReady;
-      videoEl.onloadeddata = onReady;
-      videoEl.onerror = () => {
-        loadingFilesRef.current.delete(nextFilename);
-        pumpPreloadQueue();
-      };
-
-      videoEl.src = `/api/camera/dvr/video/${nextFilename}?token=${token}`;
-    }
-  }, [token]);
-
-  // Atualiza a janela deslizante quando activeSegment mudar
+  // Mantém a playlist cronológica ao redor do bloco ativo (sem criar elementos <video> ocultos em massa)
   useEffect(() => {
     if (!activeSegment?.filename) {
-      for (const fname of Array.from(preloadVideoMapRef.current.keys())) {
-        discardPreloadVideo(fname);
-      }
       lastActiveFilenameRef.current = null;
       return;
     }
 
-    // Só refaça a janela quando o bloco ativo mudar (evita loops de refetch)
     if (lastActiveFilenameRef.current === activeSegment.filename) {
       return;
     }
     lastActiveFilenameRef.current = activeSegment.filename;
 
     const curDate = activeSegment.start_time.substring(0, 10);
-    const wAhead = getWAhead();
-    const wBehind = DVR_WINDOW_CONFIG.W_BEHIND;
-
     let isMounted = true;
 
-    async function buildWindow() {
+    async function buildPlaylist() {
       const curTimeline = await fetchTimelineForDate(curDate);
       if (!isMounted) return;
 
@@ -233,9 +132,9 @@ export function useDvrWindow({
       const curIdx = curTimeline.findIndex((s) => s.filename === activeSegment?.filename);
       const isRecording = activeSegment?.status === 'recording';
 
-      // Cruza dia: busca timeline do dia anterior se início, e do seguinte se fim do dia
-      const needPrevDay = curIdx === -1 || curIdx < wBehind;
-      const needNextDay = !isRecording && (curIdx === -1 || curIdx >= curTimeline.length - wAhead);
+      // Cruza fronteira de dia apenas quando próximo do início ou do fim do dia
+      const needPrevDay = curIdx === -1 || curIdx < 2;
+      const needNextDay = !isRecording && (curIdx === -1 || curIdx >= curTimeline.length - 2);
 
       const datesToLoad = [curDate];
       if (needPrevDay) datesToLoad.unshift(addDays(curDate, -1));
@@ -266,68 +165,24 @@ export function useDvrWindow({
       );
 
       setPlaylist(fullPlaylist);
-
-      const activeIdx = fullPlaylist.findIndex((s) => s.filename === activeSegment?.filename);
-      if (activeIdx === -1) return;
-
-      const behindCount = Math.min(wBehind, activeIdx);
-      // Se o bloco ativo for o que está gravando (status 'recording') não pré-carregue além dele
-      const aheadCount = isRecording ? 0 : Math.min(wAhead, fullPlaylist.length - 1 - activeIdx);
-
-      const behindSegs = fullPlaylist.slice(activeIdx - behindCount, activeIdx);
-      const aheadSegs = isRecording ? [] : fullPlaylist.slice(activeIdx + 1, activeIdx + 1 + aheadCount);
-
-      // Descarte dos vídeos que saíram da janela
-      const windowFilenames = new Set<string>();
-      behindSegs.forEach((s) => windowFilenames.add(s.filename));
-      aheadSegs.forEach((s) => windowFilenames.add(s.filename));
-
-      for (const fname of Array.from(preloadVideoMapRef.current.keys())) {
-        if (!windowFilenames.has(fname)) {
-          discardPreloadVideo(fname);
-        }
-      }
-
-      // Ordem de proximidade: próximos primeiro (+1, -1, +2, -2...)
-      const priorityQueue: string[] = [];
-      const maxDist = Math.max(aheadSegs.length, behindSegs.length);
-      for (let d = 1; d <= maxDist; d++) {
-        if (d <= aheadSegs.length) {
-          priorityQueue.push(aheadSegs[d - 1].filename);
-        }
-        if (d <= behindSegs.length) {
-          priorityQueue.push(behindSegs[behindSegs.length - d].filename);
-        }
-      }
-
-      priorityQueueRef.current = priorityQueue;
-      pumpPreloadQueue();
     }
 
-    buildWindow();
+    buildPlaylist();
 
     return () => {
       isMounted = false;
     };
-  }, [
-    activeSegment?.filename,
-    activeSegment?.start_time,
-    activeSegment?.status,
-    fetchTimelineForDate,
-    discardPreloadVideo,
-    pumpPreloadQueue,
-  ]);
+  }, [activeSegment?.filename, activeSegment?.start_time, activeSegment?.status, fetchTimelineForDate]);
 
-  // Limpeza completa ao desmontar o componente
-  useEffect(() => {
-    return () => {
-      for (const fname of Array.from(preloadVideoMapRef.current.keys())) {
-        discardPreloadVideo(fname);
-      }
-    };
-  }, [discardPreloadVideo]);
+  // Próximo bloco imediato para o player duplo A/B (apenas 1 bloco de standby, sem tempestade de preload)
+  const nextSegment = useMemo<TimelineSeg | null>(() => {
+    if (!activeSegment?.filename || activeSegment.status === 'recording') return null;
+    const idx = playlist.findIndex((s) => s.filename === activeSegment.filename);
+    if (idx === -1 || idx + 1 >= playlist.length) return null;
+    return playlist[idx + 1];
+  }, [playlist, activeSegment?.filename, activeSegment?.status]);
 
-  // Próximo bloco da janela (ou API adjacent se no final)
+  // Próximo bloco da playlist (ou API adjacent se estiver no final)
   const playNext = useCallback(async () => {
     if (!token || !activeSegment) return;
     const curIdx = playlist.findIndex((s) => s.filename === activeSegment.filename);
@@ -338,7 +193,6 @@ export function useDvrWindow({
       return;
     }
 
-    // Se estiver no final da playlist local, busca se há algo além
     try {
       const res = await fetch(
         `/api/camera/dvr/adjacent?filename=${encodeURIComponent(activeSegment.filename)}&direction=next`,
@@ -355,7 +209,6 @@ export function useDvrWindow({
       }
     } catch {}
 
-    // Fim das gravações disponíveis (não volta ao vivo)
     if (onFeedback) {
       onFeedback({ text: 'Fim das gravações disponíveis.', type: 'success' });
     }
@@ -364,7 +217,7 @@ export function useDvrWindow({
     }
   }, [token, activeSegment, playlist, setActiveSegment, pendingOffsetRef, onFeedback, onEndReached]);
 
-  // Bloco anterior da janela
+  // Bloco anterior da playlist
   const playPrev = useCallback(async () => {
     if (!token || !activeSegment) return;
     const curIdx = playlist.findIndex((s) => s.filename === activeSegment.filename);
@@ -438,7 +291,6 @@ export function useDvrWindow({
           p--;
         }
 
-        // Ultrapassou os blocos carregados: busca por horário absoluto via API seek
         const curStartMs = parseTs(activeSegment.start_time);
         if (!isNaN(curStartMs)) {
           const targetDt = new Date(curStartMs + Math.floor(targetInCur) * 1000);
@@ -496,7 +348,6 @@ export function useDvrWindow({
           p++;
         }
 
-        // Ultrapassou os blocos carregados: busca por horário absoluto via API seek
         const curStartMs = parseTs(activeSegment.start_time);
         if (!isNaN(curStartMs)) {
           const targetDt = new Date(curStartMs + Math.floor(targetInCur) * 1000);
@@ -538,7 +389,7 @@ export function useDvrWindow({
   return {
     playlist,
     dayTimeline,
-    preloadContainerRef,
+    nextSegment,
     playNext,
     playPrev,
     seekRelative,

@@ -41,7 +41,7 @@ interface CameraStatus {
 }
 
 export function App() {
-  const { isAuthenticated, initialize, token } = useAuthStore();
+  const { isAuthenticated, isInitialized, initialize, token } = useAuthStore();
   const [activeTab, setActiveTab] = useState<NavTab>('live');
 
   const [camStatus, setCamStatus] = useState<CameraStatus>({
@@ -80,6 +80,15 @@ export function App() {
     const interval = setInterval(fetchStatus, 3000);
     return () => clearInterval(interval);
   }, [isAuthenticated, fetchStatus]);
+
+  if (!isInitialized) {
+    return (
+      <div className="h-[100dvh] w-screen flex items-center justify-center bg-[#040608] text-slate-400 font-mono text-xs gap-2.5">
+        <div className="w-4 h-4 border-2 border-cyan-500/30 border-t-cyan-400 rounded-full animate-spin" />
+        <span>Verificando sessão...</span>
+      </div>
+    );
+  }
 
   if (!isAuthenticated) {
     return <LoginPage />;

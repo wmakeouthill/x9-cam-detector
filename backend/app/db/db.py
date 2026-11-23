@@ -868,8 +868,115 @@ def mark_dvr_segment_synced(filename: str, drive_file_id: str | None = None):
     conn.commit()
     conn.close()
 
+def mark_dvr_segment_failed(filename: str):
+    """Marca segmento local sem backup no Drive como 'failed' (ex: descartado por FIFO de emergência)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE dvr_segments
+        SET status = 'failed'
+        WHERE filename = ? AND drive_file_id IS NULL
+    """, (filename,))
+    conn.commit()
+    conn.close()
+
+def bulk_sync_dvr_segments_from_drive(records: list[dict]) -> int:
+    """
+    Sincroniza segmentos vindos do Google Drive em uma ÚNICA transação SQLite.
+    Preserva durações reais já gravadas (nunca rebaixa blocos de 300s para 60s)
+    e repara blocos previamente corrompidos para <=65s quando a duração inferida for maior.
+    """
+    if not records:
+        return 0
+    conn = get_connection()
+    cursor = conn.cursor()
+    rows_to_upsert = [
+        (
+            r["filename"],
+            r["start_time"],
+            r.get("end_time"),
+            int(r.get("duration_seconds") or 60),
+            int(r.get("size_bytes") or 0),
+            "synced",
+            r.get("drive_file_id"),
+        )
+        for r in records
+    ]
+    cursor.executemany("""
+        INSERT INTO dvr_segments (filename, start_time, end_time, duration_seconds, size_bytes, status, drive_file_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(filename) DO UPDATE SET
+            start_time = COALESCE(dvr_segments.start_time, excluded.start_time),
+            duration_seconds = CASE
+                WHEN dvr_segments.duration_seconds IS NULL OR dvr_segments.duration_seconds <= 0 THEN excluded.duration_seconds
+                WHEN dvr_segments.duration_seconds <= 65 AND excluded.duration_seconds > 90 THEN excluded.duration_seconds
+                ELSE dvr_segments.duration_seconds
+            END,
+            end_time = CASE
+                WHEN dvr_segments.end_time IS NULL THEN excluded.end_time
+                WHEN (dvr_segments.duration_seconds IS NULL OR dvr_segments.duration_seconds <= 65) AND excluded.duration_seconds > 90 THEN excluded.end_time
+                ELSE dvr_segments.end_time
+            END,
+            size_bytes = CASE
+                WHEN excluded.size_bytes > 0 THEN excluded.size_bytes
+                ELSE dvr_segments.size_bytes
+            END,
+            status = CASE
+                WHEN dvr_segments.status = 'recording' THEN 'recording'
+                ELSE 'synced'
+            END,
+            drive_file_id = COALESCE(excluded.drive_file_id, dvr_segments.drive_file_id)
+    """, rows_to_upsert)
+    conn.commit()
+    conn.close()
+    return len(rows_to_upsert)
+
+def cleanup_missing_local_dvr_segments(recordings_dir: str | None = None) -> int:
+    """
+    Marca como 'failed' segmentos com status='local' sem drive_file_id cujo arquivo
+    já não existe em disco/RAM (fantasmas de FIFO ou reinícios anteriores).
+    """
+    search_dirs = [
+        recordings_dir,
+        "/tmp/x9_dvr_buffer",
+        "recordings_24h",
+        os.path.join("backend", "recordings_24h"),
+        os.path.join("..", "recordings_24h"),
+    ]
+    valid_dirs = [d for d in dict.fromkeys(search_dirs) if d and os.path.exists(d)]
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, filename FROM dvr_segments
+        WHERE status = 'local' AND drive_file_id IS NULL
+    """)
+    rows = cursor.fetchall()
+
+    missing_ids: list[int] = []
+    for row in rows:
+        fname = row["filename"] or ""
+        found = False
+        if fname:
+            for folder in valid_dirs:
+                target = os.path.join(folder, fname)
+                if os.path.exists(target) and os.path.getsize(target) >= 16384:
+                    found = True
+                    break
+        if not found:
+            missing_ids.append(row["id"])
+
+    if missing_ids:
+        for i in range(0, len(missing_ids), 500):
+            chunk = missing_ids[i : i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            cursor.execute(f"UPDATE dvr_segments SET status = 'failed' WHERE id IN ({placeholders})", chunk)
+        conn.commit()
+    conn.close()
+    return len(missing_ids)
+
 def _build_dvr_filter(date_str: str | None = None, hour_str: str | None = None):
-    clauses = []
+    clauses = ["status != 'failed'"]
     params = []
     if date_str and hour_str is not None and str(hour_str).strip() != "":
         h = str(hour_str).strip().zfill(2)

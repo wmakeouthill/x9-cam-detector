@@ -14,6 +14,8 @@ from app.db import (
     save_dvr_config,
     upsert_dvr_segment,
     mark_dvr_segment_synced,
+    mark_dvr_segment_failed,
+    cleanup_missing_local_dvr_segments,
     list_dvr_segments,
     count_dvr_segments,
     cleanup_dvr_retention,
@@ -108,6 +110,9 @@ class DvrService:
             """)
             conn.commit()
             conn.close()
+            cleaned_ghosts = cleanup_missing_local_dvr_segments(self.recordings_dir)
+            if cleaned_ghosts > 0:
+                logger.info(f"[DVR 24h] {cleaned_ghosts} registro(s) local(is) ausente(s) marcados como 'failed'.")
         except Exception as e:
             logger.warning(f"[DVR 24h] Aviso ao limpar status 'recording' órfãos na inicialização: {e}")
 
@@ -439,6 +444,17 @@ class DvrService:
                     status="local",
                 )
 
+    def _cushion_limit(self) -> int:
+        """
+        Ajusta quantos blocos sincronizados ficam no buffer RAM conforme o tamanho do bloco:
+        blocos de 5 min (~67 MB) mantêm 3 no buffer (~200 MB), preservando folga no tmpfs para +faststart.
+        """
+        if self.segment_seconds >= 300:
+            return 3
+        if self.segment_seconds >= 120:
+            return 4
+        return RAM_CUSHION_MAX_SEGMENTS
+
     def _remux_faststart_if_needed(self, filepath: str, filename: str):
         """
         Reorganiza o átomo moov para o início do MP4 (+faststart) assim que o bloco fecha.
@@ -446,13 +462,17 @@ class DvrService:
         """
         if filename in self._faststart_done:
             return
-        self._faststart_done.add(filename)
         try:
-            # O remux grava uma cópia temporária: sem folga no tmpfs, é melhor pular que encher o buffer
-            if shutil.disk_usage(self.recordings_dir).free < os.path.getsize(filepath) * 2:
+            needed = os.path.getsize(filepath) * 2
+            if shutil.disk_usage(self.recordings_dir).free < needed:
+                # Tenta liberar blocos já sincronizados antes de desistir do +faststart
+                self._prune_ram_buffer()
+            if shutil.disk_usage(self.recordings_dir).free < needed:
+                logger.warning(f"[DVR 24h] Espaço insuficiente no tmpfs para +faststart em '{filename}'.")
                 return
         except OSError:
             return
+        self._faststart_done.add(filename)
         tmp_path = filepath + ".faststart.mp4"
         try:
             ffmpeg_bin = resolve_ffmpeg_bin()
@@ -467,7 +487,7 @@ class DvrService:
                     "-y",
                     tmp_path,
                 ],
-                timeout=10,
+                timeout=30,
                 capture_output=True,
             )
             if res.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
@@ -501,13 +521,14 @@ class DvrService:
         except OSError:
             low_space = False
 
-        if len(files) <= RAM_CUSHION_MAX_SEGMENTS and not low_space:
+        cushion_limit = self._cushion_limit()
+        if len(files) <= cushion_limit and not low_space:
             return
 
         # Consulta status no SQLite para só apagar do buffer o que já subiu para o Google Drive (ou se Drive não estiver ativo)
         seg_map = {s["filename"]: s.get("status") for s in list_dvr_segments(limit=200)}
         # Com pouco espaço livre, qualquer bloco sincronizado (menos o atual) pode sair, do mais antigo ao mais novo
-        candidates_to_prune = files if low_space else files[:-RAM_CUSHION_MAX_SEGMENTS]
+        candidates_to_prune = files if low_space else files[:-cushion_limit]
         # 1. Primeira passagem: descarta blocos já sincronizados (ou se Drive desativado)
         for fname in candidates_to_prune:
             if fname == self.current_segment:
@@ -546,6 +567,7 @@ class DvrService:
                 try:
                     os.remove(fpath)
                     self._faststart_done.discard(fname)
+                    mark_dvr_segment_failed(fname)
                     logger.warning(
                         f"[DVR 24h Buffer de Emergência] Espaço livre crítico (<{MIN_FREE_BUFFER_BYTES // (1024*1024)}MB). "
                         f"Descartado bloco antigo não sincronizado '{fname}' para manter gravação contínua ativa!"

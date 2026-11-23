@@ -468,6 +468,7 @@ def test_gdrive_get_dvr_file_range_direct(monkeypatch):
     from app.services.gdrive_service import gdrive_service, GoogleDriveService
 
     monkeypatch.setattr(GoogleDriveService, "is_configured", property(lambda self: True))
+    monkeypatch.setattr(gdrive_service, "_get_access_token", lambda force_refresh=False: None)
 
     mock_req = MagicMock()
     mock_req.headers = {}
@@ -481,6 +482,40 @@ def test_gdrive_get_dvr_file_range_direct(monkeypatch):
     assert res == b"CHUNK_100_200"
     assert mock_req.headers["Range"] == "bytes=100-200"
     mock_service.files().get_media.assert_called_with(fileId="drv_id_123")
+
+
+def test_gdrive_get_dvr_file_range_http_keepalive_fastpath_and_401_retry(monkeypatch):
+    from app.services.gdrive_service import gdrive_service, GoogleDriveService
+
+    monkeypatch.setattr(GoogleDriveService, "is_configured", property(lambda self: True))
+
+    tokens = []
+    def fake_token(force_refresh=False):
+        tokens.append(force_refresh)
+        return "fresh_tok" if force_refresh else "stale_tok"
+
+    monkeypatch.setattr(gdrive_service, "_get_access_token", fake_token)
+
+    calls = []
+    class FakeResp:
+        def __init__(self, status_code, content):
+            self.status_code = status_code
+            self.content = content
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append((url, headers))
+        if headers["Authorization"] == "Bearer stale_tok":
+            return FakeResp(401, b"")
+        return FakeResp(206, b"FAST_CHUNK_DATA")
+
+    monkeypatch.setattr(gdrive_service._http_session, "get", fake_get)
+
+    res = gdrive_service.get_dvr_file_range("dvr_fast.mp4", drive_file_id="drv_fast_1", start=0, end=1023)
+    assert res == b"FAST_CHUNK_DATA"
+    assert tokens == [False, True]
+    assert len(calls) == 2
+    assert calls[1][0] == "https://www.googleapis.com/drive/v3/files/drv_fast_1?alt=media"
+    assert calls[1][1]["Range"] == "bytes=0-1023"
 
 
 def test_dvr_video_range_streaming_from_drive(monkeypatch):
@@ -529,7 +564,7 @@ def test_dvr_video_range_streaming_from_drive(monkeypatch):
     resp_cached = get_dvr_video("dvr_remote_20261105_100000.mp4", req, user="admin")
     assert resp_cached.status_code == 206
     assert len(calls) == 1  # sem novo hit no Drive
-    assert _gdrive_download_semaphore._value == 3  # semáforo sempre liberado
+    assert _gdrive_download_semaphore._value == 6  # semáforo sempre liberado
 
 
 def test_dvr_video_open_ended_range_capped_at_2mb(monkeypatch):
@@ -658,8 +693,93 @@ def test_dvr_prune_ram_buffer_emergency_fifo_when_gdrive_fails(monkeypatch, tmp_
 
     # O bloco mais antigo não sincronizado DEVE ter sido descartado em emergência para manter a gravação viva
     assert not (buf / fnames[0]).exists()
+    # O bloco descartado deve ser marcado como 'failed' no banco para não virar fantasma 404
+    from app.db.db import get_dvr_segment_by_filename
+    assert get_dvr_segment_by_filename(fnames[0])["status"] == "failed"
     # O bloco atualmente em gravação NUNCA é descartado
     assert (buf / fnames[-1]).exists()
+
+
+def test_reconcile_dvr_preserves_and_repairs_5min_durations(monkeypatch):
+    from app.services.gdrive_service import gdrive_service, GoogleDriveService
+    from app.db.db import get_dvr_segment_by_filename
+
+    monkeypatch.setattr(GoogleDriveService, "is_configured", property(lambda self: True))
+    monkeypatch.setattr("app.db.db._is_dvr_file_available", lambda *a, **k: True)
+    save_dvr_config(enabled=True, segment_seconds=300, retention_days=15, subtype=0)
+
+    # 1. Bloco A já foi salvo com duração corrompida (60s), Bloco B tem duração real (304s)
+    upsert_dvr_segment(
+        filename="dvr_20261123_020000.mp4",
+        start_time="2026-11-23 02:00:00",
+        end_time="2026-11-23 02:01:00",
+        duration_seconds=60,
+        size_bytes=67_500_000,
+        status="synced",
+        drive_file_id="id_a",
+    )
+    upsert_dvr_segment(
+        filename="dvr_20261123_020503.mp4",
+        start_time="2026-11-23 02:05:03",
+        end_time="2026-11-23 02:10:07",
+        duration_seconds=304,
+        size_bytes=67_500_000,
+        status="synced",
+        drive_file_id="id_b",
+    )
+
+    monkeypatch.setattr(
+        gdrive_service,
+        "list_dvr_drive_files",
+        lambda: [
+            {"id": "id_a", "name": "dvr_20261123_020000.mp4", "size": "67500000", "createdTime": "2026-11-23T05:05:00Z"},
+            {"id": "id_b", "name": "dvr_20261123_020503.mp4", "size": "67500000", "createdTime": "2026-11-23T05:10:07Z"},
+            {"id": "id_c", "name": "dvr_20261123_021007.mp4", "size": "67500000", "createdTime": "2026-11-23T05:15:10Z"},
+        ],
+    )
+
+    gdrive_service.reconcile_dvr_from_drive(force=True)
+
+    seg_a = get_dvr_segment_by_filename("dvr_20261123_020000.mp4")
+    seg_b = get_dvr_segment_by_filename("dvr_20261123_020503.mp4")
+    seg_c = get_dvr_segment_by_filename("dvr_20261123_021007.mp4")
+
+    # Bloco A foi reparado de 60s -> 303s; Bloco B preservou 304s; Bloco C inferiu 300s
+    assert seg_a["duration_seconds"] == 303
+    assert seg_a["end_time"] == "2026-11-23 02:05:03"
+    assert seg_b["duration_seconds"] == 304
+    assert seg_c["duration_seconds"] == 300
+
+    # Seek no minuto 3 do Bloco A (02:03:00) cai exatamente em offset=180s sem gap!
+    seek = find_dvr_segment_for_seek(target_time_str="2026-11-23 02:03:00")
+    assert seek is not None
+    assert seek["gap"] is False
+    assert seek["segment"]["filename"] == "dvr_20261123_020000.mp4"
+    assert seek["seek_offset"] == 180
+
+
+def test_cleanup_missing_local_dvr_segments_marks_ghosts_failed(tmp_path):
+    from app.db.db import cleanup_missing_local_dvr_segments, get_dvr_segment_by_filename
+
+    buf = tmp_path / "buf"
+    buf.mkdir()
+    real_local = buf / "dvr_20261123_010000.mp4"
+    real_local.write_bytes(b"X" * 20000)
+
+    upsert_dvr_segment("dvr_20261123_010000.mp4", "2026-11-23 01:00:00", "2026-11-23 01:05:00", 300, 20000, "local")
+    upsert_dvr_segment("dvr_20261110_010000.mp4", "2026-11-10 01:00:00", "2026-11-10 01:05:00", 300, 20000, "local")
+    upsert_dvr_segment("dvr_20261110_020000.mp4", "2026-11-10 02:00:00", "2026-11-10 02:05:00", 300, 20000, "synced", "drv_ok")
+
+    cleaned = cleanup_missing_local_dvr_segments(str(buf))
+    assert cleaned == 1
+    assert get_dvr_segment_by_filename("dvr_20261110_010000.mp4")["status"] == "failed"
+    assert get_dvr_segment_by_filename("dvr_20261123_010000.mp4")["status"] == "local"
+    assert get_dvr_segment_by_filename("dvr_20261110_020000.mp4")["status"] == "synced"
+
+    # Segmentos 'failed' não aparecem mais em list_dvr_segments nem count_dvr_segments
+    listed = {s["filename"] for s in list_dvr_segments()}
+    assert "dvr_20261110_010000.mp4" not in listed
+    assert count_dvr_segments() == 2
 
 
 

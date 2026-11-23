@@ -22,6 +22,8 @@ import {
   ChevronDown,
   ChevronUp,
   Layers,
+  Maximize2,
+  Minimize2,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useDvrWindow } from './useDvrWindow';
@@ -146,13 +148,30 @@ export function DvrRecordingsView() {
   const [currentMinute, setCurrentMinute] = useState<number | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const videoRefA = useRef<HTMLVideoElement | null>(null);
+  const videoRefB = useRef<HTMLVideoElement | null>(null);
+  const playerContainerRef = useRef<HTMLDivElement | null>(null);
   // Offset (s) a aplicar assim que o vídeo do novo bloco tiver metadados; currentTime antes disso é ignorado
   const pendingOffsetRef = useRef<number | null>(null);
   const [timeline, setTimeline] = useState<TimelineSeg[]>([]);
 
+  // Player duplo A/B: alterna visibilidade sem destruir o DOM nem disparar tempestade de preloads
+  const [activeSlot, setActiveSlot] = useState<0 | 1>(0);
+  const [slotFiles, setSlotFiles] = useState<[string | null, string | null]>([null, null]);
+  const [preloadArmed, setPreloadArmed] = useState<boolean>(false);
+  const [videoBuffering, setVideoBuffering] = useState<boolean>(false);
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const activeSlotRef = useRef<0 | 1>(0);
+  const slotFilesRef = useRef<[string | null, string | null]>([null, null]);
+  const playbackSpeedRef = useRef<number>(1);
+  activeSlotRef.current = activeSlot;
+  slotFilesRef.current = slotFiles;
+  playbackSpeedRef.current = playbackSpeed;
+
   const {
     dayTimeline,
-    preloadContainerRef,
+    nextSegment,
     playNext,
     playPrev,
     seekRelative,
@@ -166,7 +185,132 @@ export function DvrRecordingsView() {
     onFeedback: (fb) => setFeedback(fb),
   });
 
-  const handleTimeUpdate = (currentTimeSeconds: number) => {
+  // Mantém videoRef sincronizado com o slot ativo e acompanha estado de tela cheia do container
+  useEffect(() => {
+    videoRef.current = activeSlot === 0 ? videoRefA.current : videoRefB.current;
+  }, [activeSlot, slotFiles]);
+
+  useEffect(() => {
+    const onFsChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, []);
+
+  // Sincroniza activeSegment com os slots A/B (faz swap instantâneo se o bloco já estiver pré-carregado no standby)
+  useEffect(() => {
+    const targetFile = activeSegment?.filename || null;
+    setPreloadArmed(false);
+    setVideoError(null);
+
+    if (!targetFile) {
+      setSlotFiles([null, null]);
+      setVideoBuffering(false);
+      return;
+    }
+
+    const curSlot = activeSlotRef.current;
+    const standbySlot: 0 | 1 = curSlot === 0 ? 1 : 0;
+    const curFiles = slotFilesRef.current;
+
+    // 1. Já está no slot ativo
+    if (curFiles[curSlot] === targetFile) {
+      const el = curSlot === 0 ? videoRefA.current : videoRefB.current;
+      if (el) {
+        videoRef.current = el;
+        el.playbackRate = playbackSpeedRef.current;
+        if (pendingOffsetRef.current !== null && el.readyState >= 1) {
+          el.currentTime = pendingOffsetRef.current;
+          pendingOffsetRef.current = null;
+        }
+        el.muted = false;
+        el.play().catch(() => {});
+      }
+      return;
+    }
+
+    // 2. Hit no buffer standby (transição contínua A <-> B sem destruir <video>!)
+    if (curFiles[standbySlot] === targetFile) {
+      const oldEl = curSlot === 0 ? videoRefA.current : videoRefB.current;
+      const newEl = standbySlot === 0 ? videoRefA.current : videoRefB.current;
+      if (oldEl) {
+        oldEl.pause();
+        oldEl.muted = true;
+      }
+      activeSlotRef.current = standbySlot;
+      setActiveSlot(standbySlot);
+      // Libera o slot antigo para interromper downloads antigos e aguardar o próximo bloco
+      const nextPair: [string | null, string | null] =
+        standbySlot === 0 ? [targetFile, null] : [null, targetFile];
+      slotFilesRef.current = nextPair;
+      setSlotFiles(nextPair);
+
+      if (newEl) {
+        videoRef.current = newEl;
+        newEl.playbackRate = playbackSpeedRef.current;
+        const offset = pendingOffsetRef.current ?? 0;
+        if (newEl.readyState >= 1) {
+          newEl.currentTime = offset;
+          pendingOffsetRef.current = null;
+        }
+        newEl.muted = false;
+        setVideoBuffering(newEl.readyState < 3);
+        newEl.play().catch(() => {});
+      }
+      return;
+    }
+
+    // 3. Salto manual para horário distante: carrega direto no slot ativo e cancela standby
+    const standbyEl = standbySlot === 0 ? videoRefA.current : videoRefB.current;
+    if (standbyEl) {
+      standbyEl.pause();
+      standbyEl.removeAttribute('src');
+      standbyEl.load();
+    }
+    const nextPair: [string | null, string | null] =
+      curSlot === 0 ? [targetFile, null] : [null, targetFile];
+    setSlotFiles(nextPair);
+    setVideoBuffering(true);
+  }, [activeSegment?.filename]);
+
+  // Arma o pré-carregamento APENAS do próximo bloco imediato quando faltar <= 25s no bloco atual
+  useEffect(() => {
+    if (!preloadArmed || !nextSegment?.filename) return;
+    const curSlot = activeSlotRef.current;
+    const standbySlot: 0 | 1 = curSlot === 0 ? 1 : 0;
+    if (slotFilesRef.current[standbySlot] === nextSegment.filename) return;
+    setSlotFiles((prev) => {
+      const copy: [string | null, string | null] = [prev[0], prev[1]];
+      copy[standbySlot] = nextSegment.filename;
+      return copy;
+    });
+  }, [preloadArmed, nextSegment?.filename]);
+
+  // Aborta download imediatamente quando um slot fica vazio
+  useEffect(() => {
+    ([0, 1] as const).forEach((slot) => {
+      if (slotFiles[slot] === null) {
+        const el = slot === 0 ? videoRefA.current : videoRefB.current;
+        if (el && el.getAttribute('src')) {
+          el.pause();
+          el.removeAttribute('src');
+          el.load();
+        }
+      }
+    });
+  }, [slotFiles]);
+
+  const handleTimeUpdate = (el: HTMLVideoElement, slot: 0 | 1) => {
+    if (slot !== activeSlotRef.current) return;
+    const currentTimeSeconds = el.currentTime;
+
+    // Dispara pré-carregamento do próximo bloco nos últimos 25s (ou após 2s em blocos curtos <= 30s)
+    if (!preloadArmed && nextSegment?.filename && Number.isFinite(el.duration) && el.duration > 0) {
+      const remaining = el.duration - currentTimeSeconds;
+      if (remaining <= 25 || (el.duration <= 30 && currentTimeSeconds >= 2)) {
+        setPreloadArmed(true);
+      }
+    }
+
     if (!activeSegment?.start_time) return;
     const startMs = parseTs(activeSegment.start_time);
     if (isNaN(startMs)) return;
@@ -216,13 +360,38 @@ export function DvrRecordingsView() {
     }
   };
 
-  const applyPendingOffset = () => {
-    const v = videoRef.current;
-    if (!v || pendingOffsetRef.current === null) return;
-    v.currentTime = pendingOffsetRef.current;
-    pendingOffsetRef.current = null;
-    v.playbackRate = playbackSpeed;
-    v.play().catch(() => {});
+  const applyPendingOffset = (el: HTMLVideoElement, slot: 0 | 1) => {
+    if (slot !== activeSlotRef.current) return;
+    videoRef.current = el;
+    if (pendingOffsetRef.current !== null) {
+      const dur = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : Infinity;
+      el.currentTime = Math.min(pendingOffsetRef.current, Math.max(0, dur - 0.5));
+      pendingOffsetRef.current = null;
+    }
+    el.playbackRate = playbackSpeedRef.current;
+    el.muted = false;
+    el.play().catch(() => {});
+  };
+
+  const handleToggleFullscreen = () => {
+    if (!playerContainerRef.current) return;
+    if (!document.fullscreenElement) {
+      playerContainerRef.current.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen().catch(() => {});
+    }
+  };
+
+  const handleRetryActiveVideo = () => {
+    const curSlot = activeSlotRef.current;
+    const el = curSlot === 0 ? videoRefA.current : videoRefB.current;
+    const fname = slotFilesRef.current[curSlot];
+    if (!el || !fname || !token) return;
+    setVideoError(null);
+    setVideoBuffering(true);
+    el.src = `/api/camera/dvr/video/${fname}?token=${token}&_r=${Date.now()}`;
+    el.load();
+    el.play().catch(() => {});
   };
 
   const handleJumpToTime = async (customTs?: string) => {
@@ -356,7 +525,10 @@ export function DvrRecordingsView() {
           setSegments(items);
           setTotal(totalCount);
           if (Array.isArray(data.available_dates)) {
-            setAvailableDates(data.available_dates);
+            const incoming: string[] = data.available_dates;
+            setAvailableDates((prev) =>
+              prev.length === incoming.length && prev.every((v, i) => v === incoming[i]) ? prev : incoming
+            );
           }
 
           // Só escolhe automaticamente quando nada está tocando. Antes, qualquer bloco fora do filtro
@@ -390,7 +562,7 @@ export function DvrRecordingsView() {
       const targetDate =
         selectedDate || activeSegment?.start_time?.substring(0, 10) || availableDates[0] || localDateStr();
       refreshDateTimeline(targetDate);
-    }, 10000);
+    }, 30000);
     return () => clearInterval(interval);
   }, [
     fetchDvrStatus,
@@ -691,36 +863,137 @@ export function DvrRecordingsView() {
           </div>
 
           {activeSegment && (
-            <a
-              href={`/api/camera/dvr/video/${activeSegment.filename}?token=${token}`}
-              target="_blank"
-              rel="noreferrer"
-              download
-              className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-950/50 border border-emerald-500/40 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-semibold transition-all"
-            >
-              <Download className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Baixar MP4</span>
-            </a>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleToggleFullscreen}
+                className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#141A26] border border-slate-700 hover:border-cyan-400 text-slate-200 hover:text-cyan-300 text-xs font-mono font-semibold transition-all cursor-pointer"
+                title="Tela cheia contínua (mantém tela cheia ao trocar de bloco)"
+              >
+                {isFullscreen ? (
+                  <>
+                    <Minimize2 className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>Sair Tela Cheia</span>
+                  </>
+                ) : (
+                  <>
+                    <Maximize2 className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>Tela Cheia</span>
+                  </>
+                )}
+              </button>
+              <a
+                href={`/api/camera/dvr/video/${activeSegment.filename}?token=${token}`}
+                target="_blank"
+                rel="noreferrer"
+                download
+                className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-950/50 border border-emerald-500/40 hover:border-emerald-400 text-emerald-300 text-xs font-mono font-semibold transition-all"
+              >
+                <Download className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Baixar MP4</span>
+              </a>
+            </div>
           )}
         </div>
 
         {activeSegment ? (
           <>
-            {/* Container oculto para preloading da janela deslizante */}
-            <div hidden ref={preloadContainerRef} style={{ display: 'none' }} />
+            {/* Player Duplo A/B: mantém 2 elementos <video> persistentes para transição sem corte nem destruição do DOM */}
+            <div
+              ref={playerContainerRef}
+              className="relative w-full aspect-video max-h-[58vh] bg-black rounded-xl overflow-hidden border border-zinc-800 flex items-center justify-center"
+            >
+              {([0, 1] as const).map((slot) => {
+                const isSlotActive = activeSlot === slot;
+                const fname = slotFiles[slot];
+                const srcUrl = fname && token ? `/api/camera/dvr/video/${fname}?token=${token}` : undefined;
+                return (
+                  <video
+                    key={slot}
+                    ref={slot === 0 ? videoRefA : videoRefB}
+                    src={srcUrl}
+                    controls={isSlotActive}
+                    autoPlay={isSlotActive}
+                    muted={!isSlotActive}
+                    playsInline
+                    preload={fname ? 'auto' : 'none'}
+                    onLoadStart={() => {
+                      if (isSlotActive && fname) {
+                        setVideoBuffering(true);
+                        setVideoError(null);
+                      }
+                    }}
+                    onWaiting={() => {
+                      if (isSlotActive) setVideoBuffering(true);
+                    }}
+                    onCanPlay={() => {
+                      if (isSlotActive) setVideoBuffering(false);
+                    }}
+                    onPlaying={() => {
+                      if (isSlotActive) {
+                        setVideoBuffering(false);
+                        setVideoError(null);
+                      }
+                    }}
+                    onLoadedMetadata={(e) => applyPendingOffset(e.currentTarget, slot)}
+                    onTimeUpdate={(e) => handleTimeUpdate(e.currentTarget, slot)}
+                    onEnded={() => {
+                      if (isSlotActive) playNext();
+                    }}
+                    onError={async () => {
+                      if (!isSlotActive || !fname) return;
+                      if (token) {
+                        try {
+                          const authRes = await fetch('/api/auth/me', {
+                            headers: { Authorization: `Bearer ${token}` },
+                          });
+                          if (authRes.status === 401) return;
+                        } catch {
+                          // segue para erro do player
+                        }
+                      }
+                      setVideoBuffering(false);
+                      setVideoError(`Não foi possível carregar o bloco ${fname}.`);
+                    }}
+                    className={
+                      isSlotActive
+                        ? 'w-full h-full object-contain relative z-10'
+                        : 'w-full h-full object-contain absolute inset-0 opacity-0 pointer-events-none z-0'
+                    }
+                  />
+                );
+              })}
 
-            <div className="w-full aspect-video max-h-[58vh] bg-black rounded-xl overflow-hidden border border-zinc-800 flex items-center justify-center">
-              <video
-                ref={videoRef}
-                key={activeSegment.filename}
-                src={`/api/camera/dvr/video/${activeSegment.filename}?token=${token}`}
-                controls
-                autoPlay
-                onLoadedMetadata={applyPendingOffset}
-                onTimeUpdate={(e) => handleTimeUpdate(e.currentTarget.currentTime)}
-                onEnded={playNext}
-                className="w-full h-full object-contain"
-              />
+              {/* Indicador de carregamento (buffering) */}
+              {videoBuffering && !videoError && (
+                <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/60 backdrop-blur-[2px] pointer-events-none gap-2.5">
+                  <RefreshCw className="w-7 h-7 text-cyan-400 animate-spin" />
+                  <span className="text-xs font-mono text-cyan-200 px-3 py-1 rounded bg-black/80 border border-cyan-500/40">
+                    Carregando vídeo do Google Drive...
+                  </span>
+                </div>
+              )}
+
+              {/* Overlay de erro com ações de recuperação */}
+              {videoError && (
+                <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-black/85 p-4 text-center gap-3">
+                  <AlertTriangle className="w-8 h-8 text-amber-400" />
+                  <p className="text-xs font-mono text-red-300 max-w-md">{videoError}</p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleRetryActiveVideo}
+                      className="px-3 py-1.5 rounded-lg bg-cyan-500/20 border border-cyan-400 text-cyan-200 text-xs font-mono font-bold hover:bg-cyan-500/30 cursor-pointer"
+                    >
+                      Tentar novamente
+                    </button>
+                    <button
+                      onClick={playNext}
+                      className="px-3 py-1.5 rounded-lg bg-emerald-500/20 border border-emerald-400 text-emerald-200 text-xs font-mono font-bold hover:bg-emerald-500/30 cursor-pointer"
+                    >
+                      Próximo bloco
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Barra de Controles Rápidos do Player DVR */}

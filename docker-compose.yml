@@ -35,7 +35,7 @@ services:
       - ./client_secret.json:/app/client_secret.json
       - ./service_account.json:/app/service_account.json
     tmpfs:
-      - /tmp/x9_dvr_buffer:size=512m,mode=1777
+      - /tmp/x9_dvr_buffer:size=768m,mode=1777
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')\" || exit 1"]
       interval: 5s
